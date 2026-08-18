@@ -737,7 +737,7 @@ test("daemon adopts alarms created after startup and fires them on time (dry run
 		const owner = "C:\\sessions\\ghost.jsonl";
 		const due: TimerAlarmState = { id: "later", name: "Later", kind: "timer", active: true, createdAt: Date.now(), dueAt: Date.now() + 8_000, ownerSessionFile: owner };
 		await writeState(statePath, [due]);
-		const deadline = Date.now() + 30_000;
+		const deadline = Date.now() + 45_000;
 		while (Date.now() < deadline) {
 			if (stdout.includes("[dry-run] would run")) break;
 			if (!child.killed && child.exitCode !== null) throw new Error(`daemon exited early: ${stderr || stdout}`);

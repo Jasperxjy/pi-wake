@@ -19,7 +19,15 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
+      - name: npm test
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! npm test 2>&1 | tee npm-test.log; then
+            FAILS=$(grep -E "^✖ " npm-test.log | head -20 || true)
+            echo "::error::npm test failed:\n$FAILS"
+            exit 1
+          fi
       - name: package smoke (real tarball install + bin)
         shell: bash
         run: |

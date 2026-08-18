@@ -34,9 +34,9 @@ function recordingEmit(calls: OutboxEntry[]): EmitFn {
 	};
 }
 
-async function waitFor(condition: () => boolean, label: string, timeoutMs = 3000): Promise<void> {
+async function waitFor(condition: () => boolean | Promise<boolean>, label: string, timeoutMs = 3000): Promise<void> {
 	const start = Date.now();
-	while (!condition()) {
+	while (!(await condition())) {
 		if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${label}`);
 		await new Promise((resolve) => setTimeout(resolve, 20));
 	}
@@ -44,6 +44,11 @@ async function waitFor(condition: () => boolean, label: string, timeoutMs = 3000
 
 function dueTimer(id: string, ownerSessionFile?: string): TimerAlarmState {
 	return { id, name: `Timer ${id}`, kind: "timer", active: true, createdAt: Date.now() - 1000, dueAt: Date.now() + 50, ownerSessionFile, revision: 1 };
+}
+
+/** A timer due far enough in the future that a rival runtime's mutation reliably lands before the first tick. */
+function futureTimer(id: string, ownerSessionFile?: string): TimerAlarmState {
+	return { id, name: `Timer ${id}`, kind: "timer", active: true, createdAt: Date.now() - 1000, dueAt: Date.now() + 1500, ownerSessionFile, revision: 1 };
 }
 
 test("concurrent sessions fire only the alarms they own and never clobber each other", async () => {
@@ -132,9 +137,9 @@ test("a session does not flush outbox wakes owned by another session", async () 
 });
 
 test("a stale scheduler cannot fire a timer that was paused by another runtime", async () => {
-	const { statePath, configPath } = await makeFixture([dueTimer("shared")]);
+	const { statePath, configPath } = await makeFixture([futureTimer("shared")]);
 	const calls: OutboxEntry[] = [];
-	// A loaded the timer while it was due in ~150ms and arms its scheduler.
+	// A loaded the timer while it was due in ~1.5s and arms its scheduler.
 	const a = new WakeAlarmRuntime({
 		cwd: path.dirname(statePath),
 		configPath,
@@ -157,8 +162,10 @@ test("a stale scheduler cannot fire a timer that was paused by another runtime",
 	await b.start({ flushPending: false });
 	try {
 		await b.runAction({ action: "pause", id: "shared" });
+		// Make sure the pause is durable on disk BEFORE the original deadline passes.
+		await waitFor(async () => !(await readState(statePath)).alarms[0].active, "the pause to land on disk", 2_000);
 		// Wait well past the original deadline.
-		await new Promise((resolve) => setTimeout(resolve, 600));
+		await new Promise((resolve) => setTimeout(resolve, 1_200));
 		assert.equal(calls.length, 0, "a stale scheduler must not fire a paused timer");
 		const disk = (await readState(statePath)).alarms[0];
 		assert.equal(disk.active, false);
@@ -171,7 +178,7 @@ test("a stale scheduler cannot fire a timer that was paused by another runtime",
 });
 
 test("a stale scheduler cannot fire a timer that was reset to a later deadline", async () => {
-	const { statePath, configPath } = await makeFixture([dueTimer("shared")]);
+	const { statePath, configPath } = await makeFixture([futureTimer("shared")]);
 	const calls: OutboxEntry[] = [];
 	const a = new WakeAlarmRuntime({
 		cwd: path.dirname(statePath),
@@ -194,7 +201,8 @@ test("a stale scheduler cannot fire a timer that was reset to a later deadline",
 	await b.start({ flushPending: false });
 	try {
 		await b.runAction({ action: "reset", id: "shared", after: "1h" });
-		await new Promise((resolve) => setTimeout(resolve, 600));
+		await waitFor(async () => (await readState(statePath)).alarms[0].kind === "timer" && (await readState(statePath)).alarms[0].dueAt > Date.now(), "the reset to land on disk", 2_000);
+		await new Promise((resolve) => setTimeout(resolve, 1_200));
 		assert.equal(calls.length, 0, "a stale scheduler must not fire a reset timer");
 		const disk = (await readState(statePath)).alarms[0];
 		assert.ok(disk.kind === "timer" && disk.dueAt > Date.now(), "the reset deadline is in the future");
