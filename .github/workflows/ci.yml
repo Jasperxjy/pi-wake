@@ -24,10 +24,17 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          echo "node: $(node -v), npm: $(npm -v), os: $(uname -s)"
           echo "::group::npm pack"
-          TGZ=$(npm pack --silent | tail -1)
-          echo "tarball: $TGZ"
+          PACK_OUT=$(npm pack --silent 2>&1)
+          echo "$PACK_OUT"
+          TGZ=$(echo "$PACK_OUT" | tail -1)
+          echo "tarball: [$TGZ]"
           echo "::endgroup::"
+          if [ -z "$TGZ" ] || [ ! -f "$TGZ" ]; then
+            echo "::error::npm pack produced no tarball: [$PACK_OUT]"
+            exit 1
+          fi
           TMP=$(mktemp -d)
           echo "install dir: $TMP"
           cd "$TMP"
@@ -36,21 +43,36 @@ jobs:
           # missing files in the `files` whitelist, broken relative imports, and the
           # pi-wake-daemon bin wiring.
           echo "::group::npm install tarball"
-          npm install "$OLDPWD/$TGZ" --no-audit --no-fund --legacy-peer-deps
+          if ! npm install "$OLDPWD/$TGZ" --no-audit --no-fund --legacy-peer-deps; then
+            echo "::error::npm install of the tarball failed"
+            exit 1
+          fi
           echo "::endgroup::"
           echo "::group::layout checks"
-          test -f node_modules/pi-wake/dist/daemon.js && echo "dist/daemon.js present"
-          test -f node_modules/pi-wake/dist/runtime.js && echo "dist/runtime.js present"
-          test -f node_modules/pi-wake/extensions/pi-wake/index.ts && echo "extensions/pi-wake/index.ts present"
+          for f in dist/daemon.js dist/runtime.js dist/core.js extensions/pi-wake/index.ts; do
+            if [ -f "node_modules/pi-wake/$f" ]; then echo "$f present"; else echo "::error::$f MISSING from installed package"; exit 1; fi
+          done
           node -e "const p=require('pi-wake/package.json'); if(!p.bin||p.bin['pi-wake-daemon']!=='dist/daemon.js') process.exit(1)" && echo "bin wiring ok"
           echo "::endgroup::"
           echo "::group::installed daemon smoke"
           WAKE_ALARM_CWD="$TMP" WAKE_ALARM_SPAWN_DRY_RUN=1 node node_modules/pi-wake/dist/daemon.js >daemon.log 2>&1 &
           DPID=$!
-          sleep 4
+          # Poll for startup instead of a fixed sleep, so runner load cannot flake it.
+          OK=0
+          for i in $(seq 1 20); do
+            if grep -q "watching project" daemon.log 2>/dev/null; then OK=1; break; fi
+            sleep 0.5
+          done
           kill "$DPID" 2>/dev/null || true
           wait "$DPID" 2>/dev/null || true
-          grep -q "watching project" daemon.log && echo "daemon started" || { echo "daemon.log:"; cat daemon.log; exit 1; }
+          if [ "$OK" != "1" ]; then
+            LOG=$(cat daemon.log 2>/dev/null || echo "<no daemon.log>")
+            echo "daemon.log:"
+            echo "$LOG"
+            echo "::error::installed daemon did not start; log: [$LOG]"
+            exit 1
+          fi
+          echo "daemon started"
           echo "::endgroup::"
       - name: extension load smoke (real Pi, RPC mode)
         shell: bash
