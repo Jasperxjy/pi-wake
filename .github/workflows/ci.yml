@@ -17,7 +17,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - run: npm install
+      - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      - run: npm pack --dry-run
+      - name: package smoke (tarball contents)
+        run: npm pack --dry-run
+      - name: extension load smoke (real Pi, RPC mode)
+        shell: bash
+        run: |
+          printf '{"type":"get_state"}\n' | npx --no-install pi --mode rpc --offline --approve --no-session --extension extensions/pi-wake/index.ts | grep -q '"success":true'

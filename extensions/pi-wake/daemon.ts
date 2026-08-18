@@ -1,40 +1,41 @@
 #!/usr/bin/env node
 /**
- * Standalone wake-alarm daemon. Watches the same project state as the in-session
- * extension and, while no live session holds the fencing lease, fires due alarms
- * by resuming the alarm's owner session in a headless Pi process:
+ * Standalone pi-wake daemon. Shares the project alarm state with live sessions
+ * through two coordination primitives:
+ *
+ *   presence registry  (.pi/wake-alarm.sessions/) — which sessions are live
+ *   atomic wake claim  (pendingWake.claim)        — who delivers this wake
+ *
+ * The daemon schedules only alarms whose owner session is not live (ownerless
+ * alarms only when no session is live at all). Delivery itself is claimed under
+ * the state transaction lock, so a routing overlap can never double-deliver.
+ * Owned alarms are delivered by resuming the owner session headlessly:
  *
  *   pi --session <ownerSessionFile> --print "<factual wake message>"
  *
  * Project trust is respected by default (headlessTrust: "saved"); `--approve`
- * is only added when the project config explicitly sets "headlessTrust": "always".
+ * is only added when the project config sets "headlessTrust": "always".
  *
- * The spawned run gets WAKE_ALARM_PASSIVE=1, so its extension instance serves
- * tools but never schedules; this daemon stays the single active scheduler.
- * Run with: node <package>/extensions/pi-wake/daemon.ts  (Node >= 22.19).
+ * Run with: pi-wake-daemon (from the project directory), or
+ *           node <package>/extensions/pi-wake/daemon.ts   (Node >= 22.19).
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { buildResumeArgs, type AlarmState, type FiredEvent } from "./core.ts";
-import { leaseCurrentlyAlive, readLeaseFile } from "./lease.ts";
-import { WakeAlarmRuntime, readStoredAlarms, wakeMessage, type EmitFn, type ExecFn } from "./runtime.ts";
+import { PRESENCE_DIR_NAME, isSessionFileLive, listLivePresences, type PresenceRecord } from "./presence.ts";
+import { WakeAlarmRuntime, wakeMessage, type EmitFn, type ExecFn } from "./runtime.ts";
 
-const LEASE_NAME = "wake-alarm.lock.json";
-const STATE_NAME = "wake-alarm.state.json";
-const LEASE_POLL_MS = 5_000;
+const PRESENCE_POLL_MS = 5_000;
 const ACTIVATION_RETRY_MS = 10_000;
-const WAKE_RETRY_DELAY_MS = 60_000;
-const WAKE_RETRY_MAX_ATTEMPTS = 5;
 const MAX_CHILD_OUTPUT_CHARS = 2000;
 const MAX_EXEC_OUTPUT_CHARS = 1024 * 1024;
 
 const cwd = process.env.WAKE_ALARM_CWD ? path.resolve(process.env.WAKE_ALARM_CWD) : process.cwd();
 const configPath = process.env.WAKE_ALARM_CONFIG_PATH ? path.resolve(process.env.WAKE_ALARM_CONFIG_PATH) : undefined;
 const statePath = process.env.WAKE_ALARM_STATE_PATH ? path.resolve(process.env.WAKE_ALARM_STATE_PATH) : undefined;
-const effectiveStatePath = statePath ?? path.join(cwd, ".pi", STATE_NAME);
-const leasePath = path.join(cwd, ".pi", LEASE_NAME);
+const presenceDir = path.join(cwd, ".pi", PRESENCE_DIR_NAME);
 const dryRun = process.env.WAKE_ALARM_SPAWN_DRY_RUN === "1";
 const spawnDisabled = process.env.WAKE_ALARM_SPAWN === "0";
 const configuredCommand = process.env.WAKE_ALARM_PI_COMMAND;
@@ -42,6 +43,7 @@ const configuredCommand = process.env.WAKE_ALARM_PI_COMMAND;
 let stopping = false;
 let active: WakeAlarmRuntime | undefined;
 let currentChild: ChildProcess | undefined;
+let livePresences: PresenceRecord[] = [];
 
 function log(message: string): void {
 	process.stdout.write(`[${new Date().toISOString()}] [pi-wake-daemon] ${message}\n`);
@@ -51,21 +53,31 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Daemon routing: schedule alarms whose owner session is offline; ownerless only when no session is live. */
+export function daemonOwns(alarm: Pick<AlarmState, "ownerSessionFile">, live: readonly PresenceRecord[]): boolean {
+	if (alarm.ownerSessionFile === undefined) return live.length === 0;
+	return !isSessionFileLive(live, alarm.ownerSessionFile);
+}
+
 export interface PiLaunch {
 	file: string;
 	prefix: string[];
 }
 
-let piLaunch: Promise<PiLaunch> | undefined;
+const piLaunchCache = new Map<string, Promise<PiLaunch>>();
 
 /**
  * Modern Node refuses to spawn .cmd shims without a shell, so on Windows the
  * npm shim is unwrapped and the pi CLI script is run with this Node directly.
  * WAKE_ALARM_PI_COMMAND / config piCommand may point at a cli.js (run with
- * Node) or at any directly spawnable executable.
+ * Node) or at any directly spawnable executable. Failed resolutions are not
+ * cached, so fixing the environment does not require a daemon restart.
  */
 export function resolvePiLaunch(configured?: string): Promise<PiLaunch> {
-	piLaunch ??= (async (): Promise<PiLaunch> => {
+	const key = configured ?? configuredCommand ?? "<auto>";
+	let cached = piLaunchCache.get(key);
+	if (cached) return cached;
+	cached = (async (): Promise<PiLaunch> => {
 		const command = configured ?? configuredCommand;
 		if (command) {
 			if (/\.js$/i.test(command)) return { file: process.execPath, prefix: [command] };
@@ -84,7 +96,9 @@ export function resolvePiLaunch(configured?: string): Promise<PiLaunch> {
 		}
 		return { file: "pi", prefix: [] };
 	})();
-	return piLaunch;
+	cached.catch(() => piLaunchCache.delete(key));
+	piLaunchCache.set(key, cached);
+	return cached;
 }
 
 const spawnExec: ExecFn = (file, args, options) => new Promise((resolve, reject) => {
@@ -154,8 +168,6 @@ function runPi(launch: PiLaunch, sessionFile: string, message: string, timeoutMs
 
 export interface DaemonEmitDeps {
 	getRuntime: () => WakeAlarmRuntime | undefined;
-	statePath: string;
-	leasePath: string;
 	dryRun: boolean;
 	spawnDisabled: boolean;
 	isStopping: () => boolean;
@@ -164,30 +176,14 @@ export interface DaemonEmitDeps {
 }
 
 /**
- * The daemon-side emit. Fencing comes first: a live session lease means the
- * session owns delivery, so the wake stays in the outbox untouched. The outbox
- * re-check then skips spawning when the wake was already delivered by someone
- * else (a session flush or a manual check) between the scheduler tick and here.
+ * The daemon-side emit, invoked only after this runtime holds the delivery
+ * claim. Returning false releases the claim and keeps the wake in the outbox
+ * for a later attempt (or for the next live session of the owner).
  */
 export function createDaemonEmit(deps: DaemonEmitDeps): EmitFn {
 	return async (alarm: AlarmState, events: FiredEvent[], now: number): Promise<boolean> => {
 		const runtime = deps.getRuntime();
 		if (!runtime || deps.isStopping()) return false;
-		const lease = await readLeaseFile(deps.leasePath);
-		if (leaseCurrentlyAlive(lease)) {
-			deps.log(`wake for ${alarm.id} left in the outbox: a live session owns delivery`);
-			try { await runtime.reloadFromDisk(); } catch { /* best effort */ }
-			return false;
-		}
-		const expected = alarm.pendingWake?.triggeredAt;
-		if (expected !== undefined) {
-			const disk = await readStoredAlarms(deps.statePath).catch(() => undefined);
-			const record = disk?.find((entry) => entry.id === alarm.id);
-			if (!record || record.pendingWake?.triggeredAt !== expected) {
-				deps.log(`wake for ${alarm.id} was already delivered or changed; skipping the resume`);
-				return true;
-			}
-		}
 		const config = runtime.runtimeConfig;
 		if (deps.spawnDisabled || !config.spawnOnWake) {
 			deps.log(`wake for ${alarm.id} observed but spawning is disabled; left in the outbox`);
@@ -198,7 +194,7 @@ export function createDaemonEmit(deps: DaemonEmitDeps): EmitFn {
 			deps.log(`wake for ${alarm.id} has no owner session; left in the outbox for the next interactive session`);
 			return false;
 		}
-		const message = wakeMessage(alarm, events, now, config.maxEvidenceChars);
+		const message = wakeMessage(alarm, events, now, config.maxEvidenceChars, config.includeWakeEvidence);
 		let launch: PiLaunch;
 		try { launch = await resolvePiLaunch(config.piCommand); }
 		catch (error) {
@@ -239,8 +235,6 @@ async function main(): Promise<void> {
 	log(`watching project ${cwd}${dryRun ? " (dry-run)" : ""}${spawnDisabled ? " (spawning disabled)" : ""}`);
 	const emit = createDaemonEmit({
 		getRuntime: () => active,
-		statePath: effectiveStatePath,
-		leasePath,
 		dryRun,
 		spawnDisabled,
 		isStopping: () => stopping,
@@ -248,17 +242,7 @@ async function main(): Promise<void> {
 		runPi,
 	});
 	while (!stopping) {
-		const lease = await readLeaseFile(leasePath);
-		if (leaseCurrentlyAlive(lease)) {
-			if (active) {
-				log("live Pi session lease detected; daemon scheduler standing down");
-				const runtime = active;
-				active = undefined;
-				await runtime.stop();
-			}
-			await sleep(LEASE_POLL_MS);
-			continue;
-		}
+		livePresences = await listLivePresences(presenceDir).catch(() => livePresences);
 		if (!active) {
 			const runtime = new WakeAlarmRuntime({
 				cwd,
@@ -267,19 +251,22 @@ async function main(): Promise<void> {
 				emit,
 				execFn: spawnExec,
 				schedulingEnabled: true,
-				wakeRetry: { delayMs: WAKE_RETRY_DELAY_MS, maxAttempts: WAKE_RETRY_MAX_ATTEMPTS },
+				claimantId: `daemon:${process.pid}`,
+				deliveryTtlMs: () => ((active?.runtimeConfig.runTimeoutMs ?? 1_800_000) + 60_000),
+				wakeRetry: { delayMs: 60_000, capMs: 1_800_000 },
+				owns: (alarm) => daemonOwns(alarm, livePresences),
 			});
 			try {
 				await runtime.start({ flushPending: false });
 				active = runtime;
-				log(`daemon active with ${runtime.alarmCount} alarm(s)`);
+				log(`daemon active with ${runtime.alarmCount} alarm(s), ${livePresences.length} live session(s)`);
 			} catch (error) {
 				log(`activation failed: ${(error as Error).message}; retrying in ${ACTIVATION_RETRY_MS / 1000}s`);
 				await sleep(ACTIVATION_RETRY_MS);
 				continue;
 			}
 		}
-		await sleep(LEASE_POLL_MS);
+		await sleep(PRESENCE_POLL_MS);
 	}
 }
 

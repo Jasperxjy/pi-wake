@@ -441,6 +441,39 @@ test("ownerSessionFile is validated, created, and restored", () => {
 	assert.throws(() => restoreAlarmState(unknown, allowedRoots), /unknown alarm field/);
 });
 
+test("claim and revision fields round-trip through strict restore", () => {
+	const timer = createTimerAlarm({ id: "t1", name: "Timer", now: 1000, afterMs: 1000, ownerSessionFile: "/sessions/a.jsonl" });
+	const fired = {
+		...timer,
+		active: false,
+		triggeredAt: 2000,
+		lastTriggeredAt: 2000,
+		revision: 7,
+		pendingWake: {
+			triggeredAt: 2000,
+			events: [{ kind: "timer", fingerprint: "timer:t1:2000" }],
+			claim: { claimantId: "session:abc", token: "tok-1", expiresAt: 999_999 },
+		},
+	};
+	const restored = restoreAlarmState(JSON.parse(JSON.stringify(fired)), allowedRoots);
+	assert.equal(restored.revision, 7);
+	assert.equal(restored.pendingWake?.claim?.claimantId, "session:abc");
+	assert.equal(restored.pendingWake?.claim?.token, "tok-1");
+	const badClaim = JSON.parse(JSON.stringify(fired));
+	badClaim.pendingWake.claim.extra = true;
+	assert.throws(() => restoreAlarmState(badClaim, allowedRoots), /unknown alarm field/);
+	const badClaimField = JSON.parse(JSON.stringify(fired));
+	badClaimField.pendingWake.claim.expiresAt = "soon";
+	assert.throws(() => restoreAlarmState(badClaimField, allowedRoots), /expiresAt/);
+});
+
+test("absolute times require an explicit timezone", () => {
+	assert.equal(parseAbsoluteTime("2026-01-01T09:00:00+08:00"), Date.parse("2026-01-01T09:00:00+08:00"));
+	assert.equal(parseAbsoluteTime("2026-01-01T09:00:00Z"), Date.parse("2026-01-01T09:00:00Z"));
+	assert.throws(() => parseAbsoluteTime("2026-01-01T09:00:00"), /timezone/);
+	assert.throws(() => parseAbsoluteTime("2026-01-01 09:00"), /timezone/);
+});
+
 test("session lease liveness requires a fresh heartbeat and a live pid", () => {
 	const alive = () => true;
 	const dead = () => false;

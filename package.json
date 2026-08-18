@@ -35,7 +35,7 @@
 	"files": [
 		"extensions/pi-wake/index.ts",
 		"extensions/pi-wake/core.ts",
-		"extensions/pi-wake/lease.ts",
+		"extensions/pi-wake/presence.ts",
 		"extensions/pi-wake/runtime.ts",
 		"extensions/pi-wake/daemon.ts"
 	],
@@ -45,7 +45,10 @@
 		"prepublishOnly": "npm test && npm run typecheck"
 	},
 	"devDependencies": {
-		"@types/node": "^26.2.0",
+		"@types/node": "^22.20.1",
 		"typescript": "^7.0.2"
+	},
+	"bin": {
+		"pi-wake-daemon": "extensions/pi-wake/daemon.ts"
 	}
 }

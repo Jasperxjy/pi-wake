@@ -20,6 +20,8 @@ interface AlarmBase {
 	lastTriggeredAt?: number;
 	pendingWake?: PendingWake;
 	ownerSessionFile?: string;
+	/** Optimistic-concurrency revision; assigned by the state store (absent/0 for legacy). */
+	revision?: number;
 }
 
 export interface TimerAlarmState extends AlarmBase {
@@ -86,6 +88,14 @@ export interface FiredEvent {
 export interface PendingWake {
 	triggeredAt: number;
 	events: FiredEvent[];
+	/** Atomic delivery claim, written under the state transaction lock. */
+	claim?: WakeClaim;
+}
+
+export interface WakeClaim {
+	claimantId: string;
+	token: string;
+	expiresAt: number;
 }
 
 const CONTAINER_EVENTS: readonly ContainerEventKind[] = ["exit", "abnormal", "missing", "replaced", "log-error", "log-match", "deadline", "connection-failure"];
@@ -110,7 +120,9 @@ export function parseDuration(value: string | number, label = "duration"): numbe
 }
 
 export function parseAbsoluteTime(value: string, label = "at"): number {
-	const result = Date.parse(value);
+	const trimmed = value.trim();
+	if (!/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(trimmed)) throw new Error(`${label} must be an ISO 8601 timestamp with an explicit timezone (trailing Z or ±hh:mm offset)`);
+	const result = Date.parse(trimmed);
 	if (!Number.isSafeInteger(result) || result < 0) throw new Error(`${label} must be a valid absolute timestamp`);
 	return result;
 }
@@ -490,7 +502,7 @@ function restorePendingWake(record: Record<string, unknown>): PendingWake | unde
 	const raw = record.pendingWake;
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("pendingWake must be an object");
 	const pending = raw as Record<string, unknown>;
-	assertKnown(pending, ["triggeredAt", "events"]);
+	assertKnown(pending, ["triggeredAt", "events", "claim"]);
 	if (!Array.isArray(pending.events) || pending.events.length === 0 || pending.events.length > FIRED_EVENTS.length) throw new Error("pendingWake.events must be a non-empty bounded array");
 	const events = pending.events.map((value) => {
 		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("pendingWake event must be an object");
@@ -505,7 +517,19 @@ function restorePendingWake(record: Record<string, unknown>): PendingWake | unde
 		};
 	});
 	if (new Set(events.map((event) => event.kind)).size !== events.length) throw new Error("pendingWake events must not contain duplicate kinds");
-	return { triggeredAt: requiredInteger(pending, "triggeredAt"), events };
+	let claim: WakeClaim | undefined;
+	if ("claim" in pending && pending.claim !== undefined) {
+		const rawClaim = pending.claim;
+		if (!rawClaim || typeof rawClaim !== "object" || Array.isArray(rawClaim)) throw new Error("pendingWake.claim must be an object");
+		const claimRecord = rawClaim as Record<string, unknown>;
+		assertKnown(claimRecord, ["claimantId", "token", "expiresAt"]);
+		claim = {
+			claimantId: requiredString(claimRecord, "claimantId", 128),
+			token: requiredString(claimRecord, "token", 64),
+			expiresAt: requiredInteger(claimRecord, "expiresAt"),
+		};
+	}
+	return { triggeredAt: requiredInteger(pending, "triggeredAt"), events, claim };
 }
 
 function assertKnown(record: Record<string, unknown>, fields: readonly string[]): void {
@@ -528,6 +552,7 @@ function restoreBase(record: Record<string, unknown>): AlarmBase {
 		lastTriggeredAt: optionalInteger(record, "lastTriggeredAt"),
 		pendingWake: restorePendingWake(record),
 		ownerSessionFile: (() => { const file = optionalString(record, "ownerSessionFile", 4096); return file ? validateOwnerSessionFile(file) : undefined; })(),
+		revision: optionalInteger(record, "revision"),
 	};
 }
 
@@ -535,7 +560,7 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("alarm must be an object");
 	const record = value as Record<string, unknown>;
 	const base = restoreBase(record);
-	const baseFields = ["id", "name", "kind", "active", "createdAt", "pauseReason", "lastTriggeredAt", "pendingWake", "ownerSessionFile"];
+	const baseFields = ["id", "name", "kind", "active", "createdAt", "pauseReason", "lastTriggeredAt", "pendingWake", "ownerSessionFile", "revision"];
 	if (base.kind === "timer") {
 		assertKnown(record, [...baseFields, "dueAt", "triggeredAt"]);
 		const triggeredAt = optionalInteger(record, "triggeredAt");

@@ -4,12 +4,12 @@ import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AlarmState, FiredEvent } from "./core.ts";
 import {
-	cleanStaleLeaseTemps,
-	heartbeatLease,
-	releaseLease,
-	tryAcquireLease,
-	type LeaseHandle,
-} from "./lease.ts";
+	PRESENCE_DIR_NAME,
+	leaderInstanceId,
+	listLivePresences,
+	registerPresence,
+	releasePresence,
+} from "./presence.ts";
 import {
 	ACTION_ENUM,
 	WakeAlarmRuntime,
@@ -17,8 +17,7 @@ import {
 	type ToolParams,
 } from "./runtime.ts";
 
-const LEASE_NAME = "wake-alarm.lock.json";
-const LEASE_HEARTBEAT_MS = 15_000;
+const PRESENCE_HEARTBEAT_MS = 15_000;
 const TOOL_PARAMETERS = Type.Object({
 	action: StringEnum(ACTION_ENUM),
 	id: Type.Optional(Type.String({ description: "Alarm ID; required except for list and optional for check" })),
@@ -38,37 +37,41 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	const instanceId = randomUUID();
 	let runtime: WakeAlarmRuntime | undefined;
 	let ownerSessionFile: string | undefined;
-	let lease: LeaseHandle | undefined;
-	let leaseHeartbeat: ReturnType<typeof setInterval> | undefined;
-	let leaseHolder = false;
+	let presenceDir: string | undefined;
+	let presenceHeartbeat: ReturnType<typeof setInterval> | undefined;
+	let isLeader = false;
 	let passive = false;
 
-	function stopHeartbeat(): void {
-		if (leaseHeartbeat) clearInterval(leaseHeartbeat);
-		leaseHeartbeat = undefined;
+	async function refreshPresence(): Promise<void> {
+		if (!presenceDir) return;
+		try {
+			await registerPresence(presenceDir, { version: 1, pid: process.pid, instanceId, sessionFile: ownerSessionFile, heartbeatAt: Date.now() });
+			const live = await listLivePresences(presenceDir);
+			// Ownerless (legacy) alarms are scheduled by exactly one live session: the
+			// deterministic leader (smallest instance id). No acquisition, no fencing.
+			isLeader = leaderInstanceId(live) === instanceId;
+		} catch { /* presence is best-effort; the wake claim still guarantees single delivery */ }
 	}
 
-	function startHeartbeat(ctx: ExtensionContext): void {
+	function stopHeartbeat(): void {
+		if (presenceHeartbeat) clearInterval(presenceHeartbeat);
+		presenceHeartbeat = undefined;
+	}
+
+	function startHeartbeat(): void {
 		stopHeartbeat();
-		leaseHeartbeat = setInterval(() => {
-			const current = lease;
-			if (!current) return;
-			void heartbeatLease(current, ownerSessionFile).then((stillHolder) => {
-				if (stillHolder) return;
-				// Lost the fencing token: another session owns ownerless alarms from now on.
-				lease = undefined;
-				leaseHolder = false;
-				stopHeartbeat();
-				if (ctx.hasUI) ctx.ui.notify("Wake alarm lease moved to another session; scheduling only own alarms now.", "info");
-			}).catch(() => undefined);
-		}, LEASE_HEARTBEAT_MS);
-		if (typeof leaseHeartbeat.unref === "function") leaseHeartbeat.unref();
+		presenceHeartbeat = setInterval(() => void refreshPresence(), PRESENCE_HEARTBEAT_MS);
+		if (typeof presenceHeartbeat.unref === "function") presenceHeartbeat.unref();
 	}
 
 	function sessionEmit(alarm: AlarmState, events: FiredEvent[], now: number): boolean {
 		let maxEvidenceChars = 1000;
-		try { maxEvidenceChars = runtime?.runtimeConfig.maxEvidenceChars ?? maxEvidenceChars; } catch { /* config not ready */ }
-		pi.sendMessage({ customType: "wake-alarm", content: wakeMessage(alarm, events, now, maxEvidenceChars), display: true, details: { alarmId: alarm.id, events: events.map((event) => event.kind) } }, { triggerTurn: true, deliverAs: "followUp" });
+		let includeEvidence = true;
+		try {
+			maxEvidenceChars = runtime?.runtimeConfig.maxEvidenceChars ?? maxEvidenceChars;
+			includeEvidence = runtime?.runtimeConfig.includeWakeEvidence ?? includeEvidence;
+		} catch { /* config not ready */ }
+		pi.sendMessage({ customType: "wake-alarm", content: wakeMessage(alarm, events, now, maxEvidenceChars, includeEvidence), display: true, details: { alarmId: alarm.id, events: events.map((event) => event.kind) } }, { triggerTurn: true, deliverAs: "followUp" });
 		return true;
 	}
 
@@ -111,47 +114,45 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 		passive = process.env.WAKE_ALARM_PASSIVE === "1";
 		ownerSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
-		lease = undefined;
-		leaseHolder = false;
-		// Live-presence is established BEFORE any scheduling or wake flushing, so a
-		// standing daemon observes the lease before this session can start firing.
+		isLeader = false;
+		presenceDir = undefined;
+		// Presence is established BEFORE any scheduling or wake flushing: each live
+		// session owns one registry file, so this never contends with other sessions.
 		if (!passive) {
-			const candidate = path.join(ctx.cwd, ".pi", LEASE_NAME);
-			await cleanStaleLeaseTemps(candidate);
-			lease = await tryAcquireLease(candidate, instanceId, ownerSessionFile).catch(() => undefined);
-			leaseHolder = lease !== undefined;
+			presenceDir = path.join(ctx.cwd, ".pi", PRESENCE_DIR_NAME);
+			await refreshPresence();
 		}
-		// Every live session schedules the alarms it owns (ownerSessionFile match).
-		// The single lease holder additionally schedules ownerless (legacy) alarms,
-		// which keeps multi-session hosts such as pi-web from double-firing them.
 		runtime = new WakeAlarmRuntime({
 			cwd: ctx.cwd,
 			emit: sessionEmit,
 			execFn: (file, args, options) => pi.exec(file, args, options),
 			schedulingEnabled: !passive,
-			owns: (alarm) => alarm.ownerSessionFile === undefined ? leaseHolder : alarm.ownerSessionFile === ownerSessionFile,
+			owns: (alarm) => alarm.ownerSessionFile === undefined ? isLeader : alarm.ownerSessionFile === ownerSessionFile,
+			claimantId: `session:${instanceId}`,
 		});
 		try {
 			await runtime.start({ flushPending: !passive });
 			if (passive) return;
-			if (lease) startHeartbeat(ctx);
-			else if (ctx.hasUI) ctx.ui.notify("Another session holds the wake-alarm lease; this session schedules only alarms it owns.", "info");
+			startHeartbeat();
+			if (ctx.hasUI && !isLeader) ctx.ui.notify("Wake alarm: another live session leads legacy alarms; this session schedules its own.", "info");
 			if (ctx.hasUI && runtime.retiredLegacy) ctx.ui.notify("Wake alarm retired the incompatible v1 periodic watcher state; no alarm was migrated.", "info");
 			if (ctx.hasUI && runtime.alarmCount) ctx.ui.notify(`Wake alarm restored ${runtime.alarmCount} alarm(s).`, "info");
 		} catch (error) {
 			const failed = runtime;
 			runtime = undefined;
 			if (failed) await failed.stop().catch(() => undefined);
-			if (lease) { await releaseLease(lease); lease = undefined; leaseHolder = false; }
+			if (presenceDir) await releasePresence(presenceDir, instanceId);
 			ctx.ui.notify(`Wake alarm disabled: ${(error as Error).message}`, "error");
 		}
 	});
 
 	pi.on("session_shutdown", async () => {
+		// Stop accepting and finish in-flight scheduler work first; only then
+		// withdraw live presence, so the daemon cannot interleave mid-shutdown.
 		stopHeartbeat();
-		if (lease) { await releaseLease(lease); lease = undefined; leaseHolder = false; }
 		const current = runtime;
 		runtime = undefined;
 		if (current) await current.stop();
+		if (presenceDir) { await releasePresence(presenceDir, instanceId); presenceDir = undefined; }
 	});
 }

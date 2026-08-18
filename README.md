@@ -13,7 +13,7 @@ Polling and timing are deterministic and model-free — no tokens are spent unti
 - Remote Docker container watches over SSH: `exit`, `abnormal`, `missing`, `replaced`, `log-error`, `log-match`, `deadline`, `connection-failure` (OR-combined, fingerprint-deduped).
 - Same-session delivery in both process states (live loop insertion / headless resume).
 - Durable at-least-once outbox: a fired event is persisted before delivery, so a crash cannot lose it.
-- Multi-session safe (including pi-web hosting several sessions in one process): a fencing-token lease, owner-scoped scheduling, a cross-process state transaction lock, and merge-save writes prevent double-firing and clobbering.
+- Multi-session safe (including pi-web hosting several sessions in one process): per-session presence registry, owner-scoped scheduling with a deterministic leader, a cross-process state transaction lock with revision CAS, and atomic wake-delivery claims prevent double-firing, starvation, and clobbering.
 - Zero-config for timers. SSH config is needed only for `watch_container`.
 
 ## Install
@@ -24,7 +24,7 @@ pi install npm:pi-wake
 
 Or from source: `pi install git:github.com/Jasperxjy/pi-wake`. Reload Pi afterwards.
 
-Requires Node ≥ 22.18 for the standalone daemon (native TypeScript support). The in-session extension runs wherever Pi runs.
+Requires Node ≥ 22.19 (aligned with Pi's own baseline; native TypeScript support for the daemon). The in-session extension runs wherever Pi runs.
 
 ## Quick start
 
@@ -78,35 +78,34 @@ Creation establishes a log baseline, so historical log content never fires. An e
 
 ```
 session open   →  in-process scheduler → sendMessage(triggerTurn, followUp)  →  wake appears in the live loop
-session closed →  daemon (holds no lease) → pi --session <owner> --print …   →  same session continues headlessly
+session closed →  daemon (owner offline)  → pi --session <owner> --print …   →  same session continues headlessly
 ```
 
-Every alarm created in a session records that session's file as its owner. Ownership routing:
+Every alarm created in a session records that session's file as its owner. Coordination uses two simple primitives instead of a global lock lease:
 
-- A live session schedules only alarms it owns. The single lease holder additionally schedules ownerless (pre-0.1) alarms.
-- Lease acquisition is atomic (`wx`-create) with a fencing epoch; heartbeats re-verify the fencing token before writing, so two sessions can never both believe they hold the lease.
-- All state mutations run under a cross-process transaction lock (`.pi/wake-alarm.state.json.lock`): read-merge-write is serialized, so concurrent runtimes cannot lose each other's alarms or outbox records.
-- The daemon stands down whenever a live session lease (`.pi/wake-alarm.lock.json`, PID + heartbeat) exists, and takes over when it lapses. Sessions establish the lease before scheduling or flushing wakes, and the daemon re-checks the lease and the outbox immediately before resuming a session, so the daemon and a session never both deliver the same wake.
-- Runs spawned by the daemon get `WAKE_ALARM_PASSIVE=1`: their extension instance serves the tool but never schedules, so the daemon stays the single scheduler. While a wake run is active the daemon pauses scheduling, then reloads the state file — alarms the woken agent created or changed are picked up.
-- A wake run that exits 0 clears the outbox record; otherwise it is retried with linear backoff (60 s × attempts, max 5 per daemon activation). Alarms without an owner session (ephemeral `--no-session`) are never spawned; their wakes wait in the outbox for the next interactive session.
+- **Presence registry** (`.pi/wake-alarm.sessions/`): each live session owns exactly one heartbeat file, so registration never contends. A live session schedules only alarms it owns; ownerless (pre-0.1) alarms belong to the deterministic leader (smallest live instance id). The daemon schedules alarms whose owner session is **offline** — so one open session never starves another session's alarms — and ownerless alarms only when no session is live.
+- **Atomic wake claim**: a fired event becomes a durable `pendingWake` outbox record; delivering it requires winning a claim token written under the state transaction lock. Session and daemon use the identical claim transaction, so routing overlaps can never double-deliver, and a crashed claimant's claim simply expires.
+- All state mutations run under a cross-process transaction lock (`.pi/wake-alarm.state.json.lock`) with per-alarm revision CAS: concurrent creates of the same id fail cleanly (`alarm already exists`), scheduler updates on a stale base adopt the disk version, and user actions re-apply their intent onto the freshest state without ever erasing a pending wake.
+- Runs spawned by the daemon get `WAKE_ALARM_PASSIVE=1`: their extension instance serves the tool but never schedules. While a wake run is active the daemon pauses scheduling, then reloads the state file — alarms the woken agent created or changed are picked up.
+- A wake run that exits 0 clears the outbox record; otherwise it is retried with capped linear backoff. Alarms without an owner session (ephemeral `--no-session`) are never spawned; their wakes wait in the outbox for the next interactive session.
 
 ### Running the daemon
 
 ```bash
-node ~/.pi/agent/npm/node_modules/pi-wake/extensions/pi-wake/daemon.ts
+pi-wake-daemon            # from the project directory; installed as a bin by the package
 ```
 
 Run it from the project directory (or set `WAKE_ALARM_CWD`). Keep it alive with your service manager, e.g.:
 
 ```powershell
 # Windows
-schtasks /create /tn "pi-wake" /sc onlogon /tr "node %USERPROFILE%\.pi\agent\npm\node_modules\pi-wake\extensions\pi-wake\daemon.ts"
+schtasks /create /tn "pi-wake" /sc onlogon /tr "pi-wake-daemon"
 ```
 
 ```ini
 # systemd --user
 [Service]
-ExecStart=node %h/.pi/agent/npm/node_modules/pi-wake/extensions/pi-wake/daemon.ts
+ExecStart=pi-wake-daemon
 WorkingDirectory=/path/to/project
 Restart=on-failure
 ```
@@ -146,7 +145,8 @@ On Windows the daemon unwraps the npm `pi.cmd` shim and runs the CLI script with
   "piCommand": null,
   "spawnOnWake": true,
   "runTimeout": "30m",
-  "headlessTrust": "saved"
+  "headlessTrust": "saved",
+  "includeWakeEvidence": true
 }
 ```
 
@@ -154,6 +154,8 @@ On Windows the daemon unwraps the npm `pi.cmd` shim and runs the CLI script with
 - `allowedRemoteLogRoots` constrains which remote log files may be read (realpath-checked remotely).
 - `runTimeout` bounds every headless wake run; the run is terminated after it.
 - `headlessTrust` controls project trust for headless wake runs: `"saved"` (default) passes no approval flag, so a woken run only loads project resources when a saved Pi trust decision or `defaultProjectTrust` allows it; `"always"` adds `--approve`, trusting project resources on every wake — convenient for full automation, weaker for unattended security.
+- `includeWakeEvidence`: when `false`, wake messages contain no remote log excerpts (only the factual event fields), keeping untrusted log text out of the prompt entirely; the woken agent can fetch evidence on demand with `check`.
+- Unknown fields are rejected, so typos fail loudly instead of being silently ignored.
 
 ## Security notes
 
@@ -168,12 +170,14 @@ npm test          # node --test (28 tests: pure logic, multi-session runtime, mu
 npm run typecheck # tsc --noEmit (strict, erasableSyntaxOnly)
 ```
 
-Layout: `core.ts` (pure alarm/event logic) · `runtime.ts` (config, SSH probe, scheduler, state transaction lock) · `lease.ts` (atomic fencing lease) · `index.ts` (Pi extension shell) · `daemon.ts` (standalone scheduler/resume host).
+Layout: `core.ts` (pure alarm/event logic) · `runtime.ts` (config, SSH probe, scheduler, state transaction lock + CAS, wake claims) · `presence.ts` (presence registry / leadership) · `index.ts` (Pi extension shell) · `daemon.ts` (standalone scheduler/resume host).
 
 ## Honest limitations
 
 - The daemon is only as reliable as whatever keeps it alive; use a service manager.
-- Alarms are operational project state, not session-history state: rewinding or forking a Pi conversation does not roll back alarms that were already created.
+- The daemon delivers one wake at a time (deliberate, to keep state writes single-writer during a wake run); multiple alarms firing together are delivered sequentially.
+- A crashed session's presence record takes up to 60 s to expire, so daemon takeover for its alarms lags by at most that window; clean exits are immediate.
+- Alarms are project-global objects: **delivery** is owner-scoped, but **management** (`list`/`pause`/`reset`/`remove`) is available from any session — treat them like cron entries, not private session data. Alarm state is operational project state, not session-history state: rewinding or forking a Pi conversation does not roll back alarms that were already created.
 - Tested against Pi 0.83.x on Node 22.19+ / 24.x (see CI). Requires Node >= 22.19 to match Pi's own baseline.
 - One-shot timers only (no recurring cron) — recurring schedules are deliberately out of scope; see pi-loop / pi-scheduler for in-session recurrence.
 - The headless resume path depends on Pi's `--session` / `--print` CLI surface (and `--approve` only with `headlessTrust: "always"`); track upstream changes when upgrading Pi.
