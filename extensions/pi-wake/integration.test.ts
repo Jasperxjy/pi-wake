@@ -477,7 +477,7 @@ test("daemon emit re-checks presence and refuses to spawn when the owner came ba
 	const logs: string[] = [];
 	let spawns = 0;
 	const emit = createDaemonEmit({
-		getRuntime: () => ({ runtimeConfig: { spawnOnWake: true, headlessTrust: "saved", runTimeoutMs: 1000, piCommand: undefined, maxEvidenceChars: 1000, includeWakeEvidence: true } }) as unknown as WakeAlarmRuntime,
+		getRuntime: () => ({ runtimeConfig: { spawnOnWake: true, headlessTrust: "saved", runTimeoutMs: 1000, piCommand: "pi-stub-command", maxEvidenceChars: 1000, includeWakeEvidence: true } }) as unknown as WakeAlarmRuntime,
 		presenceDir,
 		dryRun: false,
 		spawnDisabled: false,
@@ -502,7 +502,7 @@ test("daemon emit re-checks presence and refuses to spawn when the owner came ba
 	const logs2: string[] = [];
 	let spawns2 = 0;
 	const emit2 = createDaemonEmit({
-		getRuntime: () => ({ runtimeConfig: { spawnOnWake: true, headlessTrust: "saved", runTimeoutMs: 1000, piCommand: undefined, maxEvidenceChars: 1000, includeWakeEvidence: true } }) as unknown as WakeAlarmRuntime,
+		getRuntime: () => ({ runtimeConfig: { spawnOnWake: true, headlessTrust: "saved", runTimeoutMs: 1000, piCommand: "pi-stub-command", maxEvidenceChars: 1000, includeWakeEvidence: true } }) as unknown as WakeAlarmRuntime,
 		presenceDir: badDir,
 		dryRun: false,
 		spawnDisabled: false,

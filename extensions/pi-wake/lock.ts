@@ -11,12 +11,14 @@ import { pidAlive } from "./presence.ts";
  *     token), so a recovered-from-crash contender can never delete a successor's
  *     live lock from the `finally` path.
  *  3. Stale takeover is rename-based: the contender renames the lock it judged
- *     stale to a private victim name and then verifies the victim's inode. The
- *     rename detaches whatever currently sits at `path`; if the inode does not
- *     match the one that was judged stale, a live successor's lock was displaced
- *     and is restored (hard link) instead of deleted. This closes the classic
- *     stat-rm-acquire TOCTOU where two contenders both "recover" the same dead
- *     lock and the second one deletes the first one's fresh lock.
+ *     stale to a private victim name and then verifies the victim — SAME content
+ *     AND SAME inode (inode-only checks are unsound on filesystems that fabricate
+ *     colliding inodes, e.g. WSL/DrvFS). If the identity does not match, a live
+ *     successor's lock was displaced and is restored (hard link, retried until the
+ *     path is free) instead of deleted; a displaced lock is NEVER dropped, so a
+ *     contender can never acquire from a live holder's emptied slot. This closes
+ *     the classic stat-rm-acquire TOCTOU where two contenders both "recover" the
+ *     same dead lock and the second one deletes the first one's fresh lock.
  *  4. A lock whose owner PID is still alive is never judged stale, no matter how
  *     old it is: age-based takeover of a live holder is what allowed a late
  *     release() to delete a successor's lock. Only dead owners are recoverable.
@@ -135,12 +137,27 @@ export class StateLock {
 				try { await fs.rename(this.lockPath, victim); }
 				catch { continue; } // someone else already took it over; retry
 				const victimStat = await fs.stat(victim).catch(() => undefined);
-				const victimIno = victimStat?.ino ?? 0;
-				const sameInode = observed.ino === 0 || victimIno === 0 ? undefined : victimIno === observed.ino;
+				if (!victimStat) {
+					// Our rename reported success but the victim is gone: the stale lock was
+					// concurrently claimed by another contender (Windows can resolve both
+					// renames of the same source without error; only one victim survives).
+					// Nothing of ours was displaced — just retry the loop; the winner will
+					// publish its lock at `path`.
+					continue;
+				}
+				const victimIno = victimStat.ino;
 				const sameText = await fs.readFile(victim, "utf8").catch(() => undefined) === observed.text;
-				if (sameInode === false || (sameInode === undefined && !sameText)) {
+				// The victim is the stale lock we judged only if its identity matches what
+				// we observed: SAME content AND SAME inode (when the filesystem provides
+				// one). Some filesystems fabricate colliding inodes (e.g. WSL/DrvFS), so
+				// the content check is load-bearing: an inode match alone must never
+				// justify deleting a lock whose text differs — that text is a LIVE
+				// successor's lock, and deleting it lets this contender acquire while the
+				// real holder is still inside its critical section.
+				const confirmedStale = sameText && (observed.ino === 0 || victimIno === 0 || victimIno === observed.ino);
+				if (!confirmedStale) {
 					// We displaced a live successor's lock, not the stale one we judged.
-					// Restore it (hard link fails cleanly if a newer lock already exists).
+					// Restore it and never acquire from its emptied slot.
 					await this.restoreVictim(victim);
 					continue;
 				}
@@ -153,24 +170,45 @@ export class StateLock {
 		}
 	}
 
-	/** Best-effort restore of a displaced live lock: hard link back, else rename back when the path is free, else drop it. */
+	/**
+	 * Restore a displaced lock, retrying until the path is free, so a live holder is
+	 * NEVER dispossessed: dropping a live lock is what lets a contender acquire from
+	 * its emptied slot while the holder is still inside its critical section.
+	 * Bounded: after 30s the victim is left orphaned (never deleted) and the acquire
+	 * retry continues; the displaced holder detects the loss at its next verifyHeld().
+	 */
 	private async restoreVictim(victim: string): Promise<void> {
-		try {
-			await fs.link(victim, this.lockPath);
-			await fs.rm(victim, { force: true });
-			return;
-		} catch (error) {
-			const code = (error as NodeJS.ErrnoException).code;
-			if (code !== "EEXIST" && code !== "EPERM" && code !== "EACCES" && code !== "ENOTSUP" && code !== "EOPNOTSUPP") {
-				// Last resort: move it back only when nothing else acquired in the meantime.
-				const occupied = await fs.stat(this.lockPath).catch(() => undefined);
-				if (!occupied) await fs.rename(victim, this.lockPath).catch(() => undefined);
+		const deadline = Date.now() + 30_000;
+		for (;;) {
+			if (Date.now() > deadline) return; // leave the victim orphaned; do not delete it
+			try {
+				await fs.link(victim, this.lockPath);
+				await fs.rm(victim, { force: true });
 				return;
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code === "ENOENT") {
+					// The displaced lock vanished (concurrent rename); nothing to restore.
+					return;
+				}
+				if (code === "EEXIST") {
+					// A contender created a lock in the window; wait for it to release.
+					await this.sleep(10 + Math.floor(Math.random() * 25));
+					continue;
+				}
+				if (code === "EPERM" || code === "EACCES" || code === "ENOTSUP" || code === "EOPNOTSUPP") {
+					// Filesystem without hard links: move back only when the path is free.
+					const occupied = await fs.stat(this.lockPath).catch(() => undefined);
+					if (!occupied) {
+						try { await fs.rename(victim, this.lockPath); return; }
+						catch { /* raced; retry */ }
+					}
+					await this.sleep(10 + Math.floor(Math.random() * 25));
+					continue;
+				}
+				throw error;
 			}
 		}
-		// A successor lock already exists; drop the displaced one. Its holder detects
-		// the loss at the next verifyHeld() and aborts its write.
-		await fs.rm(victim, { force: true }).catch(() => undefined);
 	}
 
 	/** Whether the lock file currently at `path` is still the exact one we acquired (token, and inode when the filesystem provides one). */	private isOurs(observed: LockObservation): boolean {
@@ -186,16 +224,36 @@ export class StateLock {
 	 */
 	async verifyHeld(): Promise<void> {
 		if (!this.identity) throw new Error("state lock is not held");
-		const observed = await this.observe();
-		if (!observed || !this.isOurs(observed)) throw new Error("wake-alarm state lock was taken over; operation aborted");
+		// A contender's takeover can briefly empty `path` while it restores a lock it
+		// displaced (rename-then-verify-then-link). That is transient, not a takeover:
+		// retry for a short window before declaring failure. A genuine takeover shows
+		// up as a DIFFERENT token at `path` and aborts immediately.
+		for (let attempt = 0; ; attempt++) {
+			const observed = await this.observe();
+			if (observed) {
+				if (this.isOurs(observed)) return;
+				throw new Error("wake-alarm state lock was taken over; operation aborted");
+			}
+			if (attempt >= 25) throw new Error("wake-alarm state lock was taken over; operation aborted");
+			await this.sleep(2);
+		}
 	}
 
 	async release(): Promise<void> {
 		const identity = this.identity;
 		this.identity = undefined;
 		if (!identity) return;
-		const observed = await this.observe();
-		if (!observed || observed.parsed?.token !== identity.token || (observed.ino !== 0 && identity.ino !== 0 && observed.ino !== identity.ino)) return;
-		await fs.rm(this.lockPath, { force: true }).catch(() => undefined);
+		// Like verifyHeld: ride out the transient empty window of a contender's
+		// takeover-restore; only remove the lock when it is still ours.
+		for (let attempt = 0; ; attempt++) {
+			const observed = await this.observe();
+			if (observed) {
+				if (observed.parsed?.token !== identity.token || (observed.ino !== 0 && identity.ino !== 0 && observed.ino !== identity.ino)) return;
+				await fs.rm(this.lockPath, { force: true }).catch(() => undefined);
+				return;
+			}
+			if (attempt >= 25) return;
+			await this.sleep(2);
+		}
 	}
 }
