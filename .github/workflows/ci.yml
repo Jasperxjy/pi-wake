@@ -24,8 +24,10 @@ jobs:
         run: |
           set -o pipefail
           if ! npm test 2>&1 | tee npm-test.log; then
-            FAILS=$(grep -E "^✖ " npm-test.log | head -20 || true)
-            echo "::error::npm test failed:\n$FAILS"
+            # Node 24 prints "✖ name", Node 22 prints TAP "not ok N - name"; capture
+            # the assertion context for both so the annotation shows the real error.
+            CTX=$(grep -E -A 12 "^✖ |^not ok " npm-test.log | head -80 | tr '\n' ' ')
+            echo "::error::npm test failed: $CTX"
             exit 1
           fi
       - name: package smoke (real tarball install + bin)
