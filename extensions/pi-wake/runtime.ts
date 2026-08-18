@@ -3,6 +3,7 @@ import path from "node:path";
 import { deflateSync } from "node:zlib";
 import { randomUUID } from "node:crypto";
 import { pidAlive } from "./presence.ts";
+import { StateLock, type LockTestingHooks } from "./lock.ts";
 import {
 	applyBaseline,
 	applyCheckFailure,
@@ -10,12 +11,14 @@ import {
 	applyProbe,
 	applyTimer,
 	createContainerAlarm,
+	createOutboxEntry,
 	createTimerAlarm,
 	decodeNewLog,
 	nextAlarmDueAt,
 	parseAbsoluteTime,
 	parseDuration,
 	restoreAlarmState,
+	restoreOutbox,
 	resumeAlarm,
 	sanitizeExcerpt,
 	timerDelay,
@@ -27,10 +30,12 @@ import {
 	validateRemoteLogPath,
 	validateRemoteLogRoots,
 	validateUser,
+	wakeMessage,
 	type AlarmState,
 	type ContainerAlarmState,
 	type ContainerEventKind,
 	type FiredEvent,
+	type OutboxEntry,
 	type ProbeResult,
 } from "./core.ts";
 
@@ -59,13 +64,24 @@ export interface RuntimeConfig {
 	includeWakeEvidence: boolean;
 }
 
+/**
+ * Durable shared state, version 3. The on-disk file is the source of truth;
+ * each runtime keeps only a cache of it.
+ *
+ *   alarms — the current world: every alarm and its latest revision
+ *   outbox — facts that HAPPENED but have not yet been delivered: one entry per
+ *            wake occurrence, independent of the alarm's current state, so a
+ *            later pause/reset/remove can never corrupt or lose a wake, and one
+ *            event kind may legitimately appear in many entries.
+ */
 export interface StoredState {
-	version: 2;
+	version: 3;
 	alarms: AlarmState[];
+	outbox: OutboxEntry[];
 }
 
 export interface ToolParams {
-	action: "set_timer" | "watch_container" | "list" | "check" | "pause" | "resume" | "reset" | "remove";
+	action: "set_timer" | "watch_container" | "list" | "check" | "pause" | "resume" | "reset" | "remove" | "evidence";
 	id?: string;
 	name?: string;
 	after?: string;
@@ -85,8 +101,8 @@ export interface ActionContext {
 
 export type ExecFn = (file: string, args: string[], options: { signal: AbortSignal; timeout: number }) => Promise<{ stdout: string; stderr: string; code: number }>;
 
-/** Returns false when the wake could not be delivered; the pending outbox record is then kept for retry. */
-export type EmitFn = (alarm: AlarmState, events: FiredEvent[], now: number) => Promise<boolean | void> | boolean | void;
+/** Returns false when the wake could not be delivered; the outbox record is then kept for retry. */
+export type EmitFn = (entry: OutboxEntry) => Promise<boolean | void> | boolean | void;
 
 export interface WakeRetryPolicy {
 	delayMs: number;
@@ -102,19 +118,22 @@ export interface RuntimeOptions {
 	/** When false the runtime loads state and serves actions but never schedules or fires alarms. */
 	schedulingEnabled?: boolean;
 	/**
-	 * Ownership routing: only matching alarms are scheduled or wake-flushed by this
-	 * runtime. Sessions match their own ownerSessionFile (plus ownerless alarms when
-	 * they lead the live-presence registry); the daemon matches alarms whose owner
-	 * session is not live. Correctness never depends on this filter — the atomic
-	 * wake claim under the state lock serializes any routing overlap.
+	 * Ownership routing: only matching alarms (and their outbox entries) are
+	 * scheduled or wake-flushed by this runtime. Sessions match their own
+	 * ownerSessionFile (plus ownerless alarms when they lead the live-presence
+	 * registry); the daemon matches alarms whose owner session is not live.
+	 * Correctness never depends on this filter — the atomic wake claim under the
+	 * state lock serializes any routing overlap.
 	 */
-	owns?: (alarm: AlarmState) => boolean;
+	owns?: (alarm: Pick<AlarmState, "ownerSessionFile">) => boolean;
 	/** Identity used in wake-delivery claims. Defaults to a per-runtime unique id. */
 	claimantId?: string;
 	/** How long a delivery claim stays valid; another claimant may take over after expiry. Defaults to 60s. */
 	deliveryTtlMs?: number | (() => number);
 	/** Backoff applied to undeliverable wakes (linear, capped). Default: 5s delay, 30m cap. */
 	wakeRetry?: WakeRetryPolicy;
+	/** Test hooks for the state-lock stale takeover. */
+	lockHooks?: LockTestingHooks;
 }
 
 const CONFIG_NAME = "wake-alarm.json";
@@ -281,7 +300,7 @@ except Exception as exc:
 `;
 
 const PROBE_LOADER = `import base64,zlib;exec(zlib.decompress(base64.b64decode("${deflateSync(Buffer.from(PROBE_SCRIPT)).toString("base64")}")))`;
-export const ACTION_ENUM = ["set_timer", "watch_container", "list", "check", "pause", "resume", "reset", "remove"] as const;
+export const ACTION_ENUM = ["set_timer", "watch_container", "list", "check", "pause", "resume", "reset", "remove", "evidence"] as const;
 const ACTION_FIELDS: Record<ToolParams["action"], readonly (keyof ToolParams)[]> = {
 	set_timer: ["action", "id", "name", "after", "at"],
 	watch_container: ["action", "id", "name", "container", "events", "policy", "logPath", "logPattern", "deadline", "statusPoll"],
@@ -291,6 +310,7 @@ const ACTION_FIELDS: Record<ToolParams["action"], readonly (keyof ToolParams)[]>
 	resume: ["action", "id"],
 	reset: ["action", "id", "after", "at"],
 	remove: ["action", "id"],
+	evidence: ["action", "id"],
 };
 
 function shellSingleQuote(value: string): string {
@@ -335,22 +355,22 @@ function validateActionParams(params: ToolParams): void {
 	if (irrelevant.length) throw new Error(`${params.action} does not accept: ${irrelevant.join(", ")}`);
 }
 
-/** Read the stored alarm list without validation; returns undefined when the state file is absent. One retry tolerates a rename race. */
-export async function readStoredAlarms(statePath: string): Promise<AlarmState[] | undefined> {
+/** Read the stored alarm list and outbox without validation; undefined when the state file is absent. One retry tolerates a rename race. */
+export async function readStoredState(statePath: string): Promise<StoredState | undefined> {
 	let text: string;
 	try { text = await fs.readFile(statePath, "utf8"); }
 	catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
 	}
-	let saved: { version?: unknown; alarms?: unknown };
-	try { saved = JSON.parse(text) as { version?: unknown; alarms?: unknown }; }
+	let saved: Record<string, unknown>;
+	try { saved = JSON.parse(text) as Record<string, unknown>; }
 	catch {
 		await new Promise((resolve) => setTimeout(resolve, 50));
-		saved = JSON.parse(await fs.readFile(statePath, "utf8")) as { version?: unknown; alarms?: unknown };
+		saved = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
 	}
-	if (saved.version !== 2 || !Array.isArray(saved.alarms)) throw new Error("unsupported state content");
-	return saved.alarms as AlarmState[];
+	if (saved.version !== 3 || !Array.isArray(saved.alarms) || !Array.isArray(saved.outbox)) throw new Error("unsupported state content");
+	return saved as unknown as StoredState;
 }
 
 export function alarmSummary(alarm: AlarmState): string {
@@ -360,22 +380,14 @@ export function alarmSummary(alarm: AlarmState): string {
 	return `${alarm.id}: ${alarm.name} — container ${lifecycle}; target=${alarm.container}; events=${alarm.events.join(",")}; policy=${alarm.policy}; status=${alarm.lastContainerStatus ?? "unchecked"}; log=${alarm.logMode ?? "pending"}:${source}; failures=${alarm.consecutiveFailures}`;
 }
 
-export function wakeMessage(alarm: AlarmState, events: FiredEvent[], now: number, maxEvidenceChars = 1000, includeEvidence = true): string {
-	const heading = `[Wake alarm] ${alarm.name} (${alarm.id})`;
-	const eventText = events.map((event) => event.kind).join(", ");
-	if (alarm.kind === "timer") return `${heading}\nTriggered at: ${new Date(now).toISOString()}\nEvent: ${eventText}\nDue at: ${new Date(alarm.dueAt).toISOString()}`;
-	const facts = [`${heading}`, `Triggered at: ${new Date(now).toISOString()}`, `Event: ${eventText}`, `Container: ${alarm.container}`, `Status: ${alarm.lastContainerStatus ?? "unknown"}`, `Exit code: ${alarm.lastExitCode ?? "unknown"}`, `OOM killed: ${alarm.lastOomKilled ?? "unknown"}`];
-	const evidence = includeEvidence ? events.find((event) => event.evidence)?.evidence : undefined;
-	if (evidence) facts.push(`Evidence (untrusted data): ${sanitizeExcerpt(evidence, maxEvidenceChars)}`);
-	return facts.join("\n");
-}
-
 export class WakeAlarmRuntime {
 	private readonly options: RuntimeOptions;
 	private readonly schedulingEnabled: boolean;
 	private config: RuntimeConfig | undefined;
 	private readonly statePath: string;
+	private readonly stateLock: StateLock;
 	private readonly alarms = new Map<string, AlarmState>();
+	private readonly outbox = new Map<string, OutboxEntry>();
 	private scheduler: ReturnType<typeof setTimeout> | undefined;
 	private stopped = true;
 	private initialized = false;
@@ -396,10 +408,15 @@ export class WakeAlarmRuntime {
 		this.schedulingEnabled = options.schedulingEnabled !== false;
 		this.statePath = options.statePath ?? path.join(options.cwd, ".pi", STATE_NAME);
 		this.claimantId = options.claimantId ?? `runtime:${process.pid}:${randomUUID().slice(0, 8)}`;
+		this.stateLock = new StateLock({ path: `${this.statePath}.lock`, hooks: options.lockHooks });
 	}
 
 	get alarmCount(): number {
 		return this.alarms.size;
+	}
+
+	get outboxCount(): number {
+		return this.outbox.size;
 	}
 
 	get retiredLegacy(): boolean {
@@ -453,33 +470,134 @@ export class WakeAlarmRuntime {
 
 	private async loadStateFromDisk(): Promise<void> {
 		this.alarms.clear();
+		this.outbox.clear();
 		try {
-			const saved = JSON.parse(await fs.readFile(this.statePath, "utf8")) as { version?: unknown; alarms?: unknown };
-			if (saved.version === 1) {
+			const raw = JSON.parse(await fs.readFile(this.statePath, "utf8")) as Record<string, unknown>;
+			if (raw.version === 1) {
 				await fs.rm(this.statePath, { force: true });
 				this.retiredLegacyState = true;
-			} else {
-				if (saved.version !== 2 || !Array.isArray(saved.alarms)) throw new Error("unsupported state version");
-				for (const [index, value] of saved.alarms.entries()) {
-					try {
-						const restored = restoreAlarmState(value, this.runtimeConfig.remote?.allowedRemoteLogRoots ?? []);
-						if (this.alarms.has(restored.id)) throw new Error(`duplicate alarm id: ${restored.id}`);
-						this.alarms.set(restored.id, restored);
-						this.baseRevisions.set(restored.id, restored.revision ?? 0);
-					} catch (error) {
-						throw new Error(`alarms[${index}] is invalid: ${(error as Error).message}; repair or remove ${path.basename(this.statePath)}`);
-					}
+				return;
+			}
+			if (raw.version === 2) {
+				await this.migrateLegacyState(raw);
+				return;
+			}
+			if (raw.version !== 3 || !Array.isArray(raw.alarms) || !Array.isArray(raw.outbox)) throw new Error("unsupported state version");
+			for (const [index, value] of raw.alarms.entries()) {
+				try {
+					const restored = restoreAlarmState(value, this.runtimeConfig.remote?.allowedRemoteLogRoots ?? []);
+					if (this.alarms.has(restored.id)) throw new Error(`duplicate alarm id: ${restored.id}`);
+					this.alarms.set(restored.id, restored);
+					this.baseRevisions.set(restored.id, restored.revision ?? 0);
+				} catch (error) {
+					throw new Error(`alarms[${index}] is invalid: ${(error as Error).message}; repair or remove ${path.basename(this.statePath)}`);
 				}
+			}
+			try {
+				for (const entry of restoreOutbox(raw.outbox)) this.outbox.set(entry.eventId, entry);
+			} catch (error) {
+				throw new Error(`outbox is invalid: ${(error as Error).message}; repair or remove ${path.basename(this.statePath)}`);
 			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`Cannot restore ${path.basename(this.statePath)}: ${(error as Error).message}`);
 		}
 	}
 
+	/** One-time v2 -> v3 migration: move each alarm's embedded pendingWake into the outbox, then rewrite as version 3. */
+	private async migrateLegacyState(raw: Record<string, unknown>): Promise<void> {
+		const source = Array.isArray(raw.alarms) ? raw.alarms : [];
+		const migratedAlarms: unknown[] = [];
+		const migratedOutbox: OutboxEntry[] = [];
+		for (const value of source) {
+			if (!value || typeof value !== "object" || Array.isArray(value)) { migratedAlarms.push(value); continue; }
+			const record = value as Record<string, unknown>;
+			const { pendingWake, ...rest } = record;
+			migratedAlarms.push(rest);
+			if (pendingWake && typeof pendingWake === "object" && !Array.isArray(pendingWake)) {
+				const pending = pendingWake as Record<string, unknown>;
+				if (Array.isArray(pending.events) && pending.events.length) {
+					const triggeredAt = Number.isSafeInteger(pending.triggeredAt) ? (pending.triggeredAt as number) : Date.now();
+					const claim = pending.claim as OutboxEntry["claim"] | undefined;
+					const alarm = restoreAlarmState(rest, this.runtimeConfig.remote?.allowedRemoteLogRoots ?? []);
+					migratedOutbox.push({
+						eventId: `${String(rest.id)}:${triggeredAt}:migrated-${migratedOutbox.length + 1}`,
+						alarmId: alarm.id,
+						alarmName: alarm.name,
+						ownerSessionFile: alarm.ownerSessionFile,
+						triggeredAt,
+						events: pending.events as FiredEvent[],
+						message: wakeMessage(alarm, pending.events as FiredEvent[], triggeredAt, this.runtimeConfig.maxEvidenceChars, this.runtimeConfig.includeWakeEvidence),
+						claim,
+					});
+				}
+			}
+		}
+		await this.withStateLock(async () => {
+			if (await readStoredState(this.statePath)) return; // another runtime already migrated
+			const restored: AlarmState[] = [];
+			for (const [index, value] of migratedAlarms.entries()) {
+				try {
+					restored.push(restoreAlarmState(value, this.runtimeConfig.remote?.allowedRemoteLogRoots ?? []));
+				} catch (error) {
+					throw new Error(`alarms[${index}] is invalid: ${(error as Error).message}; repair or remove ${path.basename(this.statePath)}`);
+				}
+			}
+			restoreOutbox(migratedOutbox);
+			await this.writeFullStateLocked(restored, migratedOutbox);
+			for (const alarm of restored) { this.alarms.set(alarm.id, alarm); this.baseRevisions.set(alarm.id, alarm.revision ?? 0); }
+			for (const entry of migratedOutbox) this.outbox.set(entry.eventId, entry);
+		});
+	}
+
 	/**
-	 * Re-read the alarm state from disk, replacing the in-memory map. Called by an
-	 * emit implementation after a woken session had the chance to change alarms.
-	 * Must be called from inside a serialized runtime operation (e.g. emit).
+	 * Re-read the state file and merge it into the local caches. Disk state is the
+	 * source of truth: new alarms appear, removed alarms vanish, and every alarm
+	 * whose revision advanced is replaced wholesale. This is what lets a long-lived
+	 * daemon (and any session) discover alarms created by other sessions after it
+	 * started, and what keeps the CAS base revisions fresh.
+	 *
+	 * Called before every action and every scheduler tick, and periodically by the
+	 * daemon. Skipped while this runtime still has uncommitted local mutations.
+	 */
+	async reconcileFromDisk(): Promise<void> {
+		if (!this.initialized) throw new Error("wake alarm runtime is not initialized");
+		if (this.dirtyIds.size || this.deletedIds.size) return;
+		const disk = await readStoredState(this.statePath).catch((error) => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		});
+		if (!disk) {
+			this.alarms.clear();
+			this.outbox.clear();
+			this.baseRevisions.clear();
+			return;
+		}
+		const diskById = new Map<string, AlarmState>(disk.alarms.map((alarm) => [alarm.id, alarm]));
+		for (const [id] of [...this.alarms]) {
+			if (!diskById.has(id)) { this.alarms.delete(id); this.baseRevisions.delete(id); }
+		}
+		for (const alarm of disk.alarms) {
+			const local = this.alarms.get(alarm.id);
+			if (!local || (local.revision ?? 0) !== (alarm.revision ?? 0)) {
+				this.alarms.set(alarm.id, alarm);
+				this.baseRevisions.set(alarm.id, alarm.revision ?? 0);
+			}
+		}
+		this.outbox.clear();
+		for (const entry of disk.outbox) this.outbox.set(entry.eventId, entry);
+		for (const eventId of [...this.wakeRetry.keys()]) if (!this.outbox.has(eventId)) this.wakeRetry.delete(eventId);
+	}
+
+	/** Re-read disk state and re-arm the scheduler; used by the daemon's periodic poll. */
+	async resync(): Promise<void> {
+		await this.reconcileFromDisk();
+		this.schedule();
+	}
+
+	/**
+	 * Full reload (alarms and outbox). Called by an emit implementation after a
+	 * woken session had the chance to change alarms. Must be called from inside a
+	 * serialized runtime operation (e.g. emit).
 	 */
 	async reloadFromDisk(): Promise<void> {
 		if (!this.initialized) throw new Error("wake alarm runtime is not initialized");
@@ -496,41 +614,18 @@ export class WakeAlarmRuntime {
 	 * readers never see half a file; it does NOT serialize the read-merge-write
 	 * cycle, so concurrent writers in different processes could lose each other's
 	 * alarms. All state mutations go through this exclusive lock file.
+	 *
+	 * The lock uses inode-verified rename-based stale takeover, so a crash-recovery
+	 * contender can never delete a successor's live lock (see lock.ts).
 	 */
 	private async withStateLock<T>(fn: () => Promise<T>): Promise<T> {
-		const lockPath = `${this.statePath}.lock`;
-		const deadline = Date.now() + 10_000;
-		for (;;) {
-			try {
-				const handle = await fs.open(lockPath, "wx");
-				try { await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() })); }
-				finally { await handle.close(); }
-				break;
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			}
-			let breakIt = false;
-			let raw: { pid?: unknown; acquiredAt?: unknown } | undefined;
-			try { raw = JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: unknown; acquiredAt?: unknown }; }
-			catch { raw = undefined; }
-			const stat = await fs.stat(lockPath).catch(() => undefined);
-			if (!stat) continue; // vanished between create attempt and read; retry
-			const ageMs = Date.now() - stat.mtimeMs;
-			const pid = raw ? Number(raw.pid) : Number.NaN;
-			const acquiredAt = raw ? Number(raw.acquiredAt) : Number.NaN;
-			// A fresh but unparsable lock is half-born (creator is mid-write): wait, never break.
-			const holderDead = raw !== undefined && Number.isSafeInteger(pid) && pid > 0 && !pidAlive(pid);
-			const stale = ageMs > 30_000 || (raw !== undefined && (!Number.isSafeInteger(acquiredAt) || Date.now() - acquiredAt > 30_000));
-			breakIt = holderDead || stale;
-			if (breakIt) {
-				await fs.rm(lockPath, { force: true }).catch(() => undefined);
-				continue;
-			}
-			if (Date.now() > deadline) throw new Error("timed out acquiring the wake-alarm state lock");
-			await new Promise((resolve) => setTimeout(resolve, 25 + Math.floor(Math.random() * 50)));
+		await this.stateLock.acquire();
+		try {
+			await this.stateLock.verifyHeld();
+			return await fn();
+		} finally {
+			await this.stateLock.release();
 		}
-		try { return await fn(); }
-		finally { await fs.rm(lockPath, { force: true }).catch(() => undefined); }
 	}
 
 	/** Windows can transiently refuse a rename while an indexer/AV holds a handle; retry briefly. */
@@ -548,27 +643,43 @@ export class WakeAlarmRuntime {
 		throw lastError;
 	}
 
-	/** Write a complete alarm list atomically. Only call while holding the state lock. */
-	private async writeFullStateLocked(alarms: AlarmState[]): Promise<void> {
+	/** Write the complete version-3 state atomically. Only call while holding the state lock. */
+	private async writeFullStateLocked(alarms: AlarmState[], outbox: OutboxEntry[]): Promise<void> {
+		await this.stateLock.verifyHeld();
 		const temp = `${this.statePath}.tmp-${process.pid}-${Date.now()}`;
-		const data: StoredState = { version: 2, alarms };
+		const data: StoredState = { version: 3, alarms, outbox };
 		await fs.writeFile(temp, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 		try { await this.renameWithRetry(temp, this.statePath); }
 		catch (error) { await fs.rm(temp, { force: true }); throw error; }
+	}
+
+	private async readDiskState(): Promise<StoredState> {
+		return (await readStoredState(this.statePath)) ?? { version: 3, alarms: [], outbox: [] };
+	}
+
+	private async readLatestAlarm(id: string): Promise<AlarmState | undefined> {
+		return (await this.readDiskState()).alarms.find((alarm) => alarm.id === id);
+	}
+
+	private adopt(disk: AlarmState): void {
+		this.alarms.set(disk.id, disk);
+		this.baseRevisions.set(disk.id, disk.revision ?? 0);
 	}
 
 	/**
 	 * Merge-save with per-alarm revision CAS, under the cross-process state lock.
 	 * - fresh create colliding with an existing id on disk -> "already exists" error
 	 * - scheduler-derived update on a stale base -> adopt the disk version (re-derived next tick)
-	 * - user-intent update on a stale base -> merge onto the latest revision,
-	 *   preserving any pending wake so a durable outbox record is never silently lost
+	 * - user-intent update on a stale base -> merge onto the latest revision
+	 *
+	 * The outbox is disk-authoritative here: alarm mutations never rewrite outbox
+	 * facts, except that removing an alarm also drops its undelivered wakes.
 	 */
 	private async saveState(): Promise<void> {
 		if (!this.dirtyIds.size && !this.deletedIds.size) return;
 		await this.withStateLock(async () => {
-			const diskAlarms = (await readStoredAlarms(this.statePath)) ?? [];
-			const byId = new Map<string, AlarmState>(diskAlarms.map((alarm) => [alarm.id, alarm]));
+			const diskState = await this.readDiskState();
+			const byId = new Map<string, AlarmState>(diskState.alarms.map((alarm) => [alarm.id, alarm]));
 			for (const id of this.deletedIds) {
 				byId.delete(id);
 				this.baseRevisions.delete(id);
@@ -601,10 +712,10 @@ export class WakeAlarmRuntime {
 				}
 				if (this.forceIds.has(id)) {
 					// User intent is re-applied onto the freshest disk state, never overlaid
-					// from a stale snapshot; a durable pending wake is always preserved.
+					// from a stale snapshot.
 					const intent = this.intentMap.get(id);
 					const applied = intent ? intent(disk) : mine;
-					const merged = { ...applied, revision: diskRevision + 1, pendingWake: applied.pendingWake ?? disk.pendingWake } as AlarmState;
+					const merged = { ...applied, revision: diskRevision + 1 } as AlarmState;
 					byId.set(id, merged);
 					this.alarms.set(id, merged);
 					this.baseRevisions.set(id, diskRevision + 1);
@@ -613,7 +724,10 @@ export class WakeAlarmRuntime {
 					this.baseRevisions.set(id, diskRevision);
 				}
 			}
-			await this.writeFullStateLocked([...byId.values()]);
+			const outbox = diskState.outbox.filter((entry) => !this.deletedIds.has(entry.alarmId));
+			await this.writeFullStateLocked([...byId.values()], outbox);
+			this.outbox.clear();
+			for (const entry of outbox) this.outbox.set(entry.eventId, entry);
 			this.dirtyIds.clear();
 			this.deletedIds.clear();
 			this.createIds.clear();
@@ -623,52 +737,50 @@ export class WakeAlarmRuntime {
 	}
 
 	/**
-	 * Atomically claim the delivery of an alarm's pending wake. Returns the claim
-	 * token, or undefined when another live claimant holds it or no wake is pending.
+	 * Atomically claim the delivery of one outbox entry. Returns the claim token,
+	 * or undefined when another live claimant holds it or the entry is gone.
 	 */
-	private async claimPendingWake(id: string): Promise<string | undefined> {
+	private async claimOutboxEntry(eventId: string): Promise<string | undefined> {
 		return this.withStateLock(async () => {
-			const diskAlarms = (await readStoredAlarms(this.statePath)) ?? [];
-			const disk = diskAlarms.find((alarm) => alarm.id === id);
-			if (!disk?.pendingWake) return undefined;
+			const diskState = await this.readDiskState();
+			const entry = diskState.outbox.find((candidate) => candidate.eventId === eventId);
+			if (!entry) return undefined;
 			const now = Date.now();
-			const existing = disk.pendingWake.claim;
+			const existing = entry.claim;
 			if (existing && existing.claimantId !== this.claimantId && existing.expiresAt > now) return undefined;
 			const option = this.options.deliveryTtlMs;
 			const ttl = typeof option === "function" ? option() : (option ?? 60_000);
 			const token = randomUUID();
-			const next: AlarmState = { ...disk, revision: (disk.revision ?? 0) + 1, pendingWake: { ...disk.pendingWake, claim: { claimantId: this.claimantId, token, expiresAt: now + ttl } } };
-			await this.writeFullStateLocked(diskAlarms.map((alarm) => (alarm.id === id ? next : alarm)));
-			this.alarms.set(id, next);
-			this.baseRevisions.set(id, next.revision ?? 0);
+			const next: OutboxEntry = { ...entry, claim: { claimantId: this.claimantId, token, expiresAt: now + ttl } };
+			await this.writeFullStateLocked(diskState.alarms, diskState.outbox.map((candidate) => (candidate.eventId === eventId ? next : candidate)));
+			this.outbox.set(eventId, next);
 			return token;
 		});
 	}
 
-	/** Clear a pending wake after successful delivery; only the claim holder can complete. */
-	private async completePendingWakeClaim(id: string, token: string): Promise<boolean> {
+	/** Remove a delivered outbox entry; only the claim holder can complete. */
+	private async completeOutboxEntry(eventId: string, token: string): Promise<boolean> {
 		return this.withStateLock(async () => {
-			const diskAlarms = (await readStoredAlarms(this.statePath)) ?? [];
-			const disk = diskAlarms.find((alarm) => alarm.id === id);
-			if (disk?.pendingWake?.claim?.token !== token) return false;
-			const next: AlarmState = { ...disk, revision: (disk.revision ?? 0) + 1, pendingWake: undefined };
-			await this.writeFullStateLocked(diskAlarms.map((alarm) => (alarm.id === id ? next : alarm)));
-			this.alarms.set(id, next);
-			this.baseRevisions.set(id, next.revision ?? 0);
+			const diskState = await this.readDiskState();
+			const entry = diskState.outbox.find((candidate) => candidate.eventId === eventId);
+			if (entry?.claim?.token !== token) return false;
+			const outbox = diskState.outbox.filter((candidate) => candidate.eventId !== eventId);
+			await this.writeFullStateLocked(diskState.alarms, outbox);
+			this.outbox.delete(eventId);
+			this.wakeRetry.delete(eventId);
 			return true;
 		});
 	}
 
-	/** Release a claim after failed delivery; the pending wake stays for the next attempt. */
-	private async releasePendingWakeClaim(id: string, token: string): Promise<void> {
+	/** Release a claim after failed delivery; the entry stays for the next attempt. */
+	private async releaseOutboxEntryClaim(eventId: string, token: string): Promise<void> {
 		await this.withStateLock(async () => {
-			const diskAlarms = (await readStoredAlarms(this.statePath)) ?? [];
-			const disk = diskAlarms.find((alarm) => alarm.id === id);
-			if (disk?.pendingWake?.claim?.token !== token) return;
-			const next: AlarmState = { ...disk, revision: (disk.revision ?? 0) + 1, pendingWake: { ...disk.pendingWake, claim: undefined } };
-			await this.writeFullStateLocked(diskAlarms.map((alarm) => (alarm.id === id ? next : alarm)));
-			this.alarms.set(id, next);
-			this.baseRevisions.set(id, next.revision ?? 0);
+			const diskState = await this.readDiskState();
+			const entry = diskState.outbox.find((candidate) => candidate.eventId === eventId);
+			if (entry?.claim?.token !== token) return;
+			const next: OutboxEntry = { ...entry, claim: undefined };
+			await this.writeFullStateLocked(diskState.alarms, diskState.outbox.map((candidate) => (candidate.eventId === eventId ? next : candidate)));
+			this.outbox.set(eventId, next);
 		});
 	}
 
@@ -742,16 +854,20 @@ export class WakeAlarmRuntime {
 		throw new Error(lastError);
 	}
 
-	private async tryEmit(alarm: AlarmState, events: FiredEvent[], now: number): Promise<boolean> {
-		try { return (await this.options.emit(alarm, events, now)) !== false; }
+	private outboxOptions(): { maxEvidenceChars: number; includeWakeEvidence: boolean } {
+		return { maxEvidenceChars: this.runtimeConfig.maxEvidenceChars, includeWakeEvidence: this.runtimeConfig.includeWakeEvidence };
+	}
+
+	private async tryEmit(entry: OutboxEntry): Promise<boolean> {
+		try { return (await this.options.emit(entry)) !== false; }
 		catch { return false; }
 	}
 
-	private noteWakeRetry(id: string): void {
+	private noteWakeRetry(eventId: string): void {
 		const policy = this.options.wakeRetry ?? { delayMs: 5_000, capMs: 1_800_000 };
-		const attempts = (this.wakeRetry.get(id)?.attempts ?? 0) + 1;
+		const attempts = (this.wakeRetry.get(eventId)?.attempts ?? 0) + 1;
 		const nextAt = Date.now() + Math.min(policy.delayMs * attempts, policy.capMs);
-		this.wakeRetry.set(id, { attempts, nextAt });
+		this.wakeRetry.set(eventId, { attempts, nextAt });
 	}
 
 	private async replaceAlarm(id: string, next: AlarmState, options?: { force?: boolean; intent?: (disk: AlarmState) => AlarmState }): Promise<void> {
@@ -779,7 +895,10 @@ export class WakeAlarmRuntime {
 		this.dirtyIds.delete(id);
 		this.createIds.delete(id);
 		this.deletedIds.add(id);
-		this.wakeRetry.delete(id);
+		for (const eventId of [...this.outbox.keys()]) {
+			if (this.outbox.get(eventId)?.alarmId === id) this.outbox.delete(eventId);
+		}
+		for (const eventId of [...this.wakeRetry.keys()]) if (!this.outbox.has(eventId)) this.wakeRetry.delete(eventId);
 		try { await this.saveState(); }
 		catch (error) { this.alarms.set(id, previous); this.deletedIds.delete(id); this.dirtyIds.add(id); throw error; }
 	}
@@ -788,140 +907,154 @@ export class WakeAlarmRuntime {
 		return this.options.owns ? this.options.owns(alarm) : true;
 	}
 
-	private async persistDecision<T extends AlarmState>(id: string, state: T, events: FiredEvent[], now: number, shouldEmit: boolean): Promise<T> {
-		if (!shouldEmit || !events.length) {
-			await this.replaceAlarm(id, state);
-			return (this.alarms.get(id) ?? state) as T;
-		}
-		// Fire path: dedupe events against the freshest disk state and record the
-		// pending wake in one locked transaction, so two runtimes cannot fire twice.
-		const fired = await this.withStateLock(async (): Promise<{ alarm: T; newEvents: FiredEvent[] }> => {
-			const diskAlarms = (await readStoredAlarms(this.statePath)) ?? [];
-			const disk = diskAlarms.find((alarm) => alarm.id === id);
-			if (!disk) {
-				this.alarms.delete(id);
-				this.baseRevisions.delete(id);
-				return { alarm: state, newEvents: [] };
-			}
-			let newEvents: FiredEvent[];
-			if (disk.kind === "timer") newEvents = disk.triggeredAt === undefined ? events : [];
-			else {
-				const prints = (disk as ContainerAlarmState).eventFingerprints;
-				newEvents = events.filter((event) => prints[event.kind] !== event.fingerprint);
-			}
-			if (!newEvents.length) {
-				this.alarms.set(id, disk);
-				this.baseRevisions.set(id, disk.revision ?? 0);
-				return { alarm: disk as T, newEvents: [] };
-			}
-			const diskPending = disk.pendingWake;
-			const foreignClaimLive = diskPending?.claim !== undefined && diskPending.claim.expiresAt > now && diskPending.claim.claimantId !== this.claimantId;
-			if (foreignClaimLive && diskPending) {
-				// Another runtime is mid-delivery: record only observation fields and leave
-				// the pending wake and my event fingerprints untouched, so my occurrence
-				// re-fires after the current delivery completes (at-least-once).
-				const observed = { ...state, revision: (disk.revision ?? 0) + 1, pendingWake: diskPending } as T;
-				if (observed.kind === "container") {
-					const prints = { ...observed.eventFingerprints };
-					for (const event of newEvents) delete prints[event.kind];
-					Object.assign(prints, disk.kind === "container" ? disk.eventFingerprints : {});
-					observed.eventFingerprints = prints;
-				}
-				await this.writeFullStateLocked(diskAlarms.map((alarm) => (alarm.id === id ? observed : alarm)));
-				this.alarms.set(id, observed);
-				this.baseRevisions.set(id, observed.revision ?? 0);
-				return { alarm: observed, newEvents: [] };
-			}
-			const pendingEvents = [...(diskPending?.events ?? [])];
-			for (const event of newEvents) if (!pendingEvents.some((pending) => pending.kind === event.kind)) pendingEvents.push(event);
-			const next = { ...state, revision: (disk.revision ?? 0) + 1, pendingWake: { triggeredAt: now, events: pendingEvents } } as T;
-			if (next.kind === "container") {
-				const mergedPrints = { ...next.eventFingerprints, ...(disk.kind === "container" ? disk.eventFingerprints : {}) };
-				for (const event of newEvents) mergedPrints[event.kind] = event.fingerprint;
-				next.eventFingerprints = mergedPrints;
-			}
-			await this.writeFullStateLocked(diskAlarms.map((alarm) => (alarm.id === id ? next : alarm)));
-			this.alarms.set(id, next);
-			this.baseRevisions.set(id, next.revision ?? 0);
-			return { alarm: next, newEvents };
-		});
-		if (this.stopped || !fired.newEvents.length || !fired.alarm.pendingWake) return fired.alarm;
-		return this.deliverPendingWake(id, fired.alarm);
+	private ownsEntry(entry: OutboxEntry): boolean {
+		return this.options.owns ? this.options.owns({ ownerSessionFile: entry.ownerSessionFile }) : true;
 	}
 
-	/** Claim, deliver, and settle a pending wake. Shared by the fire path and outbox flush. */
-	private async deliverPendingWake<T extends AlarmState>(id: string, alarm: T): Promise<T> {
-		const token = await this.claimPendingWake(id);
-		if (!token) {
-			this.noteWakeRetry(id);
-			return alarm;
-		}
-		const current = this.alarms.get(id) ?? alarm;
-		const pending = current.pendingWake;
-		if (!pending) return current as T;
-		const delivered = await this.tryEmit(current, pending.events, pending.triggeredAt);
-		if (delivered) {
-			await this.completePendingWakeClaim(id, token);
-			this.wakeRetry.delete(id);
-		} else {
-			await this.releasePendingWakeClaim(id, token);
-			this.noteWakeRetry(id);
-		}
-		return (this.alarms.get(id) ?? current) as T;
+	private ownedEntries(alarmId: string): OutboxEntry[] {
+		return [...this.outbox.values()].filter((entry) => entry.alarmId === alarmId && this.ownsEntry(entry)).sort((a, b) => a.triggeredAt - b.triggeredAt);
 	}
 
-	private async flushPendingWake(alarm: AlarmState): Promise<void> {
-		if (!alarm.pendingWake || this.stopped) return;
-		await this.deliverPendingWake(alarm.id, alarm);
+	/**
+	 * Claim, deliver, and settle one outbox entry. Delivery itself happens outside
+	 * the state lock; the claim written under the lock guarantees single delivery.
+	 */
+	private async deliverOutboxEntry(eventId: string): Promise<void> {
+		if (this.stopped || !this.outbox.has(eventId)) return;
+		const token = await this.claimOutboxEntry(eventId);
+		if (!token) { this.noteWakeRetry(eventId); return; }
+		const entry = this.outbox.get(eventId);
+		if (!entry) return;
+		const delivered = await this.tryEmit(entry);
+		if (delivered) await this.completeOutboxEntry(eventId, token);
+		else { await this.releaseOutboxEntryClaim(eventId, token); this.noteWakeRetry(eventId); }
 	}
 
 	private async flushPendingWakes(): Promise<void> {
-		for (const alarm of [...this.alarms.values()]) {
-			if (!this.ownsAlarm(alarm)) continue;
-			try { await this.flushPendingWake(alarm); }
+		for (const entry of [...this.outbox.values()].sort((a, b) => a.triggeredAt - b.triggeredAt)) {
+			if (this.stopped) return;
+			if (!this.ownsEntry(entry)) continue;
+			try { await this.deliverOutboxEntry(entry.eventId); }
 			catch { /* The scheduler retries pending outbox delivery with backoff. */ }
 		}
 	}
 
+	/**
+	 * Timer check: recompute the fire decision from the freshest persisted state
+	 * under the transaction lock. A stale in-memory snapshot can therefore never
+	 * fire a timer that was paused or reset by another runtime in the meantime:
+	 * `applyTimer` is applied to the latest disk alarm, not to the local cache.
+	 */
+	private async checkTimer(id: string, shouldEmit: boolean): Promise<{ alarm: AlarmState; events: FiredEvent[] }> {
+		const current = this.alarms.get(id);
+		if (!current || current.kind !== "timer") throw new Error(`unknown timer alarm: ${id}`);
+		return this.withStateLock(async () => {
+			const disk = await this.readLatestAlarm(id);
+			if (!disk) { this.alarms.delete(id); this.baseRevisions.delete(id); return { alarm: current, events: [] }; }
+			if (disk.kind !== "timer") { this.adopt(disk); return { alarm: disk, events: [] }; }
+			const now = Date.now();
+			const decision = applyTimer(disk, now);
+			if (!decision.events.length) { this.adopt(disk); return { alarm: disk, events: [] }; }
+			const next: AlarmState = { ...decision.state, revision: (disk.revision ?? 0) + 1 };
+			const diskState = await this.readDiskState();
+			const alarms = diskState.alarms.map((alarm) => (alarm.id === id ? next : alarm));
+			if (shouldEmit) {
+				const entry = createOutboxEntry(decision.state, decision.events, now, this.outboxOptions());
+				await this.writeFullStateLocked(alarms, [...diskState.outbox, entry]);
+				this.outbox.set(entry.eventId, entry);
+			} else {
+				await this.writeFullStateLocked(alarms, diskState.outbox);
+			}
+			this.adopt(next);
+			return { alarm: next, events: decision.events };
+		});
+	}
+
+	/**
+	 * Container check with optimistic concurrency: the time-based deadline decision
+	 * is computed under the lock, then the SSH probe runs OUTSIDE it (a probe can
+	 * take many seconds and must not hold the lock), and finally the result is
+	 * committed only if the world did not move: same revision, same active flag.
+	 * Otherwise the probe is discarded and the freshest disk state adopted.
+	 */
 	private async checkContainer(id: string, shouldEmit: boolean, observePaused = false): Promise<{ alarm: ContainerAlarmState; events: FiredEvent[] }> {
 		const current = this.alarms.get(id);
 		if (!current || current.kind !== "container") throw new Error(`unknown container alarm: ${id}`);
 		if (!current.active && !observePaused) return { alarm: current, events: [] };
-		const preservePaused = !current.active && observePaused;
-		const observed = preservePaused ? { ...current, active: true, pauseReason: undefined } : current;
-		const now = Date.now();
-		const deadlineDecision = applyContainerDeadline(observed, now);
-		if (deadlineDecision.events.length && !deadlineDecision.state.active && shouldEmit) {
-			const alarm = await this.persistDecision(id, deadlineDecision.state, deadlineDecision.events, now, true);
-			return { alarm, events: deadlineDecision.events };
-		}
-		let decision: { state: ContainerAlarmState; events: FiredEvent[] };
-		try { decision = applyProbe(deadlineDecision.state, await this.probe(deadlineDecision.state), now); }
+		const phaseA = await this.withStateLock(async (): Promise<{ base: ContainerAlarmState | undefined; revision: number; deadline: { state: ContainerAlarmState; events: FiredEvent[] }; committed: { alarm: ContainerAlarmState; events: FiredEvent[] } | undefined }> => {
+			const disk = await this.readLatestAlarm(id);
+			if (!disk) { this.alarms.delete(id); this.baseRevisions.delete(id); return { base: undefined, revision: -1, deadline: { state: current, events: [] }, committed: undefined }; }
+			if (disk.kind !== "container") { this.adopt(disk); return { base: undefined, revision: -1, deadline: { state: current, events: [] }, committed: undefined }; }
+			const preservePaused = !disk.active && observePaused;
+			const effective: ContainerAlarmState = preservePaused ? { ...disk, active: true, pauseReason: undefined } : disk;
+			const deadline = applyContainerDeadline(effective, Date.now());
+			if (deadline.events.length && !deadline.state.active && shouldEmit) {
+				// Deadline fired with the pause policy: commit the transition and the
+				// wake in one locked transaction (time-based, SSH not required).
+				const next: ContainerAlarmState = { ...deadline.state, revision: (disk.revision ?? 0) + 1 };
+				const entry = createOutboxEntry(deadline.state, deadline.events, Date.now(), this.outboxOptions());
+				const diskState = await this.readDiskState();
+				await this.writeFullStateLocked(diskState.alarms.map((alarm) => (alarm.id === id ? next : alarm)), [...diskState.outbox, entry]);
+				this.adopt(next);
+				this.outbox.set(entry.eventId, entry);
+				return { base: undefined, revision: -1, deadline: { state: current, events: [] }, committed: { alarm: next, events: deadline.events } };
+			}
+			return { base: disk, revision: disk.revision ?? 0, deadline, committed: undefined };
+		});
+		if (phaseA.committed) return phaseA.committed;
+		if (!phaseA.base) return { alarm: current, events: [] };
+		let probeResult: ProbeResult | undefined;
+		let failureReason: string | undefined;
+		try { probeResult = await this.probe(phaseA.deadline.state); }
 		catch (error) {
 			if (this.stopped) return { alarm: current, events: [] };
-			const maxFailures = this.runtimeConfig.remote?.maxConsecutiveFailures ?? 3;
-			decision = applyCheckFailure(deadlineDecision.state, now, maxFailures, sanitizeExcerpt((error as Error).message, 800));
+			failureReason = sanitizeExcerpt((error as Error).message, 800);
 		}
-		const events = [...deadlineDecision.events, ...decision.events];
-		const next = preservePaused ? { ...decision.state, active: false, pauseReason: current.pauseReason } : decision.state;
-		const alarm = await this.persistDecision(id, next, events, now, shouldEmit);
-		return { alarm, events };
-	}
-
-	private async checkTimer(id: string, shouldEmit: boolean): Promise<{ alarm: AlarmState; events: FiredEvent[] }> {
-		const current = this.alarms.get(id);
-		if (!current || current.kind !== "timer") throw new Error(`unknown timer alarm: ${id}`);
-		const now = Date.now();
-		const decision = applyTimer(current, now);
-		if (decision.state === current) return { alarm: current, events: [] };
-		const alarm = await this.persistDecision(id, decision.state, decision.events, now, shouldEmit);
-		return { alarm, events: decision.events };
+		return this.withStateLock(async (): Promise<{ alarm: ContainerAlarmState; events: FiredEvent[] }> => {
+			const disk = await this.readLatestAlarm(id);
+			if (!disk) { this.alarms.delete(id); this.baseRevisions.delete(id); return { alarm: current, events: [] }; }
+			if (disk.kind !== "container" || (disk.revision ?? 0) !== phaseA.revision || disk.active !== phaseA.base!.active) {
+				this.adopt(disk);
+				return { alarm: disk as ContainerAlarmState, events: [] };
+			}
+			const preservePaused = !disk.active && observePaused;
+			const effective: ContainerAlarmState = preservePaused ? { ...disk, active: true, pauseReason: undefined } : disk;
+			const now2 = Date.now();
+			// Recompute BOTH the time-based deadline and the probe-derived decision on the
+			// freshest disk state (structurally equal to the pre-probe base, but the
+			// deadline may have newly crossed while the probe ran). Committing from the
+			// fresh deadline state also records the deadline fingerprint exactly once.
+			const deadline = applyContainerDeadline(effective, now2);
+			const applied = probeResult
+				? applyProbe(deadline.state, probeResult, now2)
+				: applyCheckFailure(deadline.state, now2, this.runtimeConfig.remote?.maxConsecutiveFailures ?? 3, failureReason ?? "SSH probe failed");
+			const events = [...deadline.events, ...applied.events.filter((event) => !deadline.events.some((other) => other.fingerprint === event.fingerprint))];
+			const nextBase: ContainerAlarmState = preservePaused ? { ...applied.state, active: false, pauseReason: disk.pauseReason } : applied.state;
+			const next: ContainerAlarmState = { ...nextBase, revision: (disk.revision ?? 0) + 1 };
+			const diskState = await this.readDiskState();
+			const alarms = diskState.alarms.map((alarm) => (alarm.id === id ? next : alarm));
+			if (shouldEmit && events.length) {
+				const entry = createOutboxEntry(next, events, Date.now(), this.outboxOptions());
+				await this.writeFullStateLocked(alarms, [...diskState.outbox, entry]);
+				this.outbox.set(entry.eventId, entry);
+			} else {
+				await this.writeFullStateLocked(alarms, diskState.outbox);
+			}
+			this.adopt(next);
+			return { alarm: next, events };
+		});
 	}
 
 	private effectiveDueAt(alarm: AlarmState): number | undefined {
-		const retry = this.wakeRetry.get(alarm.id);
-		if (alarm.pendingWake && retry && retry.nextAt > Date.now()) return retry.nextAt;
-		return nextAlarmDueAt(alarm);
+		const alarmDue = nextAlarmDueAt(alarm);
+		let entryDue: number | undefined;
+		for (const entry of this.ownedEntries(alarm.id)) {
+			const retry = this.wakeRetry.get(entry.eventId);
+			const due = retry && retry.nextAt > Date.now() ? retry.nextAt : entry.triggeredAt;
+			entryDue = entryDue === undefined ? due : Math.min(entryDue, due);
+		}
+		if (alarmDue === undefined) return entryDue;
+		return entryDue === undefined ? alarmDue : Math.min(alarmDue, entryDue);
 	}
 
 	private scheduleRetry(): void {
@@ -940,16 +1073,25 @@ export class WakeAlarmRuntime {
 		this.scheduler = setTimeout(() => {
 			this.scheduler = undefined;
 			this.serialize(async () => {
+				await this.reconcileFromDisk();
 				const now = Date.now();
 				let failed = false;
 				for (const alarm of [...this.alarms.values()]) {
-					if (!this.ownsAlarm(alarm)) continue;
+					if (this.stopped || !this.ownsAlarm(alarm)) continue;
 					const dueAt = this.effectiveDueAt(alarm);
-					if (this.stopped || dueAt === undefined || dueAt > now) continue;
+					if (dueAt === undefined || dueAt > now) continue;
 					try {
-						if (alarm.pendingWake) await this.flushPendingWake(alarm);
-						else if (alarm.kind === "timer") await this.checkTimer(alarm.id, true);
-						else await this.checkContainer(alarm.id, true);
+						for (const entry of this.ownedEntries(alarm.id)) {
+							const retry = this.wakeRetry.get(entry.eventId);
+							const entryDue = retry && retry.nextAt > Date.now() ? retry.nextAt : entry.triggeredAt;
+							if (entryDue <= Date.now()) await this.deliverOutboxEntry(entry.eventId);
+						}
+						const current = this.alarms.get(alarm.id);
+						if (this.stopped || !current) continue;
+						const alarmDue = nextAlarmDueAt(current);
+						if (alarmDue === undefined || alarmDue > Date.now()) continue;
+						if (current.kind === "timer") await this.checkTimer(current.id, true);
+						else await this.checkContainer(current.id, true);
 					} catch {
 						failed = true;
 					}
@@ -1004,6 +1146,9 @@ export class WakeAlarmRuntime {
 		if (!params || !(ACTION_ENUM as readonly string[]).includes(params.action)) throw new Error("invalid wake alarm action");
 		validateActionParams(params);
 		return this.serialize(async () => {
+			// Always act on the freshest disk truth: alarms created by other sessions
+			// appear here, and locally-deleted alarms are not resurrected by stale caches.
+			await this.reconcileFromDisk();
 			switch (params.action) {
 				case "set_timer": return `Set ${alarmSummary(await this.setTimer(params, context))}`;
 				case "watch_container": return `Set ${alarmSummary(await this.watchContainer(params, context))}`;
@@ -1015,13 +1160,15 @@ export class WakeAlarmRuntime {
 					for (const id of ids) {
 						let current = this.alarms.get(id);
 						if (!current) throw new Error(`unknown alarm: ${id}`);
-						if (current.pendingWake && this.ownsAlarm(current)) {
-							await this.flushPendingWake(current);
-							current = this.alarms.get(id);
-							if (!current || current.pendingWake) throw new Error(`alarm ${id} still has an undelivered pending wake`);
+						for (const entry of this.ownedEntries(id)) {
+							const retry = this.wakeRetry.get(entry.eventId);
+							if (retry && retry.nextAt > Date.now()) continue;
+							await this.deliverOutboxEntry(entry.eventId);
 						}
+						current = this.alarms.get(id);
+						if (!current) continue;
 						const result = current.kind === "timer" ? await this.checkTimer(id, false) : await this.checkContainer(id, false, true);
-						const pending = result.alarm.pendingWake ? "; wake pending for the owner session or daemon" : "";
+						const pending = this.ownedEntries(id).length ? "; wake pending for the owner session or daemon" : "";
 						lines.push(`${alarmSummary(result.alarm)}${result.events.length ? `; observed=${result.events.map((event) => event.kind).join(",")}` : ""}${pending}`);
 					}
 					this.schedule(); return lines.join("\n");
@@ -1045,6 +1192,25 @@ export class WakeAlarmRuntime {
 				case "remove": {
 					if (!params.id) throw new Error("id is required for remove");
 					const id = validateAlarmId(params.id); await this.removeAlarm(id); this.schedule(); return `Removed ${id}.`;
+				}
+				case "evidence": {
+					if (!params.id) throw new Error("id is required for evidence");
+					const id = validateAlarmId(params.id);
+					const maxChars = this.runtimeConfig.maxEvidenceChars;
+					const alarm = this.alarms.get(id);
+					const seen = new Set<string>();
+					const parts: string[] = [];
+					const push = (text?: string): void => {
+						if (!text) return;
+						const trimmed = text.trim();
+						if (trimmed && !seen.has(trimmed)) { seen.add(trimmed); parts.push(trimmed); }
+					};
+					for (const entry of [...this.outbox.values()].filter((entry) => entry.alarmId === id).sort((a, b) => a.triggeredAt - b.triggeredAt)) {
+						for (const event of entry.events) push(event.evidence);
+					}
+					if (alarm?.kind === "container") push(alarm.lastEvidence);
+					if (!parts.length) return `No recorded evidence for ${id}.`;
+					return parts.map((part) => sanitizeExcerpt(part, maxChars)).join("\n---\n");
 				}
 			}
 		});

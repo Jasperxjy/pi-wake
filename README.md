@@ -57,7 +57,7 @@ Tool JSON (the agent calls `wake_alarm`; you can also use the slash command):
 }
 ```
 
-Lifecycle: `{"action":"list"}`, `{"action":"check","id":"…"}`, `pause`, `resume`, `reset`, `remove`. Slash form: `/wake-alarm list`, `/wake-alarm check train-run`, …
+Lifecycle: `{"action":"list"}`, `{"action":"check","id":"…"}`, `pause`, `resume`, `reset`, `remove`, and `evidence` (opt-in historical log excerpts, see below). Slash form: `/wake-alarm list`, `/wake-alarm check train-run`, …
 
 ### Container events
 
@@ -84,8 +84,9 @@ session closed →  daemon (owner offline)  → pi --session <owner> --print …
 Every alarm created in a session records that session's file as its owner. Coordination uses two simple primitives instead of a global lock lease:
 
 - **Presence registry** (`.pi/wake-alarm.sessions/`): each live session owns exactly one heartbeat file, so registration never contends. A live session schedules only alarms it owns; ownerless (pre-0.1) alarms belong to the deterministic leader (smallest live instance id). The daemon schedules alarms whose owner session is **offline** — so one open session never starves another session's alarms — and ownerless alarms only when no session is live.
-- **Atomic wake claim**: a fired event becomes a durable `pendingWake` outbox record; delivering it requires winning a claim token written under the state transaction lock. Session and daemon use the identical claim transaction, so routing overlaps can never double-deliver, and a crashed claimant's claim simply expires.
-- All state mutations run under a cross-process transaction lock (`.pi/wake-alarm.state.json.lock`) with per-alarm revision CAS: concurrent creates of the same id fail cleanly (`alarm already exists`), scheduler updates on a stale base adopt the disk version, and user actions re-apply their intent onto the freshest state without ever erasing a pending wake.
+- **Outbox is independent of alarm state.** A fired event becomes a durable outbox entry — a fact that HAPPENED — with its own bounded message snapshot. Entries survive pause/reset/remove of the alarm (at-least-once delivery), one event kind may occur in many entries (keep policy re-fires), and delivering an entry requires winning a claim token written under the state transaction lock. Session and daemon use the identical claim transaction, so routing overlaps can never double-deliver, and a crashed claimant's claim simply expires.
+- **Disk state is the source of truth.** The runtime keeps only a cache; every action, every scheduler tick, and the daemon's 5-second poll re-reads the state file and merges it into the cache (`reconcile`). Alarms created by another session after this process started are adopted automatically, removed alarms disappear, and any alarm whose revision advanced is replaced wholesale.
+- All state mutations run under a cross-process transaction lock (`.pi/wake-alarm.state.json.lock`, inode-verified rename-based stale takeover so a crash-recovery contender can never delete a successor's lock) with per-alarm revision CAS: concurrent creates of the same id fail cleanly (`alarm already exists`), and scheduler decisions are recomputed from the freshest persisted state — a stale scheduler can never fire a timer that was paused or reset in the meantime.
 - Runs spawned by the daemon get `WAKE_ALARM_PASSIVE=1`: their extension instance serves the tool but never schedules. While a wake run is active the daemon pauses scheduling, then reloads the state file — alarms the woken agent created or changed are picked up.
 - A wake run that exits 0 clears the outbox record; otherwise it is retried with capped linear backoff. Alarms without an owner session (ephemeral `--no-session`) are never spawned; their wakes wait in the outbox for the next interactive session.
 
@@ -154,7 +155,7 @@ On Windows the daemon unwraps the npm `pi.cmd` shim and runs the CLI script with
 - `allowedRemoteLogRoots` constrains which remote log files may be read (realpath-checked remotely).
 - `runTimeout` bounds every headless wake run; the run is terminated after it.
 - `headlessTrust` controls project trust for headless wake runs: `"saved"` (default) passes no approval flag, so a woken run only loads project resources when a saved Pi trust decision or `defaultProjectTrust` allows it; `"always"` adds `--approve`, trusting project resources on every wake — convenient for full automation, weaker for unattended security.
-- `includeWakeEvidence`: when `false`, wake messages contain no remote log excerpts (only the factual event fields), keeping untrusted log text out of the prompt entirely; the woken agent can fetch evidence on demand with `check`.
+- `includeWakeEvidence`: when `false`, wake messages contain no remote log excerpts (only the factual event fields), keeping untrusted log text out of the prompt entirely; the woken agent can still fetch the stored evidence on demand with `{"action":"evidence","id":"…"}` — evidence is returned only on that explicit request.
 - Unknown fields are rejected, so typos fail loudly instead of being silently ignored.
 
 ## Security notes
@@ -166,7 +167,7 @@ On Windows the daemon unwraps the npm `pi.cmd` shim and runs the CLI script with
 ## Development
 
 ```bash
-npm test          # node --test (28 tests: pure logic, multi-session runtime, multi-process integration)
+npm test          # unit + multi-session runtime + multi-process integration tests
 npm run typecheck # tsc --noEmit (strict, erasableSyntaxOnly)
 ```
 

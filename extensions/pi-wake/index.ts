@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AlarmState, FiredEvent } from "./core.ts";
+import type { OutboxEntry } from "./core.ts";
 import {
 	PRESENCE_DIR_NAME,
 	leaderInstanceId,
@@ -13,7 +13,6 @@ import {
 import {
 	ACTION_ENUM,
 	WakeAlarmRuntime,
-	wakeMessage,
 	type ToolParams,
 } from "./runtime.ts";
 
@@ -64,14 +63,11 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		if (typeof presenceHeartbeat.unref === "function") presenceHeartbeat.unref();
 	}
 
-	function sessionEmit(alarm: AlarmState, events: FiredEvent[], now: number): boolean {
-		let maxEvidenceChars = 1000;
-		let includeEvidence = true;
-		try {
-			maxEvidenceChars = runtime?.runtimeConfig.maxEvidenceChars ?? maxEvidenceChars;
-			includeEvidence = runtime?.runtimeConfig.includeWakeEvidence ?? includeEvidence;
-		} catch { /* config not ready */ }
-		pi.sendMessage({ customType: "wake-alarm", content: wakeMessage(alarm, events, now, maxEvidenceChars, includeEvidence), display: true, details: { alarmId: alarm.id, events: events.map((event) => event.kind) } }, { triggerTurn: true, deliverAs: "followUp" });
+	function sessionEmit(entry: OutboxEntry): boolean {
+		// The outbox entry carries a bounded message snapshot built at fire time with
+		// the configured evidence policy; delivery never recomputes it from the
+		// current alarm state, so a pause/reset in the meantime cannot change it.
+		pi.sendMessage({ customType: "wake-alarm", content: entry.message, display: true, details: { alarmId: entry.alarmId, eventId: entry.eventId, events: entry.events.map((event) => event.kind) } }, { triggerTurn: true, deliverAs: "followUp" });
 		return true;
 	}
 

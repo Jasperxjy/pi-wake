@@ -4,12 +4,15 @@
  * through two coordination primitives:
  *
  *   presence registry  (.pi/wake-alarm.sessions/) — which sessions are live
- *   atomic wake claim  (pendingWake.claim)        — who delivers this wake
+ *   atomic wake claim  (outbox entry claim)       — who delivers this wake
  *
- * The daemon schedules only alarms whose owner session is not live (ownerless
- * alarms only when no session is live at all). Delivery itself is claimed under
- * the state transaction lock, so a routing overlap can never double-deliver.
- * Owned alarms are delivered by resuming the owner session headlessly:
+ * The daemon re-reads the state file on every poll (disk state is the source of
+ * truth), so alarms created by other sessions after daemon start are adopted
+ * automatically. It schedules only alarms whose owner session is not live
+ * (ownerless alarms only when no session is live at all). Delivery itself is
+ * claimed under the state transaction lock, so a routing overlap can never
+ * double-deliver. Owned alarms are delivered by resuming the owner session
+ * headlessly:
  *
  *   pi --session <ownerSessionFile> --print "<factual wake message>"
  *
@@ -23,9 +26,9 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { buildResumeArgs, type AlarmState, type FiredEvent } from "./core.ts";
+import { buildResumeArgs, type AlarmState, type OutboxEntry } from "./core.ts";
 import { PRESENCE_DIR_NAME, isSessionFileLive, listLivePresences, type PresenceRecord } from "./presence.ts";
-import { WakeAlarmRuntime, wakeMessage, type EmitFn, type ExecFn } from "./runtime.ts";
+import { WakeAlarmRuntime, type EmitFn, type ExecFn } from "./runtime.ts";
 
 const PRESENCE_POLL_MS = 5_000;
 const ACTIVATION_RETRY_MS = 10_000;
@@ -168,6 +171,7 @@ function runPi(launch: PiLaunch, sessionFile: string, message: string, timeoutMs
 
 export interface DaemonEmitDeps {
 	getRuntime: () => WakeAlarmRuntime | undefined;
+	presenceDir: string;
 	dryRun: boolean;
 	spawnDisabled: boolean;
 	isStopping: () => boolean;
@@ -176,25 +180,34 @@ export interface DaemonEmitDeps {
 }
 
 /**
- * The daemon-side emit, invoked only after this runtime holds the delivery
- * claim. Returning false releases the claim and keeps the wake in the outbox
- * for a later attempt (or for the next live session of the owner).
+ * The daemon-side emit, invoked only after this runtime holds the delivery claim
+ * for an outbox entry. Returning false releases the claim and keeps the entry
+ * in the outbox for a later attempt (or for the next live session of the owner).
  */
 export function createDaemonEmit(deps: DaemonEmitDeps): EmitFn {
-	return async (alarm: AlarmState, events: FiredEvent[], now: number): Promise<boolean> => {
+	return async (entry: OutboxEntry): Promise<boolean> => {
 		const runtime = deps.getRuntime();
 		if (!runtime || deps.isStopping()) return false;
 		const config = runtime.runtimeConfig;
 		if (deps.spawnDisabled || !config.spawnOnWake) {
-			deps.log(`wake for ${alarm.id} observed but spawning is disabled; left in the outbox`);
+			deps.log(`wake for ${entry.alarmId} observed but spawning is disabled; left in the outbox`);
 			return false;
 		}
-		const sessionFile = alarm.ownerSessionFile;
+		const sessionFile = entry.ownerSessionFile;
+		// Re-check presence between the claim and the spawn: if the owner session came
+		// back online in the meantime, leave the wake for the live session instead of
+		// spawning a second Pi process against the same session file. Ownerless wakes
+		// are daemon-served only while no session is live at all.
+		const live = await listLivePresences(deps.presenceDir).catch(() => []);
+		if (sessionFile ? isSessionFileLive(live, sessionFile) : live.length > 0) {
+			deps.log(`owner of ${entry.alarmId} is now live; wake left in the outbox for the session`);
+			return false;
+		}
 		if (!sessionFile) {
-			deps.log(`wake for ${alarm.id} has no owner session; left in the outbox for the next interactive session`);
+			deps.log(`wake for ${entry.alarmId} has no owner session; left in the outbox for the next interactive session`);
 			return false;
 		}
-		const message = wakeMessage(alarm, events, now, config.maxEvidenceChars, config.includeWakeEvidence);
+		const message = entry.message;
 		let launch: PiLaunch;
 		try { launch = await resolvePiLaunch(config.piCommand); }
 		catch (error) {
@@ -207,12 +220,12 @@ export function createDaemonEmit(deps: DaemonEmitDeps): EmitFn {
 		}
 		try { await fs.access(sessionFile); }
 		catch {
-			deps.log(`owner session file for ${alarm.id} is gone (${sessionFile}); left in the outbox`);
+			deps.log(`owner session file for ${entry.alarmId} is gone (${sessionFile}); left in the outbox`);
 			return false;
 		}
-		deps.log(`waking session for alarm ${alarm.id} (${events.map((event) => event.kind).join(", ")}): ${sessionFile}`);
+		deps.log(`waking session for alarm ${entry.alarmId} (${entry.events.map((event) => event.kind).join(", ")}): ${sessionFile}`);
 		const code = await deps.runPi(launch, sessionFile, message, config.runTimeoutMs, config.headlessTrust === "always");
-		deps.log(`wake run for ${alarm.id} exited with code ${code}`);
+		deps.log(`wake run for ${entry.alarmId} exited with code ${code}`);
 		// The woken session may have created or changed alarms; reload before the next write.
 		try { await runtime.reloadFromDisk(); }
 		catch (error) { deps.log(`state reload after wake run failed: ${(error as Error).message}`); }
@@ -235,6 +248,7 @@ async function main(): Promise<void> {
 	log(`watching project ${cwd}${dryRun ? " (dry-run)" : ""}${spawnDisabled ? " (spawning disabled)" : ""}`);
 	const emit = createDaemonEmit({
 		getRuntime: () => active,
+		presenceDir,
 		dryRun,
 		spawnDisabled,
 		isStopping: () => stopping,
@@ -265,6 +279,11 @@ async function main(): Promise<void> {
 				await sleep(ACTIVATION_RETRY_MS);
 				continue;
 			}
+		} else {
+			// Disk state is the source of truth: adopt alarms created or changed by
+			// other sessions since the last poll, then re-arm the scheduler.
+			try { await active.resync(); }
+			catch (error) { log(`reconcile failed: ${(error as Error).message}`); }
 		}
 		await sleep(PRESENCE_POLL_MS);
 	}

@@ -36,6 +36,7 @@
 		"extensions/pi-wake/index.ts",
 		"extensions/pi-wake/core.ts",
 		"extensions/pi-wake/presence.ts",
+		"extensions/pi-wake/lock.ts",
 		"extensions/pi-wake/runtime.ts",
 		"extensions/pi-wake/daemon.ts"
 	],

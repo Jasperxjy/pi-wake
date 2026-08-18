@@ -5,31 +5,31 @@ import { promises as fs, readFileSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { daemonOwns } from "./daemon.ts";
+import { createDaemonEmit, daemonOwns } from "./daemon.ts";
 import { leaderInstanceId, listLivePresences, registerPresence, releasePresence } from "./presence.ts";
-import { WakeAlarmRuntime, type EmitFn, type ExecFn } from "./runtime.ts";
-import type { AlarmState, FiredEvent, TimerAlarmState } from "./core.ts";
+import { StateLock } from "./lock.ts";
+import { WakeAlarmRuntime, type EmitFn, type ExecFn, type StoredState } from "./runtime.ts";
+import { applyBaseline, createContainerAlarm, type AlarmState, type FiredEvent, type OutboxEntry, type ProbeResult, type TimerAlarmState } from "./core.ts";
 
 const runtimeUrl = pathToFileURL(path.resolve("extensions/pi-wake/runtime.ts")).href;
 const presenceUrl = pathToFileURL(path.resolve("extensions/pi-wake/presence.ts")).href;
+const lockUrl = pathToFileURL(path.resolve("extensions/pi-wake/lock.ts")).href;
 const noopExec: ExecFn = async () => ({ stdout: "", stderr: "", code: 0 });
 
 async function makeDir(): Promise<string> {
 	return fs.mkdtemp(path.join(tmpdir(), "pi-wake-it-"));
 }
 
-async function writeState(dir: string, alarms: AlarmState[]): Promise<string> {
-	const statePath = path.join(dir, "state.json");
-	await fs.writeFile(statePath, `${JSON.stringify({ version: 2, alarms }, null, 2)}\n`);
-	return statePath;
+async function writeState(statePath: string, alarms: AlarmState[], outbox: OutboxEntry[] = []): Promise<void> {
+	await fs.writeFile(statePath, `${JSON.stringify({ version: 3, alarms, outbox } as StoredState, null, 2)}\n`);
 }
 
-async function readState(statePath: string): Promise<AlarmState[]> {
-	return (JSON.parse(await fs.readFile(statePath, "utf8")) as { alarms: AlarmState[] }).alarms;
+async function readState(statePath: string): Promise<StoredState> {
+	return JSON.parse(await fs.readFile(statePath, "utf8")) as StoredState;
 }
 
 async function readIds(statePath: string): Promise<string[]> {
-	return (await readState(statePath)).map((alarm) => alarm.id).sort();
+	return (await readState(statePath)).alarms.map((alarm) => alarm.id).sort();
 }
 
 function runWorker(args: string[]): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
@@ -71,9 +71,36 @@ function makeRuntime(dir: string, statePath: string, emit: EmitFn, extra?: Recor
 	});
 }
 
+function cannedProbe(overrides: Record<string, unknown> = {}): { stdout: string; stderr: string; code: number } {
+	return {
+		stdout: JSON.stringify({
+			exists: true,
+			containerId: "c".repeat(64),
+			running: false,
+			status: "exited",
+			containerStatus: "exited",
+			startedAt: "2026-01-01T00:00:00.000Z",
+			exitCode: 0,
+			oomKilled: false,
+			logMode: null,
+			selectedLogPath: null,
+			logFileId: null,
+			logOffset: 0,
+			logCursor: null,
+			logReset: false,
+			logBase64: "",
+			tailBase64: "",
+			...overrides,
+		}),
+		stderr: "",
+		code: 0,
+	};
+}
+
 test("two processes racing state writes never lose an alarm", { timeout: 120_000 }, async () => {
 	const dir = await makeDir();
-	const statePath = await writeState(dir, []);
+	const statePath = path.join(dir, "state.json");
+	await writeState(statePath, []);
 	const barrier = path.join(dir, "go");
 	const workerSource = `
 import { WakeAlarmRuntime } from ${JSON.stringify(runtimeUrl)};
@@ -118,7 +145,8 @@ console.log("worker", prefix, "done");
 
 test("two processes creating the same alarm id get exactly one success", { timeout: 60_000 }, async () => {
 	const dir = await makeDir();
-	const statePath = await writeState(dir, []);
+	const statePath = path.join(dir, "state.json");
+	await writeState(statePath, []);
 	const barrier = path.join(dir, "go");
 	const workerSource = `
 import { WakeAlarmRuntime } from ${JSON.stringify(runtimeUrl)};
@@ -234,28 +262,29 @@ test("daemon routing skips alarms whose owner session is live", () => {
 	assert.equal(daemonOwns({ ownerSessionFile: undefined }, []), true, "ownerless alarms fall to the daemon only when nothing is live");
 });
 
-test("a stale snapshot pause cannot erase another runtime's pending wake", { timeout: 60_000 }, async () => {
+test("a stale snapshot pause cannot erase another runtime's undelivered outbox wake", { timeout: 60_000 }, async () => {
 	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
 	const due: TimerAlarmState = { id: "shared", name: "Shared", kind: "timer", active: true, createdAt: Date.now() - 1000, dueAt: Date.now() + 50 };
-	const statePath = await writeState(dir, [due]);
-	const bCalls: { alarm: AlarmState; events: FiredEvent[] }[] = [];
-	// B fires the timer first; delivery fails (emit=false), so the pending wake stays durable.
-	// A is scheduling-disabled and only performs the stale pause.
-	const b = makeRuntime(dir, statePath, (alarm, events) => { bCalls.push({ alarm, events }); return false; }, { wakeRetry: { delayMs: 60_000, capMs: 60_000 } });
+	await writeState(statePath, [due]);
+	const bCalls: OutboxEntry[] = [];
+	// B fires the timer first; delivery fails (emit=false), so the wake stays durable in the outbox.
+	const b = makeRuntime(dir, statePath, (entry) => { bCalls.push(entry); return false; }, { wakeRetry: { delayMs: 60_000, capMs: 60_000 } });
 	const a = makeRuntime(dir, statePath, () => true, { schedulingEnabled: false });
 	await a.start({ flushPending: false });
 	await b.start({ flushPending: false });
 	try {
 		await waitFor(() => bCalls.length === 1, "B to fire the timer");
-		const onDisk = (await readState(statePath))[0];
-		assert.ok(onDisk.pendingWake, "B's pending wake is durable");
-		// A's in-memory snapshot predates the fire; pausing from it must not erase the pending wake.
+		const onDisk = await readState(statePath);
+		assert.equal(onDisk.outbox.length, 1, "B's wake is durable in the outbox");
+		// A's in-memory snapshot predates the fire; pausing from it must not erase the wake.
 		const paused = await a.runAction({ action: "pause", id: "shared" });
 		assert.match(paused, /Paused shared/);
-		const after = (await readState(statePath))[0];
-		assert.equal(after.active, false, "the user pause is applied");
-		assert.ok(after.pendingWake, "the durable pending wake survives the stale-snapshot pause");
-		assert.ok((after.revision ?? 0) >= 2, "revision advanced across both writers");
+		const after = await readState(statePath);
+		const alarm = after.alarms[0];
+		assert.equal(alarm.active, false, "the user pause is applied");
+		assert.equal(after.outbox.length, 1, "the durable wake survives the stale-snapshot pause");
+		assert.ok((alarm.revision ?? 0) >= 2, "revision advanced across both writers");
 	} finally {
 		await a.stop();
 		await b.stop();
@@ -265,7 +294,7 @@ test("a stale snapshot pause cannot erase another runtime's pending wake", { tim
 test("a live claim blocks rival delivery; expiry allows takeover; exactly one delivery", { timeout: 60_000 }, async () => {
 	const dir = await makeDir();
 	const now = Date.now();
-	const pending: TimerAlarmState = {
+	const fired: TimerAlarmState = {
 		id: "claimed",
 		name: "Claimed",
 		kind: "timer",
@@ -275,24 +304,33 @@ test("a live claim blocks rival delivery; expiry allows takeover; exactly one de
 		triggeredAt: now,
 		lastTriggeredAt: now,
 		pauseReason: "timer fired",
-		pendingWake: { triggeredAt: now, events: [{ kind: "timer", fingerprint: `timer:claimed:${now - 500}` }] },
 	};
-	const statePath = await writeState(dir, [pending]);
-	const aCalls: unknown[] = [];
-	const bCalls: unknown[] = [];
+	const entry: OutboxEntry = {
+		eventId: "claimed:1000:x",
+		alarmId: "claimed",
+		alarmName: "Claimed",
+		triggeredAt: now,
+		events: [{ kind: "timer", fingerprint: `timer:claimed:${now - 500}` }],
+		message: "[Wake alarm] Claimed (claimed)",
+	};
+	const statePath = path.join(dir, "state.json");
+	await writeState(statePath, [fired], [entry]);
+	const aCalls: OutboxEntry[] = [];
+	const bCalls: OutboxEntry[] = [];
 	// A holds its claim for a long TTL; B must not deliver.
-	const a = makeRuntime(dir, statePath, (alarm, events) => { aCalls.push({ alarm, events }); return true; }, { claimantId: "A", deliveryTtlMs: 60_000, schedulingEnabled: false });
-	const b = makeRuntime(dir, statePath, (alarm, events) => { bCalls.push({ alarm, events }); return true; }, { claimantId: "B", deliveryTtlMs: 60_000, wakeRetry: { delayMs: 300, capMs: 2_000 } });
+	const a = makeRuntime(dir, statePath, (e) => { aCalls.push(e); return true; }, { claimantId: "A", deliveryTtlMs: 60_000, schedulingEnabled: false });
+	const b = makeRuntime(dir, statePath, (e) => { bCalls.push(e); return true; }, { claimantId: "B", deliveryTtlMs: 60_000, wakeRetry: { delayMs: 300, capMs: 2_000 } });
 	await a.start({ flushPending: false });
 	try {
-		// A claims manually by flushing first.
-		await (a as unknown as { claimPendingWake(id: string): Promise<string | undefined> }).claimPendingWake("claimed");
+		// A claims the outbox entry manually.
+		const token = await (a as unknown as { claimOutboxEntry(eventId: string): Promise<string | undefined> }).claimOutboxEntry("claimed:1000:x");
+		assert.ok(token, "A obtains the delivery claim");
 		await b.start({ flushPending: true });
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		assert.equal(bCalls.length, 0, "B cannot deliver while A holds a live claim");
-		const disk = (await readState(statePath))[0];
-		assert.ok(disk.pendingWake, "outbox retained while claimed");
-		assert.equal(disk.pendingWake?.claim?.claimantId, "A");
+		const disk = await readState(statePath);
+		assert.equal(disk.outbox.length, 1, "outbox retained while claimed");
+		assert.equal(disk.outbox[0].claim?.claimantId, "A");
 	} finally {
 		await a.stop();
 		await b.stop();
@@ -301,8 +339,9 @@ test("a live claim blocks rival delivery; expiry allows takeover; exactly one de
 
 test("a crash after claiming still delivers exactly once after claim expiry", { timeout: 60_000 }, async () => {
 	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
 	const firedTimer: TimerAlarmState = { id: "crash-timer", name: "Crash timer", kind: "timer", active: true, createdAt: Date.now() - 1000, dueAt: Date.now() + 50, ownerSessionFile: "C:\\sessions\\crash.jsonl" };
-	const statePath = await writeState(dir, [firedTimer]);
+	await writeState(statePath, [firedTimer]);
 	const workerSource = `
 import { WakeAlarmRuntime } from ${JSON.stringify(runtimeUrl)};
 const [statePath] = process.argv.slice(2);
@@ -321,26 +360,248 @@ setTimeout(() => process.exit(3), 10_000);
 	const worker = await writeWorker(dir, "crash-worker.ts", workerSource);
 	const crashed = await runWorker([worker, statePath]);
 	assert.notEqual(crashed.code, 0, "the worker must die mid-delivery");
-	const saved = (await readState(statePath))[0];
-	assert.ok(saved.pendingWake?.claim, "the doomed claimant's claim is durable");
-	assert.equal(saved.pendingWake?.claim?.claimantId, "doomed");
+	const saved = await readState(statePath);
+	assert.equal(saved.outbox.length, 1);
+	assert.ok(saved.outbox[0].claim, "the doomed claimant's claim is durable");
+	assert.equal(saved.outbox[0].claim?.claimantId, "doomed");
 
-	const calls: { alarm: AlarmState; events: FiredEvent[] }[] = [];
-	const restarted = makeRuntime(dir, statePath, (alarm, events) => { calls.push({ alarm, events }); return true; }, { claimantId: "survivor", deliveryTtlMs: 800, wakeRetry: { delayMs: 300, capMs: 2_000 } });
+	const calls: OutboxEntry[] = [];
+	const restarted = makeRuntime(dir, statePath, (entry) => { calls.push(entry); return true; }, { claimantId: "survivor", deliveryTtlMs: 800, wakeRetry: { delayMs: 300, capMs: 2_000 } });
 	try {
 		await restarted.start({ flushPending: true });
 		await waitFor(() => calls.length === 1, "the survivor to take over the expired claim and deliver", 6_000);
-		assert.equal(calls[0].alarm.id, "crash-timer");
+		assert.equal(calls[0].alarmId, "crash-timer");
 		assert.equal(calls[0].events[0].kind, "timer");
 		// The emit fires before the completion write; wait for the outbox clear to land.
-		await waitFor(() => readStateSync(statePath).alarms[0].pendingWake === undefined, "the delivered wake to be cleared", 3_000);
+		await waitFor(() => readStateSync(statePath).outbox.length === 0, "the delivered wake to be cleared", 3_000);
 	} finally {
 		await restarted.stop();
 	}
 });
 
-function readStateSync(statePath: string): { alarms: AlarmState[] } {
-	return JSON.parse(readFileSync(statePath, "utf8")) as { alarms: AlarmState[] };
+test("keep policy records one outbox entry per same-kind occurrence without loss or corruption", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	// A remote section is required for the probe path; a fake identity file suffices.
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const cid = "c".repeat(64);
+	const base: ProbeResult = { exists: true, containerId: cid, running: false, status: "exited", containerStatus: "exited", startedAt: "2026-01-01T00:00:00.000Z", exitCode: 0, oomKilled: false, logMode: "docker-logs", selectedLogPath: undefined, logFileId: undefined, logOffset: 0, logCursor: "2026-01-01T00:00:00Z", logBytes: new Uint8Array(), tail: "" };
+	const alarm = applyBaseline(createContainerAlarm({ id: "keep", name: "Keep", container: "job", events: ["exit"], policy: "keep", now: Date.now(), statusPollMs: 250 }), base, Date.now());
+	await writeState(statePath, [alarm]);
+	const calls: OutboxEntry[] = [];
+	const startedAts = ["2026-01-01T00:00:01.000Z", "2026-01-01T00:00:02.000Z", "2026-01-01T00:00:02.000Z"];
+	let probes = 0;
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: (entry) => { calls.push(entry); return true; },
+		execFn: async () => cannedProbe({ startedAt: startedAts[Math.min(probes++, startedAts.length - 1)] }),
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await waitFor(() => calls.length === 2, "two distinct exit occurrences to fire and deliver", 10_000);
+		assert.deepEqual(calls.map((entry) => entry.events[0].kind), ["exit", "exit"]);
+		assert.notEqual(calls[0].events[0].fingerprint, calls[1].events[0].fingerprint, "the two occurrences have distinct fingerprints");
+		// The emit fires before the completion write; wait for both deliveries to settle on disk.
+		await waitFor(() => readStateSync(statePath).outbox.length === 0, "both delivered wakes to be cleared", 3_000);
+		const disk = await readState(statePath);
+		assert.deepEqual(disk.outbox, [], "both wakes were delivered and removed");
+		// The accumulated state (two same-kind fingerprints) restores cleanly.
+		const restored = makeRuntime(dir, statePath, () => true, { schedulingEnabled: false });
+		await restored.start({ flushPending: false });
+		assert.equal(restored.alarmCount, 1);
+		await restored.stop();
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("dead state-lock takeover race keeps the critical section exclusive", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const lockPath = path.join(dir, "state.json.lock");
+	const barrier = path.join(dir, "takeover-go");
+	const logFile = path.join(dir, "critical.log");
+	// Pre-place a stale lock: dead pid, old mtime, unparsable-by-token shape.
+	await fs.writeFile(lockPath, `${JSON.stringify({ pid: 999_999_999, token: "dead", createdAt: Date.now() - 120_000 })}\n`);
+	await fs.utimes(lockPath, new Date(Date.now() - 120_000), new Date(Date.now() - 120_000));
+	const workerSource = `
+import { StateLock } from ${JSON.stringify(lockUrl)};
+${BARRIER_HELPER}
+const [lockPath, barrier, logFile, id] = process.argv.slice(2);
+const lock = new StateLock({ path: lockPath, hooks: { beforeTakeover: () => waitBarrier(barrier) } });
+await lock.acquire();
+await lock.verifyHeld();
+fs.appendFileSync(logFile, "enter:" + id + "\\n");
+await new Promise((resolve) => setTimeout(resolve, 120));
+fs.appendFileSync(logFile, "exit:" + id + "\\n");
+await lock.release();
+console.log(id, "done");
+`;
+	const worker = await writeWorker(dir, "lock-worker.ts", workerSource);
+	const [a, b] = [runWorker([worker, lockPath, barrier, logFile, "A"]), runWorker([worker, lockPath, barrier, logFile, "B"])];
+	// Both contenders must observe the same stale lock and hit the takeover barrier together.
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await fs.writeFile(barrier, "go");
+	const [ra, rb] = await Promise.all([a, b]);
+	assert.equal(ra.code, 0, ra.stderr);
+	assert.equal(rb.code, 0, rb.stderr);
+	const lines = (await fs.readFile(logFile, "utf8")).trim().split("\n").filter(Boolean);
+	assert.equal(lines.length, 4, `expected enter/exit pairs, got: ${JSON.stringify(lines)}`);
+	// Strict alternation proves the two critical sections never overlapped.
+	for (let i = 0; i < lines.length; i += 2) {
+		const [action, id] = lines[i].split(":");
+		assert.equal(action, "enter", `line ${i} must be an enter: ${JSON.stringify(lines)}`);
+		assert.equal(lines[i + 1], `exit:${id}`, `enter:${id} must be closed by its own exit: ${JSON.stringify(lines)}`);
+	}
+	assert.deepEqual([lines[0].split(":")[1], lines[2].split(":")[1]].sort(), ["A", "B"], "both contenders entered exactly once");
+});
+
+test("daemon emit re-checks presence and refuses to spawn when the owner came back live", async () => {
+	const dir = await makeDir();
+	const presenceDir = path.join(dir, "wake-alarm.sessions");
+	const sessionFile = path.join(dir, "owner.jsonl");
+	await fs.writeFile(sessionFile, "");
+	await registerPresence(presenceDir, { version: 1, pid: process.pid, instanceId: "owner-live", sessionFile, heartbeatAt: Date.now() });
+	const entry: OutboxEntry = {
+		eventId: "w:1:x",
+		alarmId: "w",
+		alarmName: "W",
+		ownerSessionFile: sessionFile,
+		triggeredAt: Date.now(),
+		events: [{ kind: "timer", fingerprint: "timer:w:1" }],
+		message: "[Wake alarm] W (w)",
+	};
+	const logs: string[] = [];
+	let spawns = 0;
+	const emit = createDaemonEmit({
+		getRuntime: () => ({ runtimeConfig: { spawnOnWake: true, headlessTrust: "saved", runTimeoutMs: 1000, piCommand: undefined, maxEvidenceChars: 1000, includeWakeEvidence: true } }) as unknown as WakeAlarmRuntime,
+		presenceDir,
+		dryRun: false,
+		spawnDisabled: false,
+		isStopping: () => false,
+		log: (message) => logs.push(message),
+		runPi: async () => { spawns++; return 0; },
+	});
+	try {
+		assert.equal(await emit(entry), false, "owner is live: no spawn, wake stays in the outbox");
+		assert.equal(spawns, 0);
+		assert.ok(logs.some((line) => line.includes("now live")), `expected a presence re-check log line: ${JSON.stringify(logs)}`);
+		// Once the owner leaves, the same daemon proceeds to spawn.
+		await releasePresence(presenceDir, "owner-live");
+		assert.equal(await emit(entry), true);
+		assert.equal(spawns, 1);
+	} finally {
+		await releasePresence(presenceDir, "owner-live");
+	}
+});
+
+test("evidence is opt-in: check never leaks it, the evidence action returns historical evidence", async () => {
+	const dir = await makeDir();
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ includeWakeEvidence: false }));
+	const statePath = path.join(dir, "state.json");
+	const base: ProbeResult = { exists: true, containerId: "abc", running: true, status: "running", containerStatus: "running", startedAt: "2026-01-01T00:00:00Z", exitCode: 0, oomKilled: false, logMode: "docker-logs", selectedLogPath: undefined, logFileId: undefined, logOffset: 0, logCursor: "2026-01-01T00:00:00Z", logBytes: new Uint8Array(), tail: "" };
+	const alarm = applyBaseline(createContainerAlarm({ id: "train-run", name: "Train run", container: "job", events: ["log-error"], now: Date.now() - 60_000, statusPollMs: 60_000 }), base, Date.now() - 60_000);
+	const withEvidence: AlarmState = { ...alarm, lastEvidence: "Traceback: kaboom in trainer" };
+	const entry: OutboxEntry = {
+		eventId: "train-run:1:x",
+		alarmId: "train-run",
+		alarmName: "Train run",
+		triggeredAt: Date.now() - 1000,
+		events: [{ kind: "log-error", fingerprint: "log-error:10:abc", evidence: "kaboom line: boom" }],
+		message: "[Wake alarm] Train run (train-run)",
+	};
+	await writeState(statePath, [withEvidence], [entry]);
+	const runtime = new WakeAlarmRuntime({ cwd: dir, configPath, statePath, emit: () => true, execFn: noopExec, schedulingEnabled: false });
+	try {
+		await runtime.start({ flushPending: false });
+		const check = await runtime.runAction({ action: "check", id: "train-run" });
+		assert.ok(!check.includes("kaboom"), "check output does not contain raw evidence text");
+		const evidence = await runtime.runAction({ action: "evidence", id: "train-run" });
+		assert.ok(evidence.includes("kaboom"), "the explicit evidence action returns the stored evidence");
+		assert.ok(evidence.includes("boom"), "both the outbox event and the alarm-level evidence are surfaced");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("a deadline crossing while the probe runs fires exactly once (keep policy)", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const now = Date.now();
+	const base: ProbeResult = { exists: true, containerId: "c".repeat(64), running: true, status: "running", containerStatus: "running", startedAt: "2026-01-01T00:00:00.000Z", exitCode: 0, oomKilled: false, logMode: "docker-logs", selectedLogPath: undefined, logFileId: undefined, logOffset: 0, logCursor: "2026-01-01T00:00:00Z", logBytes: new Uint8Array(), tail: "" };
+	// Fast polling starts a probe at +100ms; the deadline elapses at +400ms while that probe is still in flight.
+	const alarm = applyBaseline(createContainerAlarm({ id: "dl", name: "Deadline", container: "job", events: ["deadline"], policy: "keep", now, deadlineMs: 400, statusPollMs: 100 }), base, now);
+	await writeState(statePath, [alarm]);
+	const calls: OutboxEntry[] = [];
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: (entry) => { calls.push(entry); return true; },
+		execFn: async () => { await new Promise((resolve) => setTimeout(resolve, 600)); return cannedProbe(); },
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await waitFor(() => calls.length === 1, "the deadline to fire once after the probe returns", 8_000);
+		assert.equal(calls[0].events[0].kind, "deadline");
+		await new Promise((resolve) => setTimeout(resolve, 900));
+		assert.equal(calls.length, 1, "the deadline must not re-fire after its fingerprint was recorded");
+		const disk = await readState(statePath);
+		assert.equal(disk.outbox.length, 0, "delivered wake removed");
+		const alarmDisk = disk.alarms[0];
+		assert.ok(alarmDisk.kind === "container" && alarmDisk.eventFingerprints.deadline, "the deadline fingerprint is durably recorded");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("daemon adopts alarms created after startup and fires them on time (dry run)", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await writeState(statePath, []);
+	const piStub = path.join(dir, "pi-stub.js");
+	await fs.writeFile(piStub, "console.error('pi stub'); process.exit(0);\n");
+	const child = spawn(process.execPath, [path.resolve("extensions/pi-wake/daemon.ts")], {
+		cwd: dir,
+		env: { ...process.env, WAKE_ALARM_CWD: dir, WAKE_ALARM_STATE_PATH: statePath, WAKE_ALARM_PI_COMMAND: piStub, WAKE_ALARM_SPAWN_DRY_RUN: "1" },
+		stdio: ["ignore", "pipe", "pipe"],
+		windowsHide: true,
+	});
+	let stdout = "";
+	let stderr = "";
+	child.stdout.on("data", (chunk) => { stdout += chunk; });
+	child.stderr.on("data", (chunk) => { stderr += chunk; });
+	try {
+		// Give the daemon time to activate with an empty state, then create the alarm
+		// from "another session" — the daemon must discover it on its next poll.
+		await new Promise((resolve) => setTimeout(resolve, 1_000));
+		const owner = "C:\\sessions\\ghost.jsonl";
+		const due: TimerAlarmState = { id: "later", name: "Later", kind: "timer", active: true, createdAt: Date.now(), dueAt: Date.now() + 8_000, ownerSessionFile: owner };
+		await writeState(statePath, [due]);
+		const deadline = Date.now() + 30_000;
+		while (Date.now() < deadline) {
+			if (stdout.includes("[dry-run] would run")) break;
+			if (!child.killed && child.exitCode !== null) throw new Error(`daemon exited early: ${stderr || stdout}`);
+			await new Promise((resolve) => setTimeout(resolve, 200));
+		}
+		assert.ok(stdout.includes("[dry-run] would run"), `daemon never fired the late alarm; stdout:\n${stdout}\nstderr:\n${stderr}`);
+		assert.ok(stdout.includes("--session") && stdout.includes("ghost.jsonl"), "the dry run targets the alarm's owner session");
+	} finally {
+		if (child.exitCode === null) child.kill();
+		await new Promise((resolve) => { if (child.exitCode !== null) resolve(undefined); else child.once("exit", () => resolve(undefined)); setTimeout(resolve, 2_000); });
+		if (child.exitCode === null) child.kill("SIGKILL");
+	}
+});
+
+function readStateSync(statePath: string): StoredState {
+	return JSON.parse(readFileSync(statePath, "utf8")) as StoredState;
 }
 
 async function waitFor(condition: () => boolean, label: string, timeoutMs = 3_000): Promise<void> {

@@ -8,7 +8,7 @@ pi-wake is an agent-automation extension: it schedules work, probes remote hosts
 
 - **Headless wake runs respect Pi project trust by default.** `headlessTrust: "saved"` (the default) never passes `--approve`; a woken run only loads project extensions/skills when a saved Pi trust decision or `defaultProjectTrust` allows it. `"always"` re-grants project trust on every unattended wake — enable it only if you accept that trade-off.
 - **Project trust is not a sandbox.** A woken session runs with your OS permissions. For high-risk unattended automation, run the daemon and Pi inside a container/VM, and consider `spawnOnWake: false` (outbox-only mode).
-- **Wake evidence is untrusted remote content.** Log excerpts are sanitized, length-bounded, and labeled `untrusted data`, but no sanitization can fully rule out prompt injection. Set `"includeWakeEvidence": false` to keep remote log content out of wake messages entirely; the agent can then query evidence explicitly via `check`.
+- **Wake evidence is untrusted remote content.** Log excerpts are sanitized, length-bounded, and labeled `untrusted data`, but no sanitization can fully rule out prompt injection. Set `"includeWakeEvidence": false` to keep remote log content out of wake messages entirely; the agent can then fetch stored evidence only on an explicit `{"action":"evidence","id":"…"}` request.
 - **SSH is private-key-path only** (`identityFile`), `BatchMode=yes`, bounded output; password/key material fields in config are rejected. Remote log reads are confined to `remote.allowedRemoteLogRoots` with a remote realpath check.
 
 ## Reporting a vulnerability

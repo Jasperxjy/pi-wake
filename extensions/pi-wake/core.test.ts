@@ -11,6 +11,7 @@ import {
 	applyTimer,
 	buildResumeArgs,
 	createContainerAlarm,
+	createOutboxEntry,
 	createTimerAlarm,
 	deadlineAfter,
 	fileReadWindow,
@@ -19,6 +20,7 @@ import {
 	parseAbsoluteTime,
 	parseDuration,
 	restoreAlarmState,
+	restoreOutbox,
 	resumeAlarm,
 	scanNewLog,
 	timerDelay,
@@ -32,7 +34,10 @@ import {
 	validateRemoteLogPath,
 	validateRemoteLogRoots,
 	validateUser,
+	wakeMessage,
 	type ContainerAlarmState,
+	type FiredEvent,
+	type OutboxEntry,
 	type ProbeResult,
 } from "./core.ts";
 
@@ -256,15 +261,11 @@ test("file windows cover baseline, append, and truncation", () => {
 test("strict restoration accepts valid timer/container states and rejects malformed or legacy fields", () => {
 	const timer = JSON.parse(JSON.stringify(createTimerAlarm({ id: "timer", name: "Timer", now: 1000, afterMs: 5000 })));
 	assert.equal(restoreAlarmState(timer, allowedRoots).kind, "timer");
-	const pendingTimer = { ...timer, active: false, triggeredAt: 6000, lastTriggeredAt: 6000, pendingWake: { triggeredAt: 6000, events: [{ kind: "timer", fingerprint: "timer:timer:6000" }] } };
-	const restoredPendingTimer = restoreAlarmState(pendingTimer, allowedRoots);
-	assert.equal(restoredPendingTimer.pendingWake?.events[0].kind, "timer");
-	assert.equal(nextAlarmDueAt(restoredPendingTimer), 0, "pending outbox delivery remains immediately retryable after restore");
+	// An alarm must no longer carry an embedded pendingWake: wakes live in the outbox.
+	const legacyPendingTimer = { ...timer, pendingWake: { triggeredAt: 6000, events: [{ kind: "timer", fingerprint: "timer:timer:6000" }] } };
+	assert.throws(() => restoreAlarmState(legacyPendingTimer, allowedRoots), /unknown alarm field.*pendingWake/);
 	const valid = JSON.parse(JSON.stringify(applyBaseline(makeContainer(["log-match", "deadline"], { logPattern: "DONE", deadlineMs: 5000, logPath: "/data/probes/data/run.log", allowedRemoteLogRoots: allowedRoots }), runningProbe({ logOffset: 10 }), 1000)));
 	assert.equal(restoreAlarmState(valid, allowedRoots).kind, "container");
-	const exitDecision = applyProbe(applyBaseline(makeContainer(["exit"]), runningProbe(), 1000), runningProbe({ running: false, status: "exited", containerStatus: "exited" }), 2000);
-	const pendingContainer = JSON.parse(JSON.stringify({ ...exitDecision.state, pendingWake: { triggeredAt: 2000, events: exitDecision.events } }));
-	assert.equal(restoreAlarmState(pendingContainer, allowedRoots).pendingWake?.events[0].kind, "exit");
 	for (const mutation of [
 		(value: Record<string, unknown>) => { delete value.nextCheckAt; },
 		(value: Record<string, unknown>) => { value.statusPollMs = MAX_TIMER_DELAY_MS + 1; },
@@ -277,6 +278,35 @@ test("strict restoration accepts valid timer/container states and rejects malfor
 		const invalid = structuredClone(valid) as Record<string, unknown>;
 		mutation(invalid);
 		assert.throws(() => restoreAlarmState(invalid, allowedRoots));
+	}
+});
+
+test("outbox entries are durable facts independent of the alarm state: same kind may occur many times", () => {
+	const timer = createTimerAlarm({ id: "t1", name: "Timer", now: 1000, afterMs: 5000 });
+	const timerEvent: FiredEvent = { kind: "timer", fingerprint: "timer:t1:6000" };
+	const first = createOutboxEntry(timer, [timerEvent], 6000);
+	assert.match(first.eventId, /^t1:6000:/);
+	// A second, independent occurrence of the SAME kind is a separate entry and must restore cleanly.
+	const second = createOutboxEntry(timer, [{ kind: "timer", fingerprint: "timer:t1:9000" }], 9000);
+	const restored = restoreOutbox([first, second]);
+	assert.equal(restored.length, 2);
+	assert.deepEqual(restored.map((entry) => entry.events[0].fingerprint), [timerEvent.fingerprint, "timer:t1:9000"]);
+	// Entries never touch the alarm: a reset timer plus an old wake stays valid.
+	assert.equal(restoreAlarmState(JSON.parse(JSON.stringify(createTimerAlarm({ id: "t1", name: "Timer", now: 7000, afterMs: 5000 }))), allowedRoots).kind, "timer");
+
+	const exitEvent: FiredEvent = { kind: "exit", fingerprint: "exit:abc:2026-01-01T00:00:00Z:0" };
+	const entry = createOutboxEntry({ ...timer, kind: "container", container: "job", events: ["exit"], policy: "pause", statusPollMs: 60_000, nextCheckAt: 2000, logOffset: 0, scanCarry: "", eventFingerprints: {}, consecutiveFailures: 0, failureNotified: false } as ContainerAlarmState, [exitEvent], 2000);
+	assert.equal(entry.alarmName, "Timer");
+	// Duplicate kinds WITHIN one entry are still rejected.
+	const duplicate = { ...entry, events: [exitEvent, { kind: "exit", fingerprint: "exit:def" }] };
+	assert.throws(() => restoreOutbox([duplicate]), /duplicate kinds/);
+	for (const mutation of [
+		(value: OutboxEntry) => ({ ...value, eventId: "bad event id!" }),
+		(value: OutboxEntry) => ({ ...value, events: [] }),
+		(value: OutboxEntry) => ({ ...value, message: "x".repeat(4001) }),
+		(value: OutboxEntry) => ({ ...value, claim: { claimantId: "a", token: "t" } } as unknown as OutboxEntry),
+	]) {
+		assert.throws(() => restoreOutbox([mutation(entry)]));
 	}
 });
 
@@ -441,30 +471,43 @@ test("ownerSessionFile is validated, created, and restored", () => {
 	assert.throws(() => restoreAlarmState(unknown, allowedRoots), /unknown alarm field/);
 });
 
-test("claim and revision fields round-trip through strict restore", () => {
+test("claim fields round-trip through strict outbox restore", () => {
 	const timer = createTimerAlarm({ id: "t1", name: "Timer", now: 1000, afterMs: 1000, ownerSessionFile: "/sessions/a.jsonl" });
-	const fired = {
-		...timer,
-		active: false,
+	const entry: OutboxEntry = {
+		eventId: "t1:2000:abc",
+		alarmId: "t1",
+		alarmName: "Timer",
+		ownerSessionFile: "/sessions/a.jsonl",
 		triggeredAt: 2000,
-		lastTriggeredAt: 2000,
-		revision: 7,
-		pendingWake: {
-			triggeredAt: 2000,
-			events: [{ kind: "timer", fingerprint: "timer:t1:2000" }],
-			claim: { claimantId: "session:abc", token: "tok-1", expiresAt: 999_999 },
-		},
+		events: [{ kind: "timer", fingerprint: "timer:t1:2000" }],
+		message: "[Wake alarm] Timer (t1)\nTriggered at: ...",
+		claim: { claimantId: "session:abc", token: "tok-1", expiresAt: 999_999 },
 	};
-	const restored = restoreAlarmState(JSON.parse(JSON.stringify(fired)), allowedRoots);
-	assert.equal(restored.revision, 7);
-	assert.equal(restored.pendingWake?.claim?.claimantId, "session:abc");
-	assert.equal(restored.pendingWake?.claim?.token, "tok-1");
-	const badClaim = JSON.parse(JSON.stringify(fired));
-	badClaim.pendingWake.claim.extra = true;
-	assert.throws(() => restoreAlarmState(badClaim, allowedRoots), /unknown alarm field/);
-	const badClaimField = JSON.parse(JSON.stringify(fired));
-	badClaimField.pendingWake.claim.expiresAt = "soon";
-	assert.throws(() => restoreAlarmState(badClaimField, allowedRoots), /expiresAt/);
+	const restored = restoreOutbox([entry])[0];
+	assert.equal(restored.claim?.claimantId, "session:abc");
+	assert.equal(restored.claim?.token, "tok-1");
+	assert.equal(restored.message, entry.message);
+	const badClaim = { ...entry, claim: { claimantId: "a", token: "t", expiresAt: 999_999, extra: true } } as OutboxEntry;
+	assert.throws(() => restoreOutbox([badClaim]), /unknown/);
+	const badClaimField = { ...entry, claim: { claimantId: "a", token: "t", expiresAt: "soon" } } as unknown as OutboxEntry;
+	assert.throws(() => restoreOutbox([badClaimField]), /expiresAt/);
+	// Alarm revision is unaffected by outbox facts.
+	const fired = { ...timer, active: false, triggeredAt: 2000, lastTriggeredAt: 2000, revision: 7 };
+	assert.equal(restoreAlarmState(JSON.parse(JSON.stringify(fired)), allowedRoots).revision, 7);
+});
+
+test("includeWakeEvidence false keeps evidence out of the wake message but stored for opt-in retrieval", () => {
+	const container = applyProbe(applyBaseline(makeContainer(["log-error"]), runningProbe({ logBytes: encoder.encode("Traceback: kaboom\n") }), 1000), runningProbe({ logOffset: 20, logBytes: encoder.encode("ok\nTraceback: second\n") }), 2000);
+	const event = container.events.find((candidate) => candidate.kind === "log-error");
+	assert.ok(event?.evidence, "the fired log-error event carries evidence");
+	const sanitized = wakeMessage(container.state, [event], 2000, 1000, false);
+	assert.ok(!sanitized.includes(event.evidence!), "includeWakeEvidence:false excludes the raw log text from the wake message");
+	const withEvidence = wakeMessage(container.state, [event], 2000, 1000, true);
+	assert.ok(withEvidence.includes("Traceback"), "includeWakeEvidence:true includes it");
+	// The outbox entry built with evidence disabled still retains the evidence for the evidence action.
+	const entry = createOutboxEntry(container.state, [event], 2000, { includeEvidence: false });
+	assert.ok(!entry.message.includes("Traceback"));
+	assert.equal(entry.events[0].evidence, event.evidence);
 });
 
 test("absolute times require an explicit timezone", () => {

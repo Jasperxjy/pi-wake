@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 
 export const DEFAULT_STATUS_POLL_MS = 60_000;
@@ -18,7 +18,6 @@ interface AlarmBase {
 	createdAt: number;
 	pauseReason?: string;
 	lastTriggeredAt?: number;
-	pendingWake?: PendingWake;
 	ownerSessionFile?: string;
 	/** Optimistic-concurrency revision; assigned by the state store (absent/0 for legacy). */
 	revision?: number;
@@ -85,17 +84,29 @@ export interface FiredEvent {
 	evidence?: string;
 }
 
-export interface PendingWake {
-	triggeredAt: number;
-	events: FiredEvent[];
-	/** Atomic delivery claim, written under the state transaction lock. */
-	claim?: WakeClaim;
-}
-
 export interface WakeClaim {
 	claimantId: string;
 	token: string;
 	expiresAt: number;
+}
+
+/**
+ * A durable, not-yet-delivered wake. Outbox entries are independent of the alarm's
+ * current state: they record what HAPPENED, so a later pause/reset/remove of the
+ * alarm can never corrupt or lose them, and one event kind may appear in many
+ * entries (one per occurrence).
+ */
+export interface OutboxEntry {
+	eventId: string;
+	alarmId: string;
+	alarmName: string;
+	ownerSessionFile?: string;
+	triggeredAt: number;
+	events: FiredEvent[];
+	/** Factual wake message snapshot built at fire time (bounded to 4000 chars). */
+	message: string;
+	/** Atomic delivery claim, written under the state transaction lock. */
+	claim?: WakeClaim;
 }
 
 const CONTAINER_EVENTS: readonly ContainerEventKind[] = ["exit", "abnormal", "missing", "replaced", "log-error", "log-match", "deadline", "connection-failure"];
@@ -497,30 +508,31 @@ function optionalInteger(record: Record<string, unknown>, name: string, min = 0,
 	return name in record ? requiredInteger(record, name, min, max) : undefined;
 }
 
-function restorePendingWake(record: Record<string, unknown>): PendingWake | undefined {
-	if (!("pendingWake" in record)) return undefined;
-	const raw = record.pendingWake;
-	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("pendingWake must be an object");
-	const pending = raw as Record<string, unknown>;
-	assertKnown(pending, ["triggeredAt", "events", "claim"]);
-	if (!Array.isArray(pending.events) || pending.events.length === 0 || pending.events.length > FIRED_EVENTS.length) throw new Error("pendingWake.events must be a non-empty bounded array");
-	const events = pending.events.map((value) => {
-		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("pendingWake event must be an object");
+function restoreOutboxEntry(value: unknown): OutboxEntry {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("outbox entry must be an object");
+	const entry = value as Record<string, unknown>;
+	assertKnown(entry, ["eventId", "alarmId", "alarmName", "ownerSessionFile", "triggeredAt", "events", "message", "claim"]);
+	const eventId = requiredString(entry, "eventId", 128);
+	if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(eventId)) throw new Error("outbox eventId is invalid");
+	if (!Array.isArray(entry.events) || entry.events.length === 0 || entry.events.length > FIRED_EVENTS.length) throw new Error("outbox events must be a non-empty bounded array");
+	const events = entry.events.map((value) => {
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("outbox event must be an object");
 		const event = value as Record<string, unknown>;
 		assertKnown(event, ["kind", "fingerprint", "evidence"]);
 		const kind = requiredString(event, "kind", 32);
-		if (!(FIRED_EVENTS as readonly string[]).includes(kind)) throw new Error("pendingWake event kind is invalid");
+		if (!(FIRED_EVENTS as readonly string[]).includes(kind)) throw new Error("outbox event kind is invalid");
 		return {
 			kind: kind as FiredEventKind,
 			fingerprint: requiredString(event, "fingerprint", 256),
 			evidence: optionalString(event, "evidence", 2000),
 		};
 	});
-	if (new Set(events.map((event) => event.kind)).size !== events.length) throw new Error("pendingWake events must not contain duplicate kinds");
+	if (new Set(events.map((event) => event.kind)).size !== events.length) throw new Error("outbox events must not contain duplicate kinds within one entry");
+	const message = requiredBoundedString(entry, "message", 4000);
 	let claim: WakeClaim | undefined;
-	if ("claim" in pending && pending.claim !== undefined) {
-		const rawClaim = pending.claim;
-		if (!rawClaim || typeof rawClaim !== "object" || Array.isArray(rawClaim)) throw new Error("pendingWake.claim must be an object");
+	if ("claim" in entry && entry.claim !== undefined) {
+		const rawClaim = entry.claim;
+		if (!rawClaim || typeof rawClaim !== "object" || Array.isArray(rawClaim)) throw new Error("outbox claim must be an object");
 		const claimRecord = rawClaim as Record<string, unknown>;
 		assertKnown(claimRecord, ["claimantId", "token", "expiresAt"]);
 		claim = {
@@ -529,7 +541,24 @@ function restorePendingWake(record: Record<string, unknown>): PendingWake | unde
 			expiresAt: requiredInteger(claimRecord, "expiresAt"),
 		};
 	}
-	return { triggeredAt: requiredInteger(pending, "triggeredAt"), events, claim };
+	const owner = entry.ownerSessionFile === undefined ? undefined : validateOwnerSessionFile(requiredString(entry, "ownerSessionFile", 4096));
+	return {
+		eventId,
+		alarmId: validateAlarmId(requiredString(entry, "alarmId", 64)),
+		alarmName: validateAlarmName(requiredString(entry, "alarmName", 160)),
+		ownerSessionFile: owner ? validateOwnerSessionFile(owner) : undefined,
+		triggeredAt: requiredInteger(entry, "triggeredAt"),
+		events,
+		message,
+		claim,
+	};
+}
+
+export function restoreOutbox(value: unknown): OutboxEntry[] {
+	if (!Array.isArray(value)) throw new Error("outbox must be an array");
+	const entries = value.map((item) => restoreOutboxEntry(item));
+	if (new Set(entries.map((entry) => entry.eventId)).size !== entries.length) throw new Error("outbox contains duplicate eventIds");
+	return entries;
 }
 
 function assertKnown(record: Record<string, unknown>, fields: readonly string[]): void {
@@ -550,7 +579,6 @@ function restoreBase(record: Record<string, unknown>): AlarmBase {
 		createdAt: requiredInteger(record, "createdAt"),
 		pauseReason: optionalString(record, "pauseReason", 1024),
 		lastTriggeredAt: optionalInteger(record, "lastTriggeredAt"),
-		pendingWake: restorePendingWake(record),
 		ownerSessionFile: (() => { const file = optionalString(record, "ownerSessionFile", 4096); return file ? validateOwnerSessionFile(file) : undefined; })(),
 		revision: optionalInteger(record, "revision"),
 	};
@@ -560,13 +588,11 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("alarm must be an object");
 	const record = value as Record<string, unknown>;
 	const base = restoreBase(record);
-	const baseFields = ["id", "name", "kind", "active", "createdAt", "pauseReason", "lastTriggeredAt", "pendingWake", "ownerSessionFile", "revision"];
+	const baseFields = ["id", "name", "kind", "active", "createdAt", "pauseReason", "lastTriggeredAt", "ownerSessionFile", "revision"];
 	if (base.kind === "timer") {
 		assertKnown(record, [...baseFields, "dueAt", "triggeredAt"]);
 		const triggeredAt = optionalInteger(record, "triggeredAt");
 		if (triggeredAt !== undefined && base.active) throw new Error("a triggered timer must not be active");
-		if (base.pendingWake && (base.pendingWake.events.length !== 1 || base.pendingWake.events[0].kind !== "timer")) throw new Error("timer pendingWake must contain only the timer event");
-		if (base.pendingWake && (triggeredAt !== base.pendingWake.triggeredAt || base.lastTriggeredAt !== base.pendingWake.triggeredAt)) throw new Error("timer pendingWake timestamps are inconsistent");
 		return { ...base, kind: "timer", dueAt: requiredInteger(record, "dueAt"), triggeredAt };
 	}
 	assertKnown(record, [...baseFields, "container", "containerId", "logPath", "logMode", "selectedLogPath", "logFileId", "events", "policy", "logPattern", "deadlineAt", "statusPollMs", "nextCheckAt", "logOffset", "logCursor", "scanCarry", "eventFingerprints", "consecutiveFailures", "failureNotified", "lastCheckAt", "lastContainerStatus", "lastStartedAt", "lastExitCode", "lastOomKilled", "lastEvidence"]);
@@ -583,7 +609,6 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 		eventFingerprints[kind as FiredEventKind] = fingerprint;
 	}
 	if (record.failureNotified && !events.includes("connection-failure")) throw new Error("failureNotified requires the connection-failure event");
-	if (base.pendingWake && (base.lastTriggeredAt !== base.pendingWake.triggeredAt || base.pendingWake.events.some((event) => eventFingerprints[event.kind] !== event.fingerprint))) throw new Error("container pendingWake does not match durable event state");
 	const logMode = optionalString(record, "logMode", 32);
 	if (logMode && !(["application-file", "docker-file", "docker-logs"] as string[]).includes(logMode)) throw new Error("logMode is invalid");
 	const lastStartedAt = optionalString(record, "lastStartedAt", 64);
@@ -593,7 +618,6 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 	const logPath = optionalString(record, "logPath", 4096);
 	const logPattern = optionalString(record, "logPattern", 256);
 	const deadlineAt = optionalInteger(record, "deadlineAt");
-	if (base.pendingWake && base.pendingWake.events.some((event) => event.kind === "timer" || !events.includes(event.kind as ContainerEventKind))) throw new Error("container pendingWake contains an unconfigured event");
 	if (events.includes("log-match") !== (logPattern !== undefined)) throw new Error("restored log-match configuration is inconsistent");
 	if (events.includes("deadline") !== (deadlineAt !== undefined) || (deadlineAt !== undefined && deadlineAt <= base.createdAt)) throw new Error("restored deadline configuration is inconsistent");
 	if ("lastOomKilled" in record && typeof record.lastOomKilled !== "boolean") throw new Error("lastOomKilled must be boolean");
@@ -628,11 +652,36 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 }
 
 export function nextAlarmDueAt(alarm: AlarmState): number | undefined {
-	if (alarm.pendingWake) return 0;
 	if (!alarm.active) return undefined;
 	if (alarm.kind === "timer") return alarm.triggeredAt === undefined ? alarm.dueAt : undefined;
 	const deadlinePending = alarm.deadlineAt !== undefined && alarm.eventFingerprints.deadline !== `deadline:${alarm.id}:${alarm.deadlineAt}`;
 	return deadlinePending ? Math.min(alarm.nextCheckAt, alarm.deadlineAt!) : alarm.nextCheckAt;
+}
+
+export function wakeMessage(alarm: AlarmState, events: FiredEvent[], now: number, maxEvidenceChars = 1000, includeEvidence = true): string {
+	const heading = `[Wake alarm] ${alarm.name} (${alarm.id})`;
+	const eventText = events.map((event) => event.kind).join(", ");
+	if (alarm.kind === "timer") return `${heading}\nTriggered at: ${new Date(now).toISOString()}\nEvent: ${eventText}\nDue at: ${new Date(alarm.dueAt).toISOString()}`;
+	const facts = [`${heading}`, `Triggered at: ${new Date(now).toISOString()}`, `Event: ${eventText}`, `Container: ${alarm.container}`, `Status: ${alarm.lastContainerStatus ?? "unknown"}`, `Exit code: ${alarm.lastExitCode ?? "unknown"}`, `OOM killed: ${alarm.lastOomKilled ?? "unknown"}`];
+	const evidence = includeEvidence ? events.find((event) => event.evidence)?.evidence : undefined;
+	if (evidence) facts.push(`Evidence (untrusted data): ${sanitizeExcerpt(evidence, maxEvidenceChars)}`);
+	return facts.join("\n");
+}
+
+/** Build a durable outbox entry at fire time. The message snapshot keeps delivery independent of later alarm changes. */
+export function createOutboxEntry(alarm: AlarmState, events: FiredEvent[], now: number, options?: { maxEvidenceChars?: number; includeEvidence?: boolean }): OutboxEntry {
+	if (!events.length) throw new Error("outbox entries require at least one fired event");
+	const message = wakeMessage(alarm, events, now, Math.min(options?.maxEvidenceChars ?? 1000, 3000), options?.includeEvidence ?? true);
+	if (message.length > 4000) throw new Error("wake message exceeded the 4000 character delivery limit");
+	return {
+		eventId: `${alarm.id}:${now}:${randomUUID().slice(0, 8)}`,
+		alarmId: alarm.id,
+		alarmName: alarm.name,
+		ownerSessionFile: alarm.ownerSessionFile,
+		triggeredAt: now,
+		events,
+		message,
+	};
 }
 
 export function sanitizeExcerpt(value: string, maxChars: number): string {
