@@ -87,4 +87,5 @@ jobs:
       - name: extension load smoke (real Pi, RPC mode)
         shell: bash
         run: |
-          printf '{"type":"get_state"}\n' | npx --no-install pi --mode rpc --offline --approve --no-session --extension extensions/pi-wake/index.ts | grep -q '"success":true'
+          OUT=$(printf '{"type":"get_state"}\n' | npx --no-install pi --mode rpc --offline --approve --no-session --extension extensions/pi-wake/index.ts 2>&1)
+          echo "$OUT" | grep -q '"success":true' || { echo "::error::pi rpc smoke failed: $OUT"; exit 1; }
