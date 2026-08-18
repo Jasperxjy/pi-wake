@@ -13,7 +13,7 @@ Polling and timing are deterministic and model-free — no tokens are spent unti
 - Remote Docker container watches over SSH: `exit`, `abnormal`, `missing`, `replaced`, `log-error`, `log-match`, `deadline`, `connection-failure` (OR-combined, fingerprint-deduped).
 - Same-session delivery in both process states (live loop insertion / headless resume).
 - Durable at-least-once outbox: a fired event is persisted before delivery, so a crash cannot lose it.
-- Multi-session safe (including pi-web hosting several sessions in one process): per-instance lease, owner-scoped scheduling, and merge-save state writes prevent double-firing and clobbering.
+- Multi-session safe (including pi-web hosting several sessions in one process): a fencing-token lease, owner-scoped scheduling, a cross-process state transaction lock, and merge-save writes prevent double-firing and clobbering.
 - Zero-config for timers. SSH config is needed only for `watch_container`.
 
 ## Install
@@ -84,8 +84,9 @@ session closed →  daemon (holds no lease) → pi --session <owner> --print …
 Every alarm created in a session records that session's file as its owner. Ownership routing:
 
 - A live session schedules only alarms it owns. The single lease holder additionally schedules ownerless (pre-0.1) alarms.
-- The daemon stands down whenever a live session lease (`.pi/wake-alarm.lock.json`, PID + heartbeat) exists, and takes over when it lapses. It never double-fires with a session.
-- State writes are merge-saves: each runtime only writes alarms it actually changed, so concurrent sessions (e.g. pi-web tabs) do not clobber each other.
+- Lease acquisition is atomic (`wx`-create) with a fencing epoch; heartbeats re-verify the fencing token before writing, so two sessions can never both believe they hold the lease.
+- All state mutations run under a cross-process transaction lock (`.pi/wake-alarm.state.json.lock`): read-merge-write is serialized, so concurrent runtimes cannot lose each other's alarms or outbox records.
+- The daemon stands down whenever a live session lease (`.pi/wake-alarm.lock.json`, PID + heartbeat) exists, and takes over when it lapses. Sessions establish the lease before scheduling or flushing wakes, and the daemon re-checks the lease and the outbox immediately before resuming a session, so the daemon and a session never both deliver the same wake.
 - Runs spawned by the daemon get `WAKE_ALARM_PASSIVE=1`: their extension instance serves the tool but never schedules, so the daemon stays the single scheduler. While a wake run is active the daemon pauses scheduling, then reloads the state file — alarms the woken agent created or changed are picked up.
 - A wake run that exits 0 clears the outbox record; otherwise it is retried with linear backoff (60 s × attempts, max 5 per daemon activation). Alarms without an owner session (ephemeral `--no-session`) are never spawned; their wakes wait in the outbox for the next interactive session.
 
@@ -144,33 +145,38 @@ On Windows the daemon unwraps the npm `pi.cmd` shim and runs the CLI script with
   "maxEvidenceChars": 1000,
   "piCommand": null,
   "spawnOnWake": true,
-  "runTimeout": "30m"
+  "runTimeout": "30m",
+  "headlessTrust": "saved"
 }
 ```
 
 - `identityFile` is resolved relative to the config file; private key **paths only** — `password`/`passphrase`/`privateKey` fields are rejected.
 - `allowedRemoteLogRoots` constrains which remote log files may be read (realpath-checked remotely).
 - `runTimeout` bounds every headless wake run; the run is terminated after it.
+- `headlessTrust` controls project trust for headless wake runs: `"saved"` (default) passes no approval flag, so a woken run only loads project resources when a saved Pi trust decision or `defaultProjectTrust` allows it; `"always"` adds `--approve`, trusting project resources on every wake — convenient for full automation, weaker for unattended security.
 
 ## Security notes
 
-- The daemon resumes sessions with `pi --approve`, which trusts project resources non-interactively. Set `"spawnOnWake": false` or `WAKE_ALARM_SPAWN=0` if you only want outbox delivery.
+- Headless wake runs respect Pi's project-trust model by default (`headlessTrust: "saved"`, no `--approve`). A wake that fires without a saved trust decision runs without project extensions/skills; the wake message itself is still delivered and the agent can act with built-in tools. Set `"headlessTrust": "always"` only if you accept re-granting project trust on every unattended wake. `spawnOnWake: false` / `WAKE_ALARM_SPAWN=0` turns spawning off entirely.
 - Log evidence in wake messages is untrusted remote content; it is sanitized, length-bounded, and labeled `untrusted data`. Treat it as data, not instructions.
 - Runtime state lives in `.pi/wake-alarm.state.json` (git-ignore it). Do not point two daemons at the same project.
 
 ## Development
 
 ```bash
-npm test          # node --test (24 tests: pure logic + multi-session runtime)
+npm test          # node --test (28 tests: pure logic, multi-session runtime, multi-process integration)
+npm run typecheck # tsc --noEmit (strict, erasableSyntaxOnly)
 ```
 
-Layout: `core.ts` (pure alarm/event logic) · `runtime.ts` (config, SSH probe, scheduler, merge-save) · `index.ts` (Pi extension shell) · `daemon.ts` (standalone scheduler/resume host).
+Layout: `core.ts` (pure alarm/event logic) · `runtime.ts` (config, SSH probe, scheduler, state transaction lock) · `lease.ts` (atomic fencing lease) · `index.ts` (Pi extension shell) · `daemon.ts` (standalone scheduler/resume host).
 
 ## Honest limitations
 
 - The daemon is only as reliable as whatever keeps it alive; use a service manager.
+- Alarms are operational project state, not session-history state: rewinding or forking a Pi conversation does not roll back alarms that were already created.
+- Tested against Pi 0.83.x on Node 22.19+ / 24.x (see CI). Requires Node >= 22.19 to match Pi's own baseline.
 - One-shot timers only (no recurring cron) — recurring schedules are deliberately out of scope; see pi-loop / pi-scheduler for in-session recurrence.
-- The headless resume path depends on Pi's `--session` / `--print` / `--approve` CLI surface; track upstream changes when upgrading Pi.
+- The headless resume path depends on Pi's `--session` / `--print` CLI surface (and `--approve` only with `headlessTrust: "always"`); track upstream changes when upgrading Pi.
 - Container watching is read-only over SSH (docker inspect + bounded log reads); it never mutates the remote host.
 
 ## License

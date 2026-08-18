@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { WakeAlarmRuntime, type EmitFn, type ExecFn } from "./runtime.ts";
-import type { AlarmState, FiredEvent } from "./core.ts";
+import type { AlarmState, FiredEvent, TimerAlarmState } from "./core.ts";
 
 const SESSION_X = "C:\\sessions\\x.jsonl";
 
@@ -38,7 +38,7 @@ async function waitFor(condition: () => boolean, label: string, timeoutMs = 3000
 	}
 }
 
-function dueTimer(id: string, ownerSessionFile?: string): AlarmState {
+function dueTimer(id: string, ownerSessionFile?: string): TimerAlarmState {
 	return { id, name: `Timer ${id}`, kind: "timer", active: true, createdAt: Date.now() - 1000, dueAt: Date.now() + 50, ownerSessionFile };
 }
 

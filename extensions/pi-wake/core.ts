@@ -643,7 +643,10 @@ export function leaseIsAlive(lease: Pick<AlarmLease, "pid" | "heartbeatAt">, now
 	return pidAlive(lease.pid);
 }
 
-export function buildResumeArgs(sessionFile: string, message: string): string[] {
+export function buildResumeArgs(sessionFile: string, message: string, options?: { approve?: boolean }): string[] {
 	if (!message || message.length > 4000) throw new Error("wake message must be 1-4000 characters");
-	return ["--session", validateOwnerSessionFile(sessionFile), "--approve", "--print", message];
+	const args = ["--session", validateOwnerSessionFile(sessionFile)];
+	if (options?.approve) args.push("--approve");
+	args.push("--print", message);
+	return args;
 }

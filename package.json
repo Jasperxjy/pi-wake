@@ -21,19 +21,31 @@
 	"homepage": "https://github.com/Jasperxjy/pi-wake#readme",
 	"bugs": "https://github.com/Jasperxjy/pi-wake/issues",
 	"engines": {
-		"node": ">=22.18"
+		"node": ">=22.19.0"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-coding-agent": "*"
 	},
 	"pi": {
-		"extensions": ["extensions/pi-wake/index.ts"]
+		"extensions": [
+			"extensions/pi-wake/index.ts"
+		]
 	},
 	"files": [
-		"extensions"
+		"extensions/pi-wake/index.ts",
+		"extensions/pi-wake/core.ts",
+		"extensions/pi-wake/lease.ts",
+		"extensions/pi-wake/runtime.ts",
+		"extensions/pi-wake/daemon.ts"
 	],
 	"scripts": {
-		"test": "node --test extensions/pi-wake/core.test.ts extensions/pi-wake/runtime.test.ts"
+		"test": "node --test extensions/pi-wake/*.test.ts",
+		"typecheck": "tsc --noEmit",
+		"prepublishOnly": "npm test && npm run typecheck"
+	},
+	"devDependencies": {
+		"@types/node": "^26.2.0",
+		"typescript": "^7.0.2"
 	}
 }

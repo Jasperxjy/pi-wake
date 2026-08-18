@@ -309,7 +309,7 @@ test("embedded file probe resets a still-larger replacement by device/inode iden
 		`exec(base64.b64decode(${JSON.stringify(scriptBase64)}))`,
 	].join("\n");
 	const result = spawnSync(process.platform === "win32" ? "python" : "python3", ["-c", wrapper], { encoding: "utf8" });
-	assert.equal(result.status, 0, result.stderr || result.error?.message);
+	assert.equal(result.status, 0, result.stderr || result.error?.message || "spawn failed");
 	const response = JSON.parse(result.stdout.trim()) as { probeError?: string; logReset?: boolean; logFileId?: string; logOffset?: number };
 	assert.equal(response.probeError, undefined);
 	assert.equal(response.logReset, true);
@@ -352,7 +352,7 @@ test("embedded Docker fallback retains the last consumed cursor on overflow and 
 		`exec(base64.b64decode(${JSON.stringify(scriptBase64)}))`,
 	].join("\n");
 	const result = spawnSync(process.platform === "win32" ? "python" : "python3", ["-c", wrapper], { encoding: "utf8" });
-	assert.equal(result.status, 0, result.stderr || result.error?.message);
+	assert.equal(result.status, 0, result.stderr || result.error?.message || "spawn failed");
 	const response = JSON.parse(result.stdout.trim()) as { probeError?: string; logCursor?: string; logBase64?: string };
 	assert.equal(response.probeError, undefined);
 	assert.equal(response.logCursor, firstStamp);
@@ -381,7 +381,7 @@ test("embedded remote probe rejects an allowed-root symlink resolving outside", 
 		`exec(base64.b64decode(${JSON.stringify(scriptBase64)}))`,
 	].join("\n");
 	const result = spawnSync(process.platform === "win32" ? "python" : "python3", ["-c", wrapper], { encoding: "utf8" });
-	assert.equal(result.status, 0, result.stderr || result.error?.message);
+	assert.equal(result.status, 0, result.stderr || result.error?.message || "spawn failed");
 	const response = JSON.parse(result.stdout.trim()) as { probeError?: string };
 	assert.match(response.probeError ?? "", /outside allowedRemoteLogRoots/);
 	assert.doesNotMatch(response.probeError ?? "", /docker inspect should not run/);
@@ -409,7 +409,7 @@ test("embedded remote probe fails closed for unavailable explicit application lo
 		`exec(base64.b64decode(${JSON.stringify(scriptBase64)}))`,
 	].join("\n");
 	const result = spawnSync(process.platform === "win32" ? "python" : "python3", ["-c", wrapper], { encoding: "utf8" });
-	assert.equal(result.status, 0, result.stderr || result.error?.message);
+	assert.equal(result.status, 0, result.stderr || result.error?.message || "spawn failed");
 	const response = JSON.parse(result.stdout.trim()) as { probeError?: string };
 	assert.match(response.probeError ?? "", /configured application log unavailable/);
 	assert.doesNotMatch(response.probeError ?? "", /docker fallback was used/);
@@ -454,7 +454,8 @@ test("session lease liveness requires a fresh heartbeat and a live pid", () => {
 });
 
 test("headless session resume arguments keep the wake message positional", () => {
-	assert.deepEqual(buildResumeArgs("C:\\Users\\x\\s.jsonl", "[Wake alarm] t1 fired"), ["--session", "C:\\Users\\x\\s.jsonl", "--approve", "--print", "[Wake alarm] t1 fired"]);
+	assert.deepEqual(buildResumeArgs("C:\\Users\\x\\s.jsonl", "[Wake alarm] t1 fired"), ["--session", "C:\\Users\\x\\s.jsonl", "--print", "[Wake alarm] t1 fired"]);
+	assert.deepEqual(buildResumeArgs("/s.jsonl", "msg", { approve: true }), ["--session", "/s.jsonl", "--approve", "--print", "msg"]);
 	assert.throws(() => buildResumeArgs("relative.jsonl", "msg"));
 	assert.throws(() => buildResumeArgs("/s.jsonl", ""));
 	assert.throws(() => buildResumeArgs("/s.jsonl", "x".repeat(4001)));

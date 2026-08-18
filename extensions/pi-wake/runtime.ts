@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { deflateSync } from "node:zlib";
+import { pidAlive } from "./lease.ts";
 import {
 	applyBaseline,
 	applyCheckFailure,
@@ -53,6 +54,7 @@ export interface RuntimeConfig {
 	piCommand?: string;
 	spawnOnWake: boolean;
 	runTimeoutMs: number;
+	headlessTrust: "saved" | "always";
 }
 
 export interface StoredState {
@@ -322,6 +324,24 @@ function validateActionParams(params: ToolParams): void {
 	if (irrelevant.length) throw new Error(`${params.action} does not accept: ${irrelevant.join(", ")}`);
 }
 
+/** Read the stored alarm list without validation; returns undefined when the state file is absent. One retry tolerates a rename race. */
+export async function readStoredAlarms(statePath: string): Promise<AlarmState[] | undefined> {
+	let text: string;
+	try { text = await fs.readFile(statePath, "utf8"); }
+	catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+	let saved: { version?: unknown; alarms?: unknown };
+	try { saved = JSON.parse(text) as { version?: unknown; alarms?: unknown }; }
+	catch {
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		saved = JSON.parse(await fs.readFile(statePath, "utf8")) as { version?: unknown; alarms?: unknown };
+	}
+	if (saved.version !== 2 || !Array.isArray(saved.alarms)) throw new Error("unsupported state content");
+	return saved.alarms as AlarmState[];
+}
+
 export function alarmSummary(alarm: AlarmState): string {
 	const lifecycle = alarm.active ? "active" : `paused${alarm.pauseReason ? ` (${alarm.pauseReason})` : ""}`;
 	if (alarm.kind === "timer") return `${alarm.id}: ${alarm.name} — timer ${lifecycle}; due=${new Date(alarm.dueAt).toISOString()}${alarm.triggeredAt === undefined ? "" : `; fired=${new Date(alarm.triggeredAt).toISOString()}`}`;
@@ -393,6 +413,7 @@ export class WakeAlarmRuntime {
 		for (const retired of ["semanticReview", "maximumRuntime"]) if (retired in parsed) throw new Error(`${retired} is retired; wake alarms fire only for explicitly configured timers or conditions`);
 		if (parsed.piCommand !== undefined && (typeof parsed.piCommand !== "string" || !parsed.piCommand || parsed.piCommand.length > 512 || parsed.piCommand.includes("\0"))) throw new Error("piCommand must be a non-empty command path no longer than 512 characters");
 		if (parsed.spawnOnWake !== undefined && typeof parsed.spawnOnWake !== "boolean") throw new Error("spawnOnWake must be boolean");
+		if (parsed.headlessTrust !== undefined && parsed.headlessTrust !== "saved" && parsed.headlessTrust !== "always") throw new Error("headlessTrust must be \"saved\" or \"always\"");
 		this.config = {
 			statusPollMs: validatePollingDuration(parseDuration((parsed.statusPoll ?? "60s") as string | number, "statusPoll")),
 			maxLogBytes: asInt(parsed.maxLogBytes ?? 65_536, "maxLogBytes", 1024, 262_144),
@@ -401,6 +422,7 @@ export class WakeAlarmRuntime {
 			piCommand: parsed.piCommand as string | undefined,
 			spawnOnWake: parsed.spawnOnWake === undefined ? true : (parsed.spawnOnWake as boolean),
 			runTimeoutMs: parseDuration((parsed.runTimeout ?? "30m") as string | number, "runTimeout"),
+			headlessTrust: parsed.headlessTrust === undefined ? "saved" : (parsed.headlessTrust as "saved" | "always"),
 		};
 		await this.loadStateFromDisk();
 		this.initialized = true;
@@ -443,36 +465,101 @@ export class WakeAlarmRuntime {
 	}
 
 	/**
+	 * Cross-process state transaction lock. Atomic rename alone only guarantees
+	 * readers never see half a file; it does NOT serialize the read-merge-write
+	 * cycle, so concurrent writers in different processes could lose each other's
+	 * alarms. All state mutations go through this exclusive lock file.
+	 */
+	private async withStateLock<T>(fn: () => Promise<T>): Promise<T> {
+		const lockPath = `${this.statePath}.lock`;
+		const deadline = Date.now() + 10_000;
+		for (;;) {
+			try {
+				const handle = await fs.open(lockPath, "wx");
+				try { await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() })); }
+				finally { await handle.close(); }
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
+			let breakIt = false;
+			let raw: { pid?: unknown; acquiredAt?: unknown } | undefined;
+			try { raw = JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: unknown; acquiredAt?: unknown }; }
+			catch { raw = undefined; }
+			const stat = await fs.stat(lockPath).catch(() => undefined);
+			if (!stat) continue; // vanished between create attempt and read; retry
+			const ageMs = Date.now() - stat.mtimeMs;
+			const pid = raw ? Number(raw.pid) : Number.NaN;
+			const acquiredAt = raw ? Number(raw.acquiredAt) : Number.NaN;
+			// A fresh but unparsable lock is half-born (creator is mid-write): wait, never break.
+			const holderDead = raw !== undefined && Number.isSafeInteger(pid) && pid > 0 && !pidAlive(pid);
+			const stale = ageMs > 30_000 || (raw !== undefined && (!Number.isSafeInteger(acquiredAt) || Date.now() - acquiredAt > 30_000));
+			breakIt = holderDead || stale;
+			if (breakIt) {
+				await fs.rm(lockPath, { force: true }).catch(() => undefined);
+				continue;
+			}
+			if (Date.now() > deadline) throw new Error("timed out acquiring the wake-alarm state lock");
+			await new Promise((resolve) => setTimeout(resolve, 25 + Math.floor(Math.random() * 50)));
+		}
+		try { return await fn(); }
+		finally { await fs.rm(lockPath, { force: true }).catch(() => undefined); }
+	}
+
+	/** Windows can transiently refuse a rename while an indexer/AV holds a handle; retry briefly. */
+	private async renameWithRetry(from: string, to: string): Promise<void> {
+		let lastError: Error | undefined;
+		for (let attempt = 0; attempt < 10; attempt++) {
+			try { await fs.rename(from, to); return; }
+			catch (error) {
+				lastError = error as Error;
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw error;
+				await new Promise((resolve) => setTimeout(resolve, 25 + attempt * 25));
+			}
+		}
+		throw lastError;
+	}
+
+	/**
 	 * Merge-save: only alarms this runtime actually changed are written back onto a
-	 * freshly read disk state, so concurrent sessions sharing the file do not
-	 * clobber each other's alarms with stale whole-map snapshots.
+	 * freshly read disk state, and the whole read-merge-write cycle runs under the
+	 * cross-process state lock so concurrent sessions cannot clobber each other.
 	 */
 	private async saveState(): Promise<void> {
 		if (!this.dirtyIds.size && !this.deletedIds.size) return;
-		let diskText: string | undefined;
-		try { diskText = await fs.readFile(this.statePath, "utf8"); }
-		catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		}
-		let diskAlarms: AlarmState[] = [];
-		if (diskText !== undefined) {
-			const saved = JSON.parse(diskText) as { version?: unknown; alarms?: unknown };
-			if (saved.version !== 2 || !Array.isArray(saved.alarms)) throw new Error(`Cannot merge into ${path.basename(this.statePath)}: unsupported state content`);
-			diskAlarms = saved.alarms as AlarmState[];
-		}
-		const byId = new Map<string, AlarmState>(diskAlarms.map((alarm) => [alarm.id, alarm]));
-		for (const id of this.deletedIds) byId.delete(id);
-		for (const id of this.dirtyIds) {
-			const alarm = this.alarms.get(id);
-			if (alarm) byId.set(id, alarm);
-		}
-		const temp = `${this.statePath}.tmp-${process.pid}-${Date.now()}`;
-		const data: StoredState = { version: 2, alarms: [...byId.values()] };
-		await fs.writeFile(temp, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-		try { await fs.rename(temp, this.statePath); }
-		catch (error) { await fs.rm(temp, { force: true }); throw error; }
-		this.dirtyIds.clear();
-		this.deletedIds.clear();
+		await this.withStateLock(async () => {
+			let diskText: string | undefined;
+			try { diskText = await fs.readFile(this.statePath, "utf8"); }
+			catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			let diskAlarms: AlarmState[] = [];
+			if (diskText !== undefined) {
+				let saved: { version?: unknown; alarms?: unknown };
+				try { saved = JSON.parse(diskText) as { version?: unknown; alarms?: unknown }; }
+				catch {
+					// A reader can race a writer's atomic rename on some platforms; retry once.
+					await new Promise((resolve) => setTimeout(resolve, 50));
+					saved = JSON.parse(await fs.readFile(this.statePath, "utf8")) as { version?: unknown; alarms?: unknown };
+				}
+				if (saved.version !== 2 || !Array.isArray(saved.alarms)) throw new Error(`Cannot merge into ${path.basename(this.statePath)}: unsupported state content`);
+				diskAlarms = saved.alarms as AlarmState[];
+			}
+			const byId = new Map<string, AlarmState>(diskAlarms.map((alarm) => [alarm.id, alarm]));
+			for (const id of this.deletedIds) byId.delete(id);
+			for (const id of this.dirtyIds) {
+				const alarm = this.alarms.get(id);
+				if (alarm) byId.set(id, alarm);
+			}
+			const temp = `${this.statePath}.tmp-${process.pid}-${Date.now()}`;
+			const data: StoredState = { version: 2, alarms: [...byId.values()] };
+			await fs.writeFile(temp, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+			try { await this.renameWithRetry(temp, this.statePath); }
+			catch (error) { await fs.rm(temp, { force: true }); throw error; }
+			this.dirtyIds.clear();
+			this.deletedIds.clear();
+		});
 	}
 
 	private sleep(ms: number, signal: AbortSignal): Promise<void> {
