@@ -33,7 +33,7 @@ async function writeLeaseAtomic(file: string, record: LeaseRecord, exclusive: bo
 	if (exclusive) {
 		let handle;
 		try {
-			handle = await fs.open(file, "wx");
+			handle = await fs.open(file, "wx", 0o600);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
 			throw error;
