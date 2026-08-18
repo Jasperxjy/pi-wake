@@ -201,7 +201,10 @@ test("a stale scheduler cannot fire a timer that was reset to a later deadline",
 	await b.start({ flushPending: false });
 	try {
 		await b.runAction({ action: "reset", id: "shared", after: "1h" });
-		await waitFor(async () => (await readState(statePath)).alarms[0].kind === "timer" && (await readState(statePath)).alarms[0].dueAt > Date.now(), "the reset to land on disk", 2_000);
+		await waitFor(async () => {
+			const alarm = (await readState(statePath)).alarms[0];
+			return alarm.kind === "timer" && alarm.dueAt > Date.now();
+		}, "the reset to land on disk", 2_000);
 		await new Promise((resolve) => setTimeout(resolve, 1_200));
 		assert.equal(calls.length, 0, "a stale scheduler must not fire a reset timer");
 		const disk = (await readState(statePath)).alarms[0];
