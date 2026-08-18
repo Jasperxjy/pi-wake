@@ -1,0 +1,32 @@
+{
+	"name": "pi-wake",
+	"version": "0.1.0",
+	"description": "Programmable event subscriptions for the Pi coding agent — one-shot timers and remote container watches that wake the same agent session when they fire, in-session while it is open and via a headless-resume daemon when it is not.",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pi-coding-agent",
+		"scheduler",
+		"event-subscription",
+		"daemon",
+		"agent-automation"
+	],
+	"license": "MIT",
+	"type": "module",
+	"engines": {
+		"node": ">=22.18"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"pi": {
+		"extensions": ["extensions/pi-wake/index.ts"]
+	},
+	"files": [
+		"extensions"
+	],
+	"scripts": {
+		"test": "node --test extensions/pi-wake/core.test.ts extensions/pi-wake/runtime.test.ts"
+	}
+}
