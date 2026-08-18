@@ -32,6 +32,7 @@ import { WakeAlarmRuntime, type EmitFn, type ExecFn } from "./runtime.ts";
 
 const PRESENCE_POLL_MS = 5_000;
 const ACTIVATION_RETRY_MS = 10_000;
+const TERMINATION_GRACE_MS = 5_000;
 const MAX_CHILD_OUTPUT_CHARS = 2000;
 const MAX_EXEC_OUTPUT_CHARS = 1024 * 1024;
 
@@ -148,24 +149,53 @@ function runPi(launch: PiLaunch, sessionFile: string, message: string, timeoutMs
 		let stdout = "";
 		let stderr = "";
 		let settled = false;
+		let timedOut = false;
+		let graceTimer: ReturnType<typeof setTimeout> | undefined;
+		let forceTimer: ReturnType<typeof setTimeout> | undefined;
 		const finish = (code: number): void => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			if (graceTimer) clearTimeout(graceTimer);
+			if (forceTimer) clearTimeout(forceTimer);
 			if (currentChild === child) currentChild = undefined;
 			if (stdout.trim()) log(`wake run stdout tail: ${stdout.trim()}`);
 			if (stderr.trim()) log(`wake run stderr tail: ${stderr.trim()}`);
 			resolve(code);
 		};
+		// Force-kill the whole process tree on Windows (the direct child only is not
+		// enough: pi may have spawned providers/tools under the session).
+		const forceKill = (): void => {
+			if (process.platform === "win32") {
+				spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+			} else {
+				child.kill("SIGKILL");
+			}
+		};
 		const timer = setTimeout(() => {
-			log(`wake run exceeded ${timeoutMs}ms; terminating the woken session`);
-			child.kill();
-			finish(124);
+			timedOut = true;
+			log(`wake run exceeded ${timeoutMs}ms; requesting termination of the woken session`);
+			child.kill(); // graceful SIGTERM (forceful on Windows, where SIGTERM is not real)
+			// Two-phase termination: only after the child actually closes (or is
+			// force-killed) is the delivery slot released, so the next attempt cannot
+			// start a second Pi on the same session file while the old one still lives.
+			graceTimer = setTimeout(() => {
+				log("wake run still running after the termination request; force-killing");
+				forceKill();
+				forceTimer = setTimeout(() => {
+					// Even SIGKILL did not close it (e.g. uninterruptible I/O): release the
+					// slot rather than hang the daemon forever; the session is unusable anyway.
+					log("wake run did not exit after SIGKILL; releasing the delivery slot");
+					finish(124);
+				}, TERMINATION_GRACE_MS);
+				child.once("close", () => { if (forceTimer) clearTimeout(forceTimer); });
+			}, TERMINATION_GRACE_MS);
+			child.once("close", () => { if (graceTimer) clearTimeout(graceTimer); });
 		}, timeoutMs);
 		child.stdout?.on("data", (chunk) => { stdout = (stdout + chunk).slice(-MAX_CHILD_OUTPUT_CHARS); });
 		child.stderr?.on("data", (chunk) => { stderr = (stderr + chunk).slice(-MAX_CHILD_OUTPUT_CHARS); });
 		child.on("error", (error) => { log(`failed to start ${launch.file}: ${error.message}`); finish(127); });
-		child.on("close", (code) => finish(code ?? 1));
+		child.on("close", (code) => finish(timedOut ? 124 : code ?? 1));
 	});
 }
 

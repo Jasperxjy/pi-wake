@@ -709,6 +709,78 @@ test("outbox overflow pauses the producing alarm instead of silently dropping", 
 		const disk = await readState(statePath);
 		assert.equal(disk.outbox.length, 2, "exactly the configured cap of entries are retained");
 		assert.ok(disk.alarms[0].pauseReason?.includes("outbox overflow"));
+		// P0 gate: the overflow-causing occurrence must NOT be consumed. The persisted
+		// exit fingerprint must stay at the last SUCCESSFUL fire (B), never advance to
+		// the overflow-causing C — so resume re-fires the same event.
+		const alarmDisk = disk.alarms[0];
+		assert.ok(alarmDisk.kind === "container", "alarm is a container");
+		assert.notEqual(alarmDisk.eventFingerprints["exit"], "exit:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc:2026-01-01T00:00:03.000Z:0", "the overflow-causing C occurrence was not consumed (its fingerprint was not persisted)");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("overflow pauses without consuming; drop_wake + resume re-fires the same occurrence", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" }, maxOutboxEntriesPerAlarm: 2 }));
+	const cid = "c".repeat(64);
+	const base: ProbeResult = { exists: true, containerId: cid, running: false, status: "exited", containerStatus: "exited", startedAt: "2026-01-01T00:00:00.000Z", exitCode: 0, oomKilled: false, logMode: "docker-logs", selectedLogPath: undefined, logFileId: undefined, logOffset: 0, logCursor: "2026-01-01T00:00:00Z", logBytes: new Uint8Array(), tail: "" };
+	const alarm = applyBaseline(createContainerAlarm({ id: "cap", name: "Cap", container: "job", events: ["exit"], policy: "keep", now: Date.now(), statusPollMs: 1000 }), base, Date.now());
+	await writeState(statePath, [alarm]);
+	const startedAts = ["2026-01-01T00:00:01.000Z", "2026-01-01T00:00:02.000Z", "2026-01-01T00:00:03.000Z"];
+	let probes = 0;
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: () => false,
+		execFn: async () => cannedProbe({ startedAt: startedAts[Math.min(probes++, startedAts.length - 1)] }),
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		// A + B fill the per-alarm cap; the C occurrence pauses the alarm unconsumed.
+		await waitFor(() => {
+			const state = readStateSync(statePath);
+			return state.alarms[0]?.active === false && String(state.alarms[0].pauseReason).includes("outbox overflow");
+		}, "the alarm to pause on outbox overflow", 12_000);
+		assert.equal((await readState(statePath)).outbox.length, 2);
+		// Free one slot explicitly, then resume: the SAME occurrence (startedAt C)
+		// must re-fire and produce its wake — the at-least-once gate.
+		const list = await runtime.runAction({ action: "list_wakes" });
+		const eventId = list.split("\n")[0].split(" | ")[0];
+		assert.ok(eventId && /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(eventId), `list_wakes returned an entry id: ${list}`);
+		await runtime.runAction({ action: "drop_wake", eventId });
+		await runtime.runAction({ action: "resume", id: "cap" });
+		await waitFor(() => readStateSync(statePath).outbox.length >= 2, "the C occurrence to re-fire after resume", 12_000);
+		const after = await readState(statePath);
+		assert.equal(after.outbox.length, 2, "one dropped, one re-fired");
+		assert.ok(after.outbox.some((entry) => entry.events[0].fingerprint.includes("2026-01-01T00:00:03.000Z")), "the re-fired wake is the overflow-causing C occurrence");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("outbox management: list_wakes, drop_wake, purge_wakes are explicit, never implied by remove", async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	const owner = "C:\\sessions\\gone.jsonl";
+	const entryA: OutboxEntry = { eventId: "a:1:x", alarmId: "a", alarmName: "A", ownerSessionFile: owner, triggeredAt: 1000, events: [{ kind: "timer", fingerprint: "timer:a:1" }], message: "[Wake alarm] A (a)" };
+	const entryB: OutboxEntry = { eventId: "b:2:y", alarmId: "b", alarmName: "B", ownerSessionFile: owner, triggeredAt: 2000, events: [{ kind: "timer", fingerprint: "timer:b:2" }], message: "[Wake alarm] B (b)" };
+	await writeState(statePath, [], [entryA, entryB]);
+	const runtime = makeRuntime(dir, statePath, () => true, { schedulingEnabled: false });
+	try {
+		await runtime.start({ flushPending: false });
+		const list = await runtime.runAction({ action: "list_wakes" });
+		assert.match(list, /a:1:x/);
+		assert.match(list, /b:2:y/);
+		assert.match(await runtime.runAction({ action: "drop_wake", eventId: "a:1:x" }), /Dropped wake a:1:x/);
+		assert.equal((await readState(statePath)).outbox.length, 1);
+		assert.match(await runtime.runAction({ action: "purge_wakes", id: "b" }), /Dropped 1 wake\(s\) for b/);
+		assert.equal((await readState(statePath)).outbox.length, 0);
+		await assert.rejects(runtime.runAction({ action: "drop_wake", eventId: "a:1:x" }), /unknown wake/);
 	} finally {
 		await runtime.stop();
 	}

@@ -62,10 +62,16 @@ jobs:
           for f in dist/daemon.js dist/runtime.js dist/core.js extensions/pi-wake/index.ts; do
             if [ -f "node_modules/pi-wake/$f" ]; then echo "$f present"; else echo "::error::$f MISSING from installed package"; exit 1; fi
           done
-          node -e "const p=require('pi-wake/package.json'); if(!p.bin||p.bin['pi-wake-daemon']!=='dist/daemon.js') process.exit(1)" && echo "bin wiring ok"
+          if ! node -e "const p=require('pi-wake/package.json'); if(!p.bin||p.bin['pi-wake-daemon']!=='dist/daemon.js') process.exit(1)"; then
+            echo "::error::invalid pi-wake-daemon bin wiring in the installed package"
+            exit 1
+          fi
+          echo "bin wiring ok"
           echo "::endgroup::"
-          echo "::group::installed daemon smoke"
-          WAKE_ALARM_CWD="$TMP" WAKE_ALARM_SPAWN_DRY_RUN=1 node node_modules/pi-wake/dist/daemon.js >daemon.log 2>&1 &
+          echo "::group::installed daemon smoke (via the npm bin shim)"
+          # Execute the REAL npm bin shim (node_modules/.bin/pi-wake-daemon), not the
+          # compiled file directly, so shim generation and the bin target are tested.
+          WAKE_ALARM_CWD="$TMP" WAKE_ALARM_SPAWN_DRY_RUN=1 node_modules/.bin/pi-wake-daemon >daemon.log 2>&1 &
           DPID=$!
           # Poll for startup instead of a fixed sleep, so runner load cannot flake it.
           OK=0
@@ -79,10 +85,10 @@ jobs:
             LOG=$(cat daemon.log 2>/dev/null || echo "<no daemon.log>")
             echo "daemon.log:"
             echo "$LOG"
-            echo "::error::installed daemon did not start; log: [$LOG]"
+            echo "::error::installed daemon (via bin shim) did not start; log: [$LOG]"
             exit 1
           fi
-          echo "daemon started"
+          echo "daemon started via node_modules/.bin/pi-wake-daemon"
           echo "::endgroup::"
       - name: extension load smoke (real Pi, RPC mode)
         shell: bash

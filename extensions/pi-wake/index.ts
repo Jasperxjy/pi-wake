@@ -30,6 +30,7 @@ const TOOL_PARAMETERS = Type.Object({
 	logPattern: Type.Optional(Type.String({ description: "Literal (not regex) required with log-match" })),
 	deadline: Type.Optional(Type.String({ description: "Relative container-watch deadline required with the deadline event" })),
 	statusPoll: Type.Optional(Type.String({ description: "Deterministic model-free condition polling interval, e.g. 60s" })),
+	eventId: Type.Optional(Type.String({ description: "Outbox wake eventId; required for drop_wake" })),
 });
 
 export default function wakeAlarmExtension(pi: ExtensionAPI) {

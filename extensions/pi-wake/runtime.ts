@@ -84,7 +84,7 @@ export interface StoredState {
 }
 
 export interface ToolParams {
-	action: "set_timer" | "watch_container" | "list" | "check" | "pause" | "resume" | "reset" | "remove" | "evidence";
+	action: "set_timer" | "watch_container" | "list" | "check" | "pause" | "resume" | "reset" | "remove" | "evidence" | "list_wakes" | "drop_wake" | "purge_wakes";
 	id?: string;
 	name?: string;
 	after?: string;
@@ -96,6 +96,7 @@ export interface ToolParams {
 	logPattern?: string;
 	deadline?: string;
 	statusPoll?: string;
+	eventId?: string;
 }
 
 export interface ActionContext {
@@ -303,7 +304,7 @@ except Exception as exc:
 `;
 
 const PROBE_LOADER = `import base64,zlib;exec(zlib.decompress(base64.b64decode("${deflateSync(Buffer.from(PROBE_SCRIPT)).toString("base64")}")))`;
-export const ACTION_ENUM = ["set_timer", "watch_container", "list", "check", "pause", "resume", "reset", "remove", "evidence"] as const;
+export const ACTION_ENUM = ["set_timer", "watch_container", "list", "check", "pause", "resume", "reset", "remove", "evidence", "list_wakes", "drop_wake", "purge_wakes"] as const;
 const ACTION_FIELDS: Record<ToolParams["action"], readonly (keyof ToolParams)[]> = {
 	set_timer: ["action", "id", "name", "after", "at"],
 	watch_container: ["action", "id", "name", "container", "events", "policy", "logPath", "logPattern", "deadline", "statusPoll"],
@@ -314,6 +315,9 @@ const ACTION_FIELDS: Record<ToolParams["action"], readonly (keyof ToolParams)[]>
 	reset: ["action", "id", "after", "at"],
 	remove: ["action", "id"],
 	evidence: ["action", "id"],
+	list_wakes: ["action"],
+	drop_wake: ["action", "eventId"],
+	purge_wakes: ["action", "id"],
 };
 
 function shellSingleQuote(value: string): string {
@@ -456,8 +460,11 @@ export class WakeAlarmRuntime {
 		if (parsed.includeWakeEvidence !== undefined && typeof parsed.includeWakeEvidence !== "boolean") throw new Error("includeWakeEvidence must be boolean");
 		if (parsed.headlessTrust !== undefined && parsed.headlessTrust !== "saved" && parsed.headlessTrust !== "always") throw new Error("headlessTrust must be \"saved\" or \"always\"");
 		const maxOutboxEntries = asInt(parsed.maxOutboxEntries ?? 1000, "maxOutboxEntries", 1, 100_000);
-		const maxOutboxEntriesPerAlarm = asInt(parsed.maxOutboxEntriesPerAlarm ?? 100, "maxOutboxEntriesPerAlarm", 1, maxOutboxEntries);
-		if (maxOutboxEntriesPerAlarm > maxOutboxEntries) throw new Error("maxOutboxEntriesPerAlarm must not exceed maxOutboxEntries");
+		// The per-alarm default follows the global cap, so setting only maxOutboxEntries
+		// to a small value cannot produce a per-alarm default that exceeds it.
+		const maxOutboxEntriesPerAlarm = parsed.maxOutboxEntriesPerAlarm === undefined
+			? Math.min(100, maxOutboxEntries)
+			: asInt(parsed.maxOutboxEntriesPerAlarm, "maxOutboxEntriesPerAlarm", 1, maxOutboxEntries);
 		this.config = {
 			statusPollMs: validatePollingDuration(parseDuration((parsed.statusPoll ?? "60s") as string | number, "statusPoll")),
 			maxLogBytes: asInt(parsed.maxLogBytes ?? 65_536, "maxLogBytes", 1024, 262_144),
@@ -898,23 +905,58 @@ export class WakeAlarmRuntime {
 	/** Commit a fire transition and (when emitting) append the outbox entry in one locked transaction. */
 	private async commitFire(id: string, next: AlarmState, events: FiredEvent[], now: number, shouldEmit: boolean): Promise<AlarmState> {
 		const diskState = await this.readDiskState();
-		const alarms = diskState.alarms.map((alarm) => (alarm.id === id ? next : alarm));
+		const disk = diskState.alarms.find((alarm) => alarm.id === id);
 		if (!shouldEmit || !events.length) {
-			await this.writeFullStateLocked(alarms, diskState.outbox);
+			await this.writeFullStateLocked(diskState.alarms.map((alarm) => (alarm.id === id ? next : alarm)), diskState.outbox);
 			this.adopt(next);
 			return next;
 		}
-		if (this.outboxOverflowed(diskState, id)) {
-			const overflowed = { ...next, active: false, pauseReason: "outbox overflow: undelivered wakes; deliver or remove them, then reset" } as AlarmState;
-			await this.writeFullStateLocked(diskState.alarms.map((alarm) => (alarm.id === id ? overflowed : alarm)), diskState.outbox);
-			this.adopt(overflowed);
-			return overflowed;
+		if (disk && this.outboxOverflowed(diskState, id)) {
+			// Outbox at capacity: PAUSE WITHOUT CONSUMING the occurrence. The pre-fire
+			// alarm state (triggeredAt, event fingerprints, log cursor, …) is kept
+			// intact and only active/pauseReason change, so once the user frees outbox
+			// capacity (drop_wake) and resumes, the very same occurrence fires again
+			// and produces its wake. Persisting the post-fire `next` here would mark
+			// the event as consumed without a durable wake — losing it forever.
+			const paused = { ...disk, active: false, pauseReason: "outbox overflow: undelivered wakes; drop_wake or purge_wakes to free capacity, then resume" } as AlarmState;
+			await this.writeFullStateLocked(diskState.alarms.map((alarm) => (alarm.id === id ? paused : alarm)), diskState.outbox);
+			this.adopt(paused);
+			return paused;
 		}
 		const entry = createOutboxEntry(next, events, now, this.outboxOptions());
-		await this.writeFullStateLocked(alarms, [...diskState.outbox, entry]);
+		await this.writeFullStateLocked(diskState.alarms.map((alarm) => (alarm.id === id ? next : alarm)), [...diskState.outbox, entry]);
 		this.outbox.set(entry.eventId, entry);
 		this.adopt(next);
 		return next;
+	}
+
+	/** Remove a specific undelivered wake (explicit management action; never implied by alarm removal). */
+	private async dropOutboxEntry(eventId: string): Promise<void> {
+		await this.withStateLock(async () => {
+			const diskState = await this.readDiskState();
+			const entry = diskState.outbox.find((candidate) => candidate.eventId === eventId);
+			if (!entry) throw new Error(`unknown wake: ${eventId}`);
+			const outbox = diskState.outbox.filter((candidate) => candidate.eventId !== eventId);
+			await this.writeFullStateLocked(diskState.alarms, outbox);
+			this.outbox.delete(eventId);
+			this.wakeRetry.delete(eventId);
+		});
+	}
+
+	/** Remove every undelivered wake of an alarm (explicit management action). Returns the number dropped. */
+	private async purgeOutboxEntries(alarmId: string): Promise<number> {
+		let dropped = 0;
+		await this.withStateLock(async () => {
+			const diskState = await this.readDiskState();
+			const outbox = diskState.outbox.filter((candidate) => candidate.alarmId !== alarmId);
+			dropped = diskState.outbox.length - outbox.length;
+			if (!dropped) return;
+			await this.writeFullStateLocked(diskState.alarms, outbox);
+			this.outbox.clear();
+			for (const entry of outbox) this.outbox.set(entry.eventId, entry);
+			for (const eventId of [...this.wakeRetry.keys()]) if (!this.outbox.has(eventId)) this.wakeRetry.delete(eventId);
+		});
+		return dropped;
 	}
 
 	private async tryEmit(entry: OutboxEntry): Promise<boolean> {
@@ -1284,6 +1326,29 @@ export class WakeAlarmRuntime {
 					}
 					if (omitted) lines.push(`… (${omitted} more evidence snippet(s) omitted)`);
 					return lines.join("\n");
+				}
+				case "list_wakes": {
+					const entries = [...this.outbox.values()].sort((a, b) => a.triggeredAt - b.triggeredAt);
+					if (!entries.length) return "No wakes in the outbox.";
+					return entries.map((entry) => {
+						const claim = entry.claim ? `claim=${entry.claim.claimantId} until ${new Date(entry.claim.expiresAt).toISOString()}` : "claim=none";
+						return `${entry.eventId} | alarm=${entry.alarmId} (${entry.alarmName}) | triggered=${new Date(entry.triggeredAt).toISOString()} | events=${entry.events.map((event) => event.kind).join(",")} | owner=${entry.ownerSessionFile ?? "(none)"} | ${claim}`;
+					}).join("\n");
+				}
+				case "drop_wake": {
+					if (!params.eventId) throw new Error("eventId is required for drop_wake");
+					const eventId = params.eventId.trim();
+					if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(eventId)) throw new Error("eventId is invalid");
+					await this.dropOutboxEntry(eventId);
+					this.schedule();
+					return `Dropped wake ${eventId}.`;
+				}
+				case "purge_wakes": {
+					if (!params.id) throw new Error("id is required for purge_wakes");
+					const id = validateAlarmId(params.id);
+					const dropped = await this.purgeOutboxEntries(id);
+					this.schedule();
+					return dropped ? `Dropped ${dropped} wake(s) for ${id}.` : `No wakes for ${id}.`;
 				}
 			}
 		});
