@@ -23,28 +23,35 @@ jobs:
       - name: package smoke (real tarball install + bin)
         shell: bash
         run: |
-          set -euo pipefail
-          TGZ=$(npm pack --silent | tail -1)   # prepack builds dist/
+          set -uo pipefail
+          echo "::group::npm pack"
+          TGZ=$(npm pack --silent | tail -1)
+          echo "tarball: $TGZ"
+          echo "::endgroup::"
           TMP=$(mktemp -d)
+          echo "install dir: $TMP"
           cd "$TMP"
           npm init -y >/dev/null
           # Install the actual publish tarball, not the source checkout: this catches
           # missing files in the `files` whitelist, broken relative imports, and the
           # pi-wake-daemon bin wiring.
-          npm install "$OLDPWD/$TGZ" --no-audit --no-fund --legacy-peer-deps >/dev/null
-          test -f node_modules/pi-wake/dist/daemon.js
-          test -f node_modules/pi-wake/dist/runtime.js
-          test -f node_modules/pi-wake/extensions/pi-wake/index.ts
-          node -e "const p=require('pi-wake/package.json'); if(!p.bin||p.bin['pi-wake-daemon']!=='dist/daemon.js') process.exit(1)"
-          # Daemon bin smoke from the installed layout: it must start, read the (empty)
-          # project state, and stay alive until killed. dist/daemon.js is plain ESM,
-          # so it runs on stock Node even under node_modules.
+          echo "::group::npm install tarball"
+          npm install "$OLDPWD/$TGZ" --no-audit --no-fund --legacy-peer-deps
+          echo "::endgroup::"
+          echo "::group::layout checks"
+          test -f node_modules/pi-wake/dist/daemon.js && echo "dist/daemon.js present"
+          test -f node_modules/pi-wake/dist/runtime.js && echo "dist/runtime.js present"
+          test -f node_modules/pi-wake/extensions/pi-wake/index.ts && echo "extensions/pi-wake/index.ts present"
+          node -e "const p=require('pi-wake/package.json'); if(!p.bin||p.bin['pi-wake-daemon']!=='dist/daemon.js') process.exit(1)" && echo "bin wiring ok"
+          echo "::endgroup::"
+          echo "::group::installed daemon smoke"
           WAKE_ALARM_CWD="$TMP" WAKE_ALARM_SPAWN_DRY_RUN=1 node node_modules/pi-wake/dist/daemon.js >daemon.log 2>&1 &
           DPID=$!
           sleep 4
           kill "$DPID" 2>/dev/null || true
           wait "$DPID" 2>/dev/null || true
-          grep -q "watching project" daemon.log
+          grep -q "watching project" daemon.log && echo "daemon started" || { echo "daemon.log:"; cat daemon.log; exit 1; }
+          echo "::endgroup::"
       - name: extension load smoke (real Pi, RPC mode)
         shell: bash
         run: |
