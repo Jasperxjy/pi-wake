@@ -23,7 +23,7 @@
  *           node <package>/extensions/pi-wake/daemon.ts   (Node >= 22.19).
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { buildResumeArgs, type AlarmState, type OutboxEntry } from "./core.ts";
@@ -326,9 +326,32 @@ async function main(): Promise<void> {
 	}
 }
 
+/**
+ * Resolve the invoked entry to its real path. `process.argv[1]` can be a relative
+ * path, an absolute path, a SYMLINK (npm links bin entries to dist/daemon.js on
+ * POSIX), or a bare command name found via PATH (service managers). Node's
+ * `import.meta.url` is the realpath, so all of these must resolve to the same
+ * file before the daemon treats itself as the main entry.
+ */
+function resolveInvoked(argv1: string): string | undefined {
+	const candidates: string[] = [path.resolve(argv1)];
+	if (!path.isAbsolute(argv1)) {
+		for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+			if (dir) candidates.push(path.join(dir, argv1));
+		}
+	}
+	for (const candidate of candidates) {
+		try { return realpathSync(candidate); } catch { /* try next candidate */ }
+	}
+	return undefined;
+}
+
 const isMain = (() => {
-	try { return Boolean(process.argv[1]) && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href; }
-	catch { return false; }
+	try {
+		if (!process.argv[1]) return false;
+		const invoked = resolveInvoked(process.argv[1]);
+		return invoked !== undefined && import.meta.url === pathToFileURL(invoked).href;
+	} catch { return false; }
 })();
 
 if (isMain) {
