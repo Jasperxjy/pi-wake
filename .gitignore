@@ -4,3 +4,6 @@ node_modules/
 .pi/wake-alarm.lock.json*
 .pid-check.mjs
 .debug-*.mts
+dist/
+.build-staging/
+*.tgz

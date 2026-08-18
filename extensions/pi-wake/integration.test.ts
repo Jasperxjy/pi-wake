@@ -388,7 +388,7 @@ test("keep policy records one outbox entry per same-kind occurrence without loss
 	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
 	const cid = "c".repeat(64);
 	const base: ProbeResult = { exists: true, containerId: cid, running: false, status: "exited", containerStatus: "exited", startedAt: "2026-01-01T00:00:00.000Z", exitCode: 0, oomKilled: false, logMode: "docker-logs", selectedLogPath: undefined, logFileId: undefined, logOffset: 0, logCursor: "2026-01-01T00:00:00Z", logBytes: new Uint8Array(), tail: "" };
-	const alarm = applyBaseline(createContainerAlarm({ id: "keep", name: "Keep", container: "job", events: ["exit"], policy: "keep", now: Date.now(), statusPollMs: 250 }), base, Date.now());
+	const alarm = applyBaseline(createContainerAlarm({ id: "keep", name: "Keep", container: "job", events: ["exit"], policy: "keep", now: Date.now(), statusPollMs: 1000 }), base, Date.now());
 	await writeState(statePath, [alarm]);
 	const calls: OutboxEntry[] = [];
 	const startedAts = ["2026-01-01T00:00:01.000Z", "2026-01-01T00:00:02.000Z", "2026-01-01T00:00:02.000Z"];
@@ -496,6 +496,23 @@ test("daemon emit re-checks presence and refuses to spawn when the owner came ba
 	} finally {
 		await releasePresence(presenceDir, "owner-live");
 	}
+	// An UNREADABLE presence registry is "unknown", never "nobody is live": fail closed.
+	const badDir = path.join(dir, "registry-as-file");
+	await fs.writeFile(badDir, "not a directory");
+	const logs2: string[] = [];
+	let spawns2 = 0;
+	const emit2 = createDaemonEmit({
+		getRuntime: () => ({ runtimeConfig: { spawnOnWake: true, headlessTrust: "saved", runTimeoutMs: 1000, piCommand: undefined, maxEvidenceChars: 1000, includeWakeEvidence: true } }) as unknown as WakeAlarmRuntime,
+		presenceDir: badDir,
+		dryRun: false,
+		spawnDisabled: false,
+		isStopping: () => false,
+		log: (message) => logs2.push(message),
+		runPi: async () => { spawns2++; return 0; },
+	});
+	assert.equal(await emit2(entry), false, "an unreadable presence registry must not lead to a spawn");
+	assert.equal(spawns2, 0);
+	assert.ok(logs2.some((line) => line.includes("cannot verify session presence")), `expected a fail-closed log line: ${JSON.stringify(logs2)}`);
 });
 
 test("evidence is opt-in: check never leaks it, the evidence action returns historical evidence", async () => {
@@ -536,8 +553,8 @@ test("a deadline crossing while the probe runs fires exactly once (keep policy)"
 	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
 	const now = Date.now();
 	const base: ProbeResult = { exists: true, containerId: "c".repeat(64), running: true, status: "running", containerStatus: "running", startedAt: "2026-01-01T00:00:00.000Z", exitCode: 0, oomKilled: false, logMode: "docker-logs", selectedLogPath: undefined, logFileId: undefined, logOffset: 0, logCursor: "2026-01-01T00:00:00Z", logBytes: new Uint8Array(), tail: "" };
-	// Fast polling starts a probe at +100ms; the deadline elapses at +400ms while that probe is still in flight.
-	const alarm = applyBaseline(createContainerAlarm({ id: "dl", name: "Deadline", container: "job", events: ["deadline"], policy: "keep", now, deadlineMs: 400, statusPollMs: 100 }), base, now);
+	// Fast polling starts a probe at +1s; the deadline elapses at +1.5s while that probe is still in flight.
+	const alarm = applyBaseline(createContainerAlarm({ id: "dl", name: "Deadline", container: "job", events: ["deadline"], policy: "keep", now, deadlineMs: 1500, statusPollMs: 1000 }), base, now);
 	await writeState(statePath, [alarm]);
 	const calls: OutboxEntry[] = [];
 	const runtime = new WakeAlarmRuntime({
@@ -545,7 +562,7 @@ test("a deadline crossing while the probe runs fires exactly once (keep policy)"
 		configPath,
 		statePath,
 		emit: (entry) => { calls.push(entry); return true; },
-		execFn: async () => { await new Promise((resolve) => setTimeout(resolve, 600)); return cannedProbe(); },
+		execFn: async () => { await new Promise((resolve) => setTimeout(resolve, 2000)); return cannedProbe(); },
 	});
 	try {
 		await runtime.start({ flushPending: false });
@@ -557,6 +574,141 @@ test("a deadline crossing while the probe runs fires exactly once (keep policy)"
 		assert.equal(disk.outbox.length, 0, "delivered wake removed");
 		const alarmDisk = disk.alarms[0];
 		assert.ok(alarmDisk.kind === "container" && alarmDisk.eventFingerprints.deadline, "the deadline fingerprint is durably recorded");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("a v2 state migrates to v3 in a single process", async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	const v2Alarm = { id: "legacy", name: "Legacy", kind: "timer", active: false, createdAt: 1000, dueAt: 2000, triggeredAt: 1500, lastTriggeredAt: 1500, pauseReason: "timer fired", pendingWake: { triggeredAt: 1500, events: [{ kind: "timer", fingerprint: "timer:legacy:2000" }] } };
+	await fs.writeFile(statePath, `${JSON.stringify({ version: 2, alarms: [v2Alarm] })}\n`);
+	const runtime = makeRuntime(dir, statePath, () => true, { schedulingEnabled: false });
+	try {
+		await runtime.start({ flushPending: false });
+		const disk = await readState(statePath);
+		assert.equal(disk.version, 3, "the file is rewritten as version 3");
+		assert.equal(disk.alarms.length, 1);
+		assert.equal((disk.alarms[0] as AlarmState & { pendingWake?: unknown }).pendingWake, undefined, "the alarm no longer embeds a pendingWake");
+		assert.equal(disk.outbox.length, 1, "the embedded wake becomes an outbox entry");
+		assert.equal(disk.outbox[0].alarmId, "legacy");
+		assert.equal(disk.outbox[0].events[0].fingerprint, "timer:legacy:2000");
+		assert.equal(runtime.alarmCount, 1);
+		assert.equal(runtime.outboxCount, 1);
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("two processes racing on a v2 state produce exactly one valid v3", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	const v2Alarm = { id: "legacy", name: "Legacy", kind: "timer", active: false, createdAt: 1000, dueAt: 2000, triggeredAt: 1500, lastTriggeredAt: 1500, pauseReason: "timer fired", pendingWake: { triggeredAt: 1500, events: [{ kind: "timer", fingerprint: "timer:legacy:2000" }] } };
+	await fs.writeFile(statePath, `${JSON.stringify({ version: 2, alarms: [v2Alarm] })}\n`);
+	const barrier = path.join(dir, "migrate-go");
+	const workerSource = `
+import { WakeAlarmRuntime } from ${JSON.stringify(runtimeUrl)};
+${BARRIER_HELPER}
+const [statePath, barrier] = process.argv.slice(2);
+const runtime = new WakeAlarmRuntime({
+	cwd: ${JSON.stringify(dir)},
+	configPath: ${JSON.stringify(path.join(dir, "absent-config.json"))},
+	statePath,
+	emit: () => false,
+	execFn: async () => ({ stdout: "", stderr: "", code: 0 }),
+});
+await runtime.start({ flushPending: false });
+await waitBarrier(barrier);
+const listing = await runtime.runAction({ action: "list" });
+await runtime.stop();
+console.log(listing);
+`;
+	const worker = await writeWorker(dir, "migrate-worker.ts", workerSource);
+	// Both processes start concurrently and race the migration on the same v2 file.
+	const [a, b] = [runWorker([worker, statePath, barrier]), runWorker([worker, statePath, barrier])];
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await fs.writeFile(barrier, "go");
+	const [ra, rb] = await Promise.all([a, b]);
+	assert.equal(ra.code, 0, ra.stderr);
+	assert.equal(rb.code, 0, rb.stderr);
+	const disk = await readState(statePath);
+	assert.equal(disk.version, 3);
+	assert.equal(disk.alarms.length, 1);
+	assert.equal(disk.outbox.length, 1);
+	assert.match(`${ra.stdout}${rb.stdout}`, /Legacy/, "both workers see the migrated alarm");
+});
+
+test("remove stops future events but keeps undelivered wakes, which are still delivered", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	const owner = "C:\\sessions\\gone.jsonl";
+	const entry: OutboxEntry = {
+		eventId: "gone:1000:x",
+		alarmId: "gone",
+		alarmName: "Gone",
+		ownerSessionFile: owner,
+		triggeredAt: Date.now() - 50,
+		events: [{ kind: "timer", fingerprint: "timer:gone:1000" }],
+		message: "[Wake alarm] Gone (gone)",
+	};
+	await writeState(statePath, [{ id: "gone", name: "Gone", kind: "timer", active: true, createdAt: Date.now() - 1000, dueAt: Date.now() + 60_000, ownerSessionFile: owner, revision: 1 }], [entry]);
+	const a = makeRuntime(dir, statePath, () => true, { schedulingEnabled: false });
+	await a.start({ flushPending: false });
+	try {
+		const removed = await a.runAction({ action: "remove", id: "gone" });
+		assert.match(removed, /1 undelivered wake/);
+		const disk = await readState(statePath);
+		assert.deepEqual(disk.alarms, [], "the alarm is gone");
+		assert.equal(disk.outbox.length, 1, "the undelivered wake survives removal");
+		// A fresh daemon-like runtime (owner not live) must pick the ORPHAN wake up
+		// through the independent outbox scheduler pass.
+		const calls: OutboxEntry[] = [];
+		// Nobody is live, so a daemon-like runtime owns every alarm and entry.
+		const daemon = makeRuntime(dir, statePath, (e) => { calls.push(e); return true; }, { owns: () => true });
+		await daemon.start({ flushPending: false });
+		try {
+			await waitFor(() => calls.length === 1, "the orphan wake to be delivered by the outbox scheduler", 6_000);
+			assert.equal(calls[0].alarmId, "gone");
+			await waitFor(() => readStateSync(statePath).outbox.length === 0, "the delivered orphan wake to be cleared", 3_000);
+		} finally {
+			await daemon.stop();
+		}
+	} finally {
+		await a.stop();
+	}
+});
+
+test("outbox overflow pauses the producing alarm instead of silently dropping", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" }, maxOutboxEntriesPerAlarm: 2 }));
+	const cid = "c".repeat(64);
+	const base: ProbeResult = { exists: true, containerId: cid, running: false, status: "exited", containerStatus: "exited", startedAt: "2026-01-01T00:00:00.000Z", exitCode: 0, oomKilled: false, logMode: "docker-logs", selectedLogPath: undefined, logFileId: undefined, logOffset: 0, logCursor: "2026-01-01T00:00:00Z", logBytes: new Uint8Array(), tail: "" };
+	const alarm = applyBaseline(createContainerAlarm({ id: "cap", name: "Cap", container: "job", events: ["exit"], policy: "keep", now: Date.now(), statusPollMs: 1000 }), base, Date.now());
+	await writeState(statePath, [alarm]);
+	const startedAts = ["2026-01-01T00:00:01.000Z", "2026-01-01T00:00:02.000Z", "2026-01-01T00:00:03.000Z", "2026-01-01T00:00:04.000Z"];
+	let probes = 0;
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: () => false,
+		execFn: async () => cannedProbe({ startedAt: startedAts[Math.min(probes++, startedAts.length - 1)] }),
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		// Two undelivered entries fill the per-alarm cap; the third occurrence must
+		// pause the alarm with an explicit diagnostic rather than drop or grow forever.
+		await waitFor(() => {
+			const state = readStateSync(statePath);
+			return state.alarms[0]?.active === false && String(state.alarms[0].pauseReason).includes("outbox overflow");
+		}, "the alarm to pause on outbox overflow", 12_000);
+		const disk = await readState(statePath);
+		assert.equal(disk.outbox.length, 2, "exactly the configured cap of entries are retained");
+		assert.ok(disk.alarms[0].pauseReason?.includes("outbox overflow"));
 	} finally {
 		await runtime.stop();
 	}

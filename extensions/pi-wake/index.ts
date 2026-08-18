@@ -40,6 +40,9 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	let presenceHeartbeat: ReturnType<typeof setInterval> | undefined;
 	let isLeader = false;
 	let passive = false;
+	let presenceFailures = 0;
+	let presenceWarned = false;
+	let uiNotify: ((message: string) => void) | undefined;
 
 	async function refreshPresence(): Promise<void> {
 		if (!presenceDir) return;
@@ -49,7 +52,19 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 			// Ownerless (legacy) alarms are scheduled by exactly one live session: the
 			// deterministic leader (smallest instance id). No acquisition, no fencing.
 			isLeader = leaderInstanceId(live) === instanceId;
-		} catch { /* presence is best-effort; the wake claim still guarantees single delivery */ }
+			presenceFailures = 0;
+			presenceWarned = false;
+		} catch {
+			// Presence is the daemon's only signal that this session has a real Pi
+			// process. A silent failure here would let the daemon treat the session as
+			// offline and spawn a second Pi on the same session file, so consecutive
+			// failures must be visible instead of swallowed.
+			presenceFailures++;
+			if (!presenceWarned || presenceFailures % 5 === 0) {
+				presenceWarned = true;
+				uiNotify?.(`Wake alarm: cannot write session presence (${presenceFailures} consecutive failure(s)); the daemon may not detect this session — check write access to ${presenceDir}`);
+			}
+		}
 	}
 
 	function stopHeartbeat(): void {
@@ -112,6 +127,9 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		ownerSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 		isLeader = false;
 		presenceDir = undefined;
+		presenceFailures = 0;
+		presenceWarned = false;
+		uiNotify = ctx.hasUI ? (message) => ctx.ui.notify(message, "warning") : undefined;
 		// Presence is established BEFORE any scheduling or wake flushing: each live
 		// session owns one registry file, so this never contends with other sessions.
 		if (!passive) {
@@ -146,6 +164,7 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		// Stop accepting and finish in-flight scheduler work first; only then
 		// withdraw live presence, so the daemon cannot interleave mid-shutdown.
 		stopHeartbeat();
+		uiNotify = undefined;
 		const current = runtime;
 		runtime = undefined;
 		if (current) await current.stop();

@@ -38,18 +38,20 @@
 		"extensions/pi-wake/presence.ts",
 		"extensions/pi-wake/lock.ts",
 		"extensions/pi-wake/runtime.ts",
-		"extensions/pi-wake/daemon.ts"
+		"dist/"
 	],
 	"scripts": {
 		"test": "node --test extensions/pi-wake/*.test.ts",
 		"typecheck": "tsc --noEmit",
-		"prepublishOnly": "npm test && npm run typecheck"
+		"build": "node scripts/build.mjs",
+		"prepack": "npm run build",
+		"prepublishOnly": "npm test && npm run typecheck && npm run build"
 	},
 	"devDependencies": {
 		"@types/node": "^22.20.1",
 		"typescript": "^7.0.2"
 	},
 	"bin": {
-		"pi-wake-daemon": "extensions/pi-wake/daemon.ts"
+		"pi-wake-daemon": "dist/daemon.js"
 	}
 }

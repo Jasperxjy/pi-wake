@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 
 export const DEFAULT_STATUS_POLL_MS = 60_000;
+export const MIN_STATUS_POLL_MS = 1_000;
 export const MAX_TIMER_DELAY_MS = 2_147_483_647;
 export const ERROR_PATTERN = /(?:Traceback|(?:[A-Z][A-Za-z]*)?Error)(?::|\b)/;
 
@@ -139,8 +140,8 @@ export function parseAbsoluteTime(value: string, label = "at"): number {
 }
 
 export function validatePollingDuration(value: number, label = "statusPoll"): number {
-	if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_TIMER_DELAY_MS) {
-		throw new Error(`${label} must be positive milliseconds no greater than ${MAX_TIMER_DELAY_MS}`);
+	if (!Number.isSafeInteger(value) || value < MIN_STATUS_POLL_MS || value > MAX_TIMER_DELAY_MS) {
+		throw new Error(`${label} must be an integer between ${MIN_STATUS_POLL_MS}ms (1s) and ${MAX_TIMER_DELAY_MS}ms`);
 	}
 	return value;
 }

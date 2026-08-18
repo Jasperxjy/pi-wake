@@ -198,7 +198,14 @@ export function createDaemonEmit(deps: DaemonEmitDeps): EmitFn {
 		// back online in the meantime, leave the wake for the live session instead of
 		// spawning a second Pi process against the same session file. Ownerless wakes
 		// are daemon-served only while no session is live at all.
-		const live = await listLivePresences(deps.presenceDir).catch(() => []);
+		// Fail CLOSED: an unreadable presence registry means "unknown", never "nobody
+		// is live" — the wake is already durable, so retrying later costs nothing.
+		let live: PresenceRecord[];
+		try { live = await listLivePresences(deps.presenceDir); }
+		catch (error) {
+			deps.log(`cannot verify session presence (${(error as Error).message}); wake left in the outbox`);
+			return false;
+		}
 		if (sessionFile ? isSessionFileLive(live, sessionFile) : live.length > 0) {
 			deps.log(`owner of ${entry.alarmId} is now live; wake left in the outbox for the session`);
 			return false;

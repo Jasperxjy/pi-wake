@@ -84,7 +84,7 @@ session closed →  daemon (owner offline)  → pi --session <owner> --print …
 Every alarm created in a session records that session's file as its owner. Coordination uses two simple primitives instead of a global lock lease:
 
 - **Presence registry** (`.pi/wake-alarm.sessions/`): each live session owns exactly one heartbeat file, so registration never contends. A live session schedules only alarms it owns; ownerless (pre-0.1) alarms belong to the deterministic leader (smallest live instance id). The daemon schedules alarms whose owner session is **offline** — so one open session never starves another session's alarms — and ownerless alarms only when no session is live.
-- **Outbox is independent of alarm state.** A fired event becomes a durable outbox entry — a fact that HAPPENED — with its own bounded message snapshot. Entries survive pause/reset/remove of the alarm (at-least-once delivery), one event kind may occur in many entries (keep policy re-fires), and delivering an entry requires winning a claim token written under the state transaction lock. Session and daemon use the identical claim transaction, so routing overlaps can never double-deliver, and a crashed claimant's claim simply expires.
+- **Outbox is independent of alarm state.** A fired event becomes a durable outbox entry — a fact that HAPPENED — with its own bounded message snapshot. Entries survive pause/reset of the alarm, and **remove stops future events only**: undelivered wakes from a removed alarm stay durable and are still delivered (the scheduler tracks the outbox independently of alarm existence). One event kind may occur in many entries (keep policy re-fires), and delivering an entry requires winning a claim token written under the state transaction lock. Session and daemon use the identical claim transaction, so routing overlaps can never double-deliver, and a crashed claimant's claim simply expires.
 - **Disk state is the source of truth.** The runtime keeps only a cache; every action, every scheduler tick, and the daemon's 5-second poll re-reads the state file and merges it into the cache (`reconcile`). Alarms created by another session after this process started are adopted automatically, removed alarms disappear, and any alarm whose revision advanced is replaced wholesale.
 - All state mutations run under a cross-process transaction lock (`.pi/wake-alarm.state.json.lock`, inode-verified rename-based stale takeover so a crash-recovery contender can never delete a successor's lock) with per-alarm revision CAS: concurrent creates of the same id fail cleanly (`alarm already exists`), and scheduler decisions are recomputed from the freshest persisted state — a stale scheduler can never fire a timer that was paused or reset in the meantime.
 - Runs spawned by the daemon get `WAKE_ALARM_PASSIVE=1`: their extension instance serves the tool but never schedules. While a wake run is active the daemon pauses scheduling, then reloads the state file — alarms the woken agent created or changed are picked up.
@@ -143,6 +143,8 @@ On Windows the daemon unwraps the npm `pi.cmd` shim and runs the CLI script with
   "statusPoll": "60s",
   "maxLogBytes": 65536,
   "maxEvidenceChars": 1000,
+  "maxOutboxEntries": 1000,
+  "maxOutboxEntriesPerAlarm": 100,
   "piCommand": null,
   "spawnOnWake": true,
   "runTimeout": "30m",
@@ -155,7 +157,9 @@ On Windows the daemon unwraps the npm `pi.cmd` shim and runs the CLI script with
 - `allowedRemoteLogRoots` constrains which remote log files may be read (realpath-checked remotely).
 - `runTimeout` bounds every headless wake run; the run is terminated after it.
 - `headlessTrust` controls project trust for headless wake runs: `"saved"` (default) passes no approval flag, so a woken run only loads project resources when a saved Pi trust decision or `defaultProjectTrust` allows it; `"always"` adds `--approve`, trusting project resources on every wake — convenient for full automation, weaker for unattended security.
-- `includeWakeEvidence`: when `false`, wake messages contain no remote log excerpts (only the factual event fields), keeping untrusted log text out of the prompt entirely; the woken agent can still fetch the stored evidence on demand with `{"action":"evidence","id":"…"}` — evidence is returned only on that explicit request.
+- `includeWakeEvidence`: when `false`, wake messages contain no remote log excerpts (only the factual event fields), keeping untrusted log text out of the prompt entirely; the woken agent can still fetch the stored evidence on demand with `{"action":"evidence","id":"…"}` — evidence is returned only on that explicit request, capped at 8000 characters and labeled as untrusted remote data.
+- `maxOutboxEntries` / `maxOutboxEntriesPerAlarm` bound the undelivered-wake backlog (defaults 1000 / 100). When a new occurrence would exceed a cap, the producing alarm is **paused with an explicit `outbox overflow` reason** instead of silently dropping or growing forever; existing entries are never discarded (at-least-once). Deliver or remove undelivered wakes, then `resume`/`reset`.
+- `statusPoll` (and the `statusPoll` request field) has a hard 1-second minimum, so an agent cannot configure a per-millisecond SSH probe loop.
 - Unknown fields are rejected, so typos fail loudly instead of being silently ignored.
 
 ## Security notes
@@ -169,9 +173,10 @@ On Windows the daemon unwraps the npm `pi.cmd` shim and runs the CLI script with
 ```bash
 npm test          # unit + multi-session runtime + multi-process integration tests
 npm run typecheck # tsc --noEmit (strict, erasableSyntaxOnly)
+npm run build     # emit dist/ (compiled daemon bin; prepack runs this automatically)
 ```
 
-Layout: `core.ts` (pure alarm/event logic) · `runtime.ts` (config, SSH probe, scheduler, state transaction lock + CAS, wake claims) · `presence.ts` (presence registry / leadership) · `index.ts` (Pi extension shell) · `daemon.ts` (standalone scheduler/resume host).
+Layout: `core.ts` (pure alarm/event logic) · `runtime.ts` (config, SSH probe, scheduler, state transaction lock + CAS, wake claims) · `presence.ts` (presence registry / leadership) · `index.ts` (Pi extension shell) · `daemon.ts` (standalone scheduler/resume host) · `scripts/build.mjs` (emits `dist/` — the daemon bin runs under plain Node, which refuses type stripping for `node_modules`, so it ships as compiled ESM; the extension itself is loaded by Pi via jiti and ships as TypeScript).
 
 ## Honest limitations
 

@@ -17,15 +17,18 @@ import { pidAlive } from "./presence.ts";
  *     and is restored (hard link) instead of deleted. This closes the classic
  *     stat-rm-acquire TOCTOU where two contenders both "recover" the same dead
  *     lock and the second one deletes the first one's fresh lock.
- *  4. Every state write inside the critical section calls `verifyHeld()` first:
+ *  4. A lock whose owner PID is still alive is never judged stale, no matter how
+ *     old it is: age-based takeover of a live holder is what allowed a late
+ *     release() to delete a successor's lock. Only dead owners are recoverable.
+ *  5. Every state write inside the critical section calls `verifyHeld()` first:
  *     if the lock at `path` is no longer the inode we acquired, the operation
  *     aborts instead of writing concurrently with the new holder.
  *
  * Residual (documented, deliberate): between a `verifyHeld()` check and the
- * state-file rename, a takeover that judges us stale (>staleMs inside the
- * critical section, or a dead pid) can still displace us. Holders are alive and
- * critical sections are short, so this requires a pathological pause; the
- * per-alarm revision CAS on top bounds the damage of any such interleave.
+ * state-file rename, a takeover that judges us stale (dead pid, or an
+ * unparsable lock that crossed staleMs) can still displace us. Holders are
+ * alive and critical sections are short, so this requires a pathological pause;
+ * the per-alarm revision CAS on top bounds the damage of any such interleave.
  */
 export interface LockTestingHooks {
 	/** Called after a contender judged the current lock stale, immediately before the takeover rename. */
@@ -97,10 +100,12 @@ export class StateLock {
 
 	private isStale(observed: LockObservation, now: number): boolean {
 		if (observed.parsed) {
-			if (!pidAlive(observed.parsed.pid)) return true;
-			if (now - observed.parsed.createdAt > this.staleMs) return true;
-			if (now - observed.mtimeMs > this.staleMs) return true;
-			return false;
+			// A lock whose owner is still alive is NEVER stale, regardless of age:
+			// age-based takeover of a live holder is what lets a still-running release()
+			// delete a successor's lock. Only a dead owner (or unparsable old garbage)
+			// can be recovered. The cost is that a hung-but-alive holder makes other
+			// contenders time out loudly instead of stealing — the safe failure mode.
+			return !pidAlive(observed.parsed.pid);
 		}
 		// Unparsable content: half-born (fresh) locks are never stale; old garbage is.
 		return now - observed.mtimeMs > this.staleMs;

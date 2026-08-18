@@ -76,6 +76,7 @@ test("durations, absolute times, deadlines, and Node timer bounds are validated"
 	assert.throws(() => parseAbsoluteTime("tomorrow sometime"));
 	assert.equal(validatePollingDuration(MAX_TIMER_DELAY_MS), MAX_TIMER_DELAY_MS);
 	assert.throws(() => validatePollingDuration(MAX_TIMER_DELAY_MS + 1));
+	assert.throws(() => validatePollingDuration(999), /1s/, "container polling has a 1 second minimum");
 	assert.equal(timerDelay(100, 200), 0);
 	assert.equal(timerDelay(MAX_TIMER_DELAY_MS + 100, 0), MAX_TIMER_DELAY_MS);
 	assert.equal(deadlineAfter(100, 50), 150);
