@@ -22,7 +22,7 @@ Polling and timing are deterministic and model-free — no tokens are spent unti
 pi install npm:pi-wake
 ```
 
-Or from source: `pi install git:github.com/<you>/pi-wake`. Reload Pi afterwards.
+Or from source: `pi install git:github.com/Jasperxjy/pi-wake`. Reload Pi afterwards.
 
 Requires Node ≥ 22.18 for the standalone daemon (native TypeScript support). The in-session extension runs wherever Pi runs.
 
