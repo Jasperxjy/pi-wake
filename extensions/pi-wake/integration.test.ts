@@ -861,6 +861,8 @@ test("watch_container_group emits ONE summary wake when all members are terminal
 		assert.equal(calls[0].events[0].kind, "group");
 		assert.match(calls[0].message, /2\/2 terminal/, calls[0].message);
 		assert.match(calls[0].message, /exit 0/, calls[0].message);
+		// The emit fires before the completion write; wait for the outbox clear to land.
+		await waitFor(() => readStateSync(statePath).outbox.length === 0, "the delivered group wake to be cleared", 5_000);
 		// Members produce no individual wakes and are paused once the group completes.
 		const disk = await readState(statePath);
 		assert.equal(disk.outbox.length, 0, "the delivered group wake was removed");
@@ -1086,6 +1088,216 @@ test("group summary includes bounded member log tails when logTailLines is set",
 		assert.match(calls[0].message, /accuracy=0.91/, "member log tail appears in the group summary");
 		assert.match(calls[0].message, /saved checkpoint/, "multi-line member tail is included");
 		assert.match(calls[0].message, /tail:/);
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("logTailLines alone enables log reading in the real probe payload", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	let lastPayload: string | undefined;
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: () => true,
+		execFn: async (_file, args) => {
+			const match = args[args.length - 1].match(/'([A-Za-z0-9+/=]+)'$/);
+			if (match) lastPayload = Buffer.from(match[1], "base64").toString("utf8");
+			return cannedProbe();
+		},
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "watch_container", id: "w", name: "W", container: "job", events: ["exit"], logTailLines: 5, statusPoll: "60s" });
+		assert.ok(lastPayload, "baseline probe payload captured");
+		const withTail = JSON.parse(lastPayload!) as { readLogs?: boolean; tailLinesReq?: number };
+		assert.equal(withTail.readLogs, true, "logTailLines alone must enable log reading in the real probe");
+		assert.equal(withTail.tailLinesReq, 5);
+		await runtime.runAction({ action: "watch_container", id: "w2", name: "W2", container: "job2", events: ["exit"], statusPoll: "60s" });
+		const withoutTail = JSON.parse(lastPayload!) as { readLogs?: boolean };
+		assert.equal(withoutTail.readLogs, false, "without logTailLines, exit-only watches stay readLogs=false");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("a satisfied group is frozen when the outbox is full and survives member state changes", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" }, maxOutboxEntries: 1 }));
+	const calls: OutboxEntry[] = [];
+	let restarting = false;
+	let probes = 0;
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: (entry) => { calls.push(entry); return false; },
+		execFn: async () => {
+			probes++;
+			// Baselines (first two probes) see running containers; polls then see
+			// abnormal exits, so the members genuinely fire their abnormal events.
+			if (restarting || probes <= 2) return cannedProbe({ running: true, status: "running", containerStatus: "running", exitCode: undefined });
+			return cannedProbe({ exitCode: 1 });
+		},
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "set_timer", id: "t1", name: "T1", after: "1s" });
+		await waitFor(() => readStateSync(statePath).outbox.length === 1, "the outbox to fill to its cap", 10_000);
+		await runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], condition: "any_abnormal", statusPoll: "1s" });
+		// any_abnormal met while the outbox is full -> the group FREEZES the occurrence.
+		await waitFor(() => {
+			const state = readStateSync(statePath);
+			const group = state.alarms.find((alarm) => alarm.id === "g");
+			return group?.kind === "group" && (group as { pendingFire?: boolean }).pendingFire === true;
+		}, "the group to freeze with pendingFire", 15_000);
+		const frozen = readStateSync(statePath);
+		assert.equal(frozen.outbox.length, 1, "no wake was appended past the cap");
+		assert.ok(frozen.alarms.every((alarm) => alarm.kind !== "container" || alarm.active === false), "members are paused while the occurrence is frozen");
+		// A container restart must NOT erase the frozen abnormal fingerprints: members
+		// are paused, so no probe rewrites them.
+		restarting = true;
+		await new Promise((resolve) => setTimeout(resolve, 2_500));
+		const after = readStateSync(statePath);
+		const groupAfter = after.alarms.find((alarm) => alarm.id === "g");
+		assert.equal(groupAfter?.kind === "group" && (groupAfter as { pendingFire?: boolean }).pendingFire, true, "the occurrence stays frozen through a restart");
+		// Free a slot: the group fires with the FROZEN summary.
+		await runtime.runAction({ action: "drop_wake", eventId: after.outbox[0].eventId });
+		await waitFor(() => readStateSync(statePath).alarms.some((alarm) => alarm.id === "g" && alarm.kind === "group" && (alarm as { firedAt?: number }).firedAt !== undefined), "the frozen group to fire after capacity was freed", 15_000);
+		const fired = readStateSync(statePath);
+		assert.equal(fired.outbox.length, 1, "cap respected: the group wake took the freed slot");
+		assert.ok(fired.alarms.some((alarm) => alarm.id === "g" && alarm.kind === "group" && String(alarm.summary).includes("2/2 terminal")), "the fired summary reflects the frozen occurrence");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("a satisfied condition is frozen when the outbox is full and is not overwritten by a later probe", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa", allowedRemoteLogRoots: ["/data/results/"] }, maxOutboxEntries: 1 }));
+	const calls: OutboxEntry[] = [];
+	let fileGone = false;
+	let probes = 0;
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: (entry) => { calls.push(entry); return false; },
+		execFn: async () => {
+			probes++;
+			if (fileGone) return { stdout: JSON.stringify({ exists: false, size: 0, tailBase64: "" }), stderr: "", code: 0 };
+			return { stdout: JSON.stringify({ exists: true, size: 128, tailBase64: Buffer.from("done\n").toString("base64") }), stderr: "", code: 0 };
+		},
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "set_timer", id: "t1", name: "T1", after: "1s" });
+		await waitFor(() => readStateSync(statePath).outbox.length === 1, "the outbox to fill to its cap", 10_000);
+		await runtime.runAction({ action: "watch_condition", id: "done", name: "Done", path: "/data/results/analysis.json", condition: "exists", statusPoll: "1s" });
+		// The file is satisfied while the outbox is full: freeze lastSatisfied=true.
+		await waitFor(() => {
+			const state = readStateSync(statePath);
+			const alarm = state.alarms.find((candidate) => candidate.id === "done");
+			return alarm?.kind === "condition" && alarm.lastSatisfied === true && alarm.satisfiedAt === undefined;
+		}, "the condition to freeze satisfied", 15_000);
+		const probesAtFreeze = probes;
+		// The file disappears: the frozen pending occurrence must NOT be overwritten.
+		fileGone = true;
+		await new Promise((resolve) => setTimeout(resolve, 2_500));
+		const after = readStateSync(statePath);
+		const alarmAfter = after.alarms.find((candidate) => candidate.id === "done");
+		assert.equal(alarmAfter?.kind === "condition" && alarmAfter.lastSatisfied, true, "the frozen satisfaction survives the file disappearing");
+		assert.ok(probes <= probesAtFreeze + 1, "the pending occurrence stops re-probing the external condition");
+		await runtime.runAction({ action: "drop_wake", eventId: after.outbox[0].eventId });
+		await waitFor(() => readStateSync(statePath).alarms.some((candidate) => candidate.id === "done" && candidate.kind === "condition" && candidate.satisfiedAt !== undefined), "the frozen condition to fire after capacity was freed", 15_000);
+		assert.equal(readStateSync(statePath).outbox.length, 1, "cap respected");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("check acknowledges a satisfied condition even when the outbox is full", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa", allowedRemoteLogRoots: ["/data/results/"] }, maxOutboxEntries: 1 }));
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: () => false,
+		execFn: async () => ({ stdout: JSON.stringify({ exists: true, size: 128, tailBase64: Buffer.from("done\n").toString("base64") }), stderr: "", code: 0 }),
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "set_timer", id: "t1", name: "T1", after: "1s" });
+		await waitFor(() => readStateSync(statePath).outbox.length === 1, "the outbox to fill to its cap", 10_000);
+		await runtime.runAction({ action: "watch_condition", id: "done", name: "Done", path: "/data/results/analysis.json", condition: "exists", statusPoll: "60s" });
+		// check = acknowledge: satisfied even with a full outbox, no wake appended.
+		const checked = await runtime.runAction({ action: "check", id: "done" });
+		assert.match(checked, /done: Done — condition/);
+		const disk = await readState(statePath);
+		const alarm = disk.alarms.find((candidate) => candidate.id === "done");
+		assert.equal(alarm?.kind === "condition" && alarm.satisfiedAt !== undefined, true, "check acknowledged the condition");
+		assert.equal(alarm?.kind === "condition" && alarm.active, false, "acknowledged condition is done");
+		assert.equal(disk.outbox.length, 1, "no wake was appended by the acknowledge");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("removing a group with an empty outbox reports no phantom wakes", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const runtime = new WakeAlarmRuntime({ cwd: dir, configPath, statePath, emit: () => true, execFn: async () => cannedProbe() });
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], statusPoll: "60s" });
+		const removed = await runtime.runAction({ action: "remove", id: "g" });
+		assert.doesNotMatch(removed, /undelivered wake/, removed);
+		assert.doesNotMatch(removed, /purged/, removed);
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("a member replaced by a different alarm kind triggers a group integrity failure", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const runtime = new WakeAlarmRuntime({ cwd: dir, configPath, statePath, emit: () => true, execFn: async () => cannedProbe() });
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], statusPoll: "1s" });
+		// Replace member g-1 with a timer of the same id.
+		await runtime.runAction({ action: "remove", id: "g-1" });
+		await runtime.runAction({ action: "set_timer", id: "g-1", name: "Imposter", after: "1h" });
+		await waitFor(() => {
+			const state = readStateSync(statePath);
+			const group = state.alarms.find((alarm) => alarm.id === "g");
+			return group?.kind === "group" && String(group.pauseReason).includes("integrity failure");
+		}, "the group to report an integrity failure", 15_000);
+		const disk = await readState(statePath);
+		const group = disk.alarms.find((alarm) => alarm.id === "g");
+		assert.equal(group?.kind === "group" && group.active, false);
+		assert.match(String(group?.kind === "group" ? group.pauseReason : ""), /g-1/);
 	} finally {
 		await runtime.stop();
 	}

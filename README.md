@@ -100,7 +100,7 @@ Members:
   ...
 ```
 
-Optional `coalesceWindow` (e.g. `30s`) delays a partial-condition fire so the summary can include stragglers; all-terminal always fires immediately. Once fired, the group and its members pause together; **group lifecycle controls members** — `pause`/`resume` apply to the group AND its members, and `reset` **rebaselines every member** (fresh probes, cleared fingerprints), so a new run can never re-fire the previous run's terminal state. `remove` on a group removes its members in the same transaction; `ack` on a group drops every member's undelivered wakes. Deleting a member alarm directly is detected as a group integrity failure (the group pauses with a diagnostic instead of counting it as terminal).
+Optional `coalesceWindow` (e.g. `30s`) delays a partial-condition fire so the summary can include stragglers; all-terminal always fires immediately. If the outbox has no capacity when the condition is met, the occurrence is **frozen** (members pause, summary kept) and the group only retries the slot — a restarted container or removed result file can never erase an already-happened event. Once fired, the group and its members pause together; **group lifecycle controls members** — `pause`/`resume` apply to the group AND its members, and `reset` **rebaselines every member** (fresh probes, cleared fingerprints), so a new run can never re-fire the previous run's terminal state. `remove` on a group removes its members in the same transaction; `ack` on a group drops every member's undelivered wakes. Deleting a member alarm directly is detected as a group integrity failure (the group pauses with a diagnostic instead of counting it as terminal).
 
 ### Completion files: `watch_condition`
 

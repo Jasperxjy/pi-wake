@@ -81,6 +81,14 @@ export interface GroupAlarmState extends AlarmBase {
 	nextCheckAt: number;
 	/** When the condition was first met; used with coalesceWindowMs. */
 	conditionMetAt?: number;
+	/**
+	 * The condition has been met and the group is due to fire, but the outbox had
+	 * no capacity. The occurrence is FROZEN: members are paused, the summary is
+	 * kept, and the group only retries the outbox slot instead of re-evaluating
+	 * the external condition (which may have moved on — a restarted container or
+	 * a removed result file must not lose an already-happened event).
+	 */
+	pendingFire?: boolean;
 	/** Wait up to this long after the condition is first met before firing, so the
 	 * summary can include stragglers; all-terminal always fires immediately. */
 	coalesceWindowMs?: number;
@@ -739,7 +747,7 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 		return { ...base, kind: "timer", dueAt: requiredInteger(record, "dueAt"), triggeredAt };
 	}
 	if (base.kind === "group") {
-		assertKnown(record, [...baseFields, "memberIds", "condition", "required", "statusPollMs", "nextCheckAt", "conditionMetAt", "coalesceWindowMs", "firedAt", "summary"]);
+		assertKnown(record, [...baseFields, "memberIds", "condition", "required", "statusPollMs", "nextCheckAt", "conditionMetAt", "coalesceWindowMs", "firedAt", "pendingFire", "summary"]);
 		if (!Array.isArray(record.memberIds) || record.memberIds.length < 2 || record.memberIds.length > 64) throw new Error("memberIds must be an array of 2-64 members");
 		const memberIds = record.memberIds.map((value) => validateAlarmId(String(value)));
 		if (new Set(memberIds).size !== memberIds.length) throw new Error("memberIds must be unique");
@@ -760,6 +768,7 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 			conditionMetAt: optionalInteger(record, "conditionMetAt"),
 			coalesceWindowMs,
 			firedAt,
+			pendingFire: record.pendingFire === undefined ? undefined : (() => { if (typeof record.pendingFire !== "boolean") throw new Error("pendingFire must be boolean"); return record.pendingFire; })(),
 			summary: optionalString(record, "summary", 2000),
 		};
 	}

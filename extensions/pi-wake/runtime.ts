@@ -877,7 +877,7 @@ export class WakeAlarmRuntime {
 			cursor: rebind ? undefined : alarm.logCursor,
 			fileId: rebind ? undefined : alarm.logFileId,
 			baseline,
-			readLogs: Boolean(alarm.logPath) || alarm.events.includes("log-error") || alarm.events.includes("log-match"),
+			readLogs: Boolean(alarm.logPath) || alarm.events.includes("log-error") || alarm.events.includes("log-match") || alarm.logTailLines !== undefined,
 			maxBytes: config.maxLogBytes,
 			tailBytes: Math.min(config.maxLogBytes, 8192),
 			tailLinesReq: alarm.logTailLines,
@@ -1054,11 +1054,13 @@ export class WakeAlarmRuntime {
 	/**
 	 * Batch-barrier evaluation. Reads the freshest member states under the state
 	 * lock, computes the condition summary, and either advances the poll cadence,
-	 * waits out a coalesce window, or fires the single group wake — all in one
-	 * transaction that bumps the revision of EVERY changed alarm (group + members).
-	 * Firing pauses the group AND its members (they are done) and never re-fires
-	 * until reset. A member alarm that no longer exists is an integrity failure,
-	 * NOT a terminal result: the group pauses with a diagnostic.
+	 * waits out a coalesce window, fires the single group wake, or — when the
+	 * outbox is full at the moment the condition is met — FREEZES the occurrence:
+	 * members are paused, the summary is kept, and the group only retries the
+	 * outbox slot, so a restarted container can never erase an already-happened
+	 * abnormal exit. Every changed alarm (group + members) gets a revision bump.
+	 * A member whose alarm is missing, not a container, or no longer pointing at
+	 * this group is an integrity failure, never a terminal result.
 	 */
 	private async evaluateGroup(id: string, shouldEmit = true): Promise<{ alarm: GroupAlarmState; events: FiredEvent[] }> {
 		const current = this.alarms.get(id);
@@ -1068,16 +1070,36 @@ export class WakeAlarmRuntime {
 			if (!group || group.kind !== "group") return { alarms: disk.alarms, outbox: disk.outbox, adopted: new Map(), result: { alarm: (group as GroupAlarmState | undefined) ?? (current as GroupAlarmState), events: [] } };
 			if (!group.active || group.firedAt !== undefined) return { alarms: disk.alarms, outbox: disk.outbox, adopted: new Map([[id, group]]), result: { alarm: group, events: [] } };
 			const now = Date.now();
-			const missingMembers = group.memberIds.filter((memberId) => !disk.alarms.some((candidate) => candidate.id === memberId));
-			if (missingMembers.length > 0) {
-				// Integrity failure: never count a locally-deleted member as terminal.
-				const diagnostic = `group integrity failure: missing member alarm(s) ${missingMembers.join(", ")}`;
-				const next = this.bump(group, { active: false, pauseReason: diagnostic, summary: diagnostic });
+			const groupMember = (memberId: string): ContainerAlarmState | undefined => {
+				const candidate = disk.alarms.find((alarm) => alarm.id === memberId);
+				return candidate !== undefined && candidate.kind === "container" && candidate.groupId === group.id ? candidate : undefined;
+			};
+			const badMembers = group.memberIds.filter((memberId) => groupMember(memberId) === undefined);
+			if (badMembers.length > 0) {
+				// Integrity failure: a member that is missing, replaced by another kind,
+				// or no longer attached to this group is NEVER a terminal result.
+				const diagnostic = `group integrity failure: invalid member alarm(s) ${badMembers.join(", ")}`;
+				const next = this.bump(group, { active: false, pauseReason: diagnostic, summary: diagnostic, pendingFire: false });
 				const alarms = disk.alarms.map((candidate) => candidate.id === id ? next : group.memberIds.includes(candidate.id) ? this.bump(candidate, { active: false, pauseReason: "group integrity failure" }) : candidate);
 				const adopted = new Map(alarms.filter((candidate) => candidate.id === id || group.memberIds.includes(candidate.id)).map((candidate) => [candidate.id, candidate]));
 				return { alarms, outbox: disk.outbox, adopted, result: { alarm: next, events: [] } };
 			}
-			const members = group.memberIds.map((memberId) => disk.alarms.find((candidate) => candidate.id === memberId)).filter((member): member is ContainerAlarmState => member !== undefined && member.kind === "container");
+			// Frozen occurrence: the condition was already met but the outbox had no
+			// capacity. ONLY retry the slot — never re-evaluate the external condition.
+			if (group.pendingFire === true) {
+				if (shouldEmit && !this.outboxCapacityFree(disk, id, 1)) {
+					const next = this.bump(group, { nextCheckAt: now + 5_000 });
+					const alarms = disk.alarms.map((candidate) => (candidate.id === id ? next : candidate));
+					return { alarms, outbox: disk.outbox, adopted: new Map([[id, next]]), result: { alarm: next, events: [] } };
+				}
+				// Fire with the FROZEN summary.
+				const fired = this.bump(group, { active: false, pauseReason: `group condition met: ${group.condition}`, firedAt: now, conditionMetAt: undefined, pendingFire: false, lastTriggeredAt: now });
+				const event: FiredEvent = { kind: "group", fingerprint: `group:${id}:${group.condition}:${now}`, evidence: group.summary };
+				const entry = createOutboxEntry(fired, [event], now, this.outboxOptions());
+				const alarms = disk.alarms.map((candidate) => (candidate.id === id ? fired : candidate));
+				return { alarms, outbox: shouldEmit ? [...disk.outbox, entry] : disk.outbox, adopted: new Map([[id, fired]]), adoptedOutbox: shouldEmit ? [...disk.outbox, entry] : undefined, result: { alarm: fired, events: [event] } };
+			}
+			const members = group.memberIds.map(groupMember).filter((member): member is ContainerAlarmState => member !== undefined);
 			let terminal = 0;
 			let exit0 = 0;
 			let abnormal = 0;
@@ -1105,47 +1127,50 @@ export class WakeAlarmRuntime {
 					if (tail) lines.push(`    tail: ${tail.replace(/\n/g, "\n    ")}`);
 				}
 			}
-			const summary = `${terminal}/${group.memberIds.length} terminal; ${exit0} exit 0; ${abnormal} abnormal; ${missing} missing; ${replaced} replaced`;
+			const counts = `${terminal}/${group.memberIds.length} terminal; ${exit0} exit 0; ${abnormal} abnormal; ${missing} missing; ${replaced} replaced`;
 			const conditionMet = group.condition === "any_terminal" ? terminal >= 1
 				: group.condition === "all_terminal" ? terminal === group.memberIds.length
 				: group.condition === "any_abnormal" ? abnormal >= 1
 				: terminal >= group.required;
 			const allTerminal = terminal === group.memberIds.length;
 			if (!conditionMet) {
-				const next = this.bump(group, { summary, conditionMetAt: undefined, nextCheckAt: now + group.statusPollMs });
+				const next = this.bump(group, { summary: counts, conditionMetAt: undefined, pendingFire: false, nextCheckAt: now + group.statusPollMs });
 				const alarms = disk.alarms.map((candidate) => (candidate.id === id ? next : candidate));
 				return { alarms, outbox: disk.outbox, adopted: new Map([[id, next]]), result: { alarm: next, events: [] } };
 			}
 			const metAt = group.conditionMetAt ?? now;
 			const shouldFire = allTerminal || group.coalesceWindowMs === undefined || now >= metAt + group.coalesceWindowMs;
 			if (!shouldFire) {
-				const next = this.bump(group, { summary, conditionMetAt: metAt, nextCheckAt: metAt + group.coalesceWindowMs! });
+				const next = this.bump(group, { summary: counts, conditionMetAt: metAt, nextCheckAt: metAt + group.coalesceWindowMs! });
 				const alarms = disk.alarms.map((candidate) => (candidate.id === id ? next : candidate));
 				return { alarms, outbox: disk.outbox, adopted: new Map([[id, next]]), result: { alarm: next, events: [] } };
 			}
-			// Capacity guard: the group wake must respect maxOutboxEntries like any other.
-			if (!this.outboxCapacityFree(disk, id, 1)) {
-				const next = this.bump(group, { summary, nextCheckAt: now + group.statusPollMs });
-				const alarms = disk.alarms.map((candidate) => (candidate.id === id ? next : candidate));
-				return { alarms, outbox: disk.outbox, adopted: new Map([[id, next]]), result: { alarm: next, events: [] } };
+			const memberLines = lines.slice(0, 12);
+			if (lines.length > 12) memberLines.push(`… ${lines.length - 12} more`);
+			const firedSummary = `${counts}\nMembers:\n${memberLines.join("\n")}`.slice(0, 2000);
+			if (shouldEmit && !this.outboxCapacityFree(disk, id, 1)) {
+				// Freeze the occurrence: pause members so a container restart can never
+				// delete the fingerprints that justify this wake, keep the summary, and
+				// retry only the outbox slot.
+				const frozen = this.bump(group, { summary: firedSummary, pendingFire: true, conditionMetAt: undefined, nextCheckAt: now + 5_000 });
+				const alarms = disk.alarms.map((candidate) => candidate.id === id ? frozen : group.memberIds.includes(candidate.id) && candidate.kind === "container" ? this.bump(candidate, { active: false, pauseReason: "group completed (awaiting outbox capacity)" }) : candidate);
+				const adopted = new Map(alarms.filter((candidate) => candidate.id === id || group.memberIds.includes(candidate.id)).map((candidate) => [candidate.id, candidate]));
+				return { alarms, outbox: disk.outbox, adopted, result: { alarm: frozen, events: [] } };
 			}
 			// Fire: the group pauses (never re-fires until reset) and its members pause too.
 			const fired = this.bump(group, {
 				active: false,
 				pauseReason: `group condition met: ${group.condition}`,
-				summary,
+				summary: firedSummary,
 				firedAt: now,
 				conditionMetAt: undefined,
+				pendingFire: false,
 				lastTriggeredAt: now,
 			});
-			const memberLines = lines.slice(0, 12);
-			if (lines.length > 12) memberLines.push(`… ${lines.length - 12} more`);
-			const firedSummary = `${summary}\nMembers:\n${memberLines.join("\n")}`.slice(0, 2000);
-			const detail: GroupAlarmState = { ...fired, summary: firedSummary };
-			const event: FiredEvent = { kind: "group", fingerprint: `group:${id}:${group.condition}:${now}`, evidence: summary };
-			const entry = createOutboxEntry(detail, [event], now, this.outboxOptions());
+			const event: FiredEvent = { kind: "group", fingerprint: `group:${id}:${group.condition}:${now}`, evidence: counts };
+			const entry = createOutboxEntry(fired, [event], now, this.outboxOptions());
 			const alarms = disk.alarms.map((candidate) => {
-				if (candidate.id === id) return detail;
+				if (candidate.id === id) return fired;
 				if (group.memberIds.includes(candidate.id) && candidate.kind === "container") return this.bump(candidate, { active: false, pauseReason: "group completed" });
 				return candidate;
 			});
@@ -1155,7 +1180,7 @@ export class WakeAlarmRuntime {
 				outbox: shouldEmit ? [...disk.outbox, entry] : disk.outbox,
 				adopted,
 				adoptedOutbox: shouldEmit ? [...disk.outbox, entry] : undefined,
-				result: { alarm: detail, events: [event] },
+				result: { alarm: fired, events: [event] },
 			};
 		});
 	}
@@ -1189,16 +1214,36 @@ export class WakeAlarmRuntime {
 				return { alarms: disk.alarms, outbox: disk.outbox, adopted: new Map(), result: { alarm: (diskAlarm as ConditionAlarmState | undefined) ?? current, events: [] } };
 			}
 			const now = Date.now();
+			// A pending occurrence: the condition WAS satisfied but the outbox had no
+			// capacity. Only retry the slot — never let a later probe (file removed,
+			// renamed) overwrite the already-happened fact.
+			if (diskAlarm.lastSatisfied === true && diskAlarm.satisfiedAt === undefined) {
+				if (shouldEmit && !this.outboxCapacityFree(disk, id, 1)) {
+					const next = this.bump(diskAlarm, { nextCheckAt: now + 5_000 });
+					const alarms = disk.alarms.map((candidate) => (candidate.id === id ? next : candidate));
+					return { alarms, outbox: disk.outbox, adopted: new Map([[id, next]]), result: { alarm: next, events: [] } };
+				}
+				const fired = this.bump(diskAlarm, { active: false, pauseReason: `condition met: ${diskAlarm.condition}`, satisfiedAt: now });
+				const event: FiredEvent = { kind: "condition", fingerprint: `condition:${id}:${now}`, evidence: diskAlarm.lastEvidence };
+				const entry = createOutboxEntry(fired, [event], now, this.outboxOptions());
+				const alarms = disk.alarms.map((candidate) => (candidate.id === id ? fired : candidate));
+				return { alarms, outbox: shouldEmit ? [...disk.outbox, entry] : disk.outbox, adopted: new Map([[id, fired]]), adoptedOutbox: shouldEmit ? [...disk.outbox, entry] : undefined, result: { alarm: fired, events: [event] } };
+			}
 			const satisfied = diskAlarm.condition === "exists" ? result.exists
 				: diskAlarm.condition === "contains" ? result.exists && result.tail.includes(diskAlarm.value ?? "")
 				: result.exists && result.size >= (diskAlarm.minSize ?? 0);
 			const tailEvidence = result.exists ? tailLines(result.tail, 10) : undefined;
-			if (!satisfied || !this.outboxCapacityFree(disk, id, 1)) {
-				// Not satisfied, or the outbox is full: advance the poll cadence. A full
-				// outbox never consumes the condition — it simply re-checks next round.
-				const next = this.bump(diskAlarm, { lastSatisfied: satisfied, lastSize: result.size, lastEvidence: tailEvidence, nextCheckAt: now + diskAlarm.statusPollMs });
+			if (!satisfied) {
+				const next = this.bump(diskAlarm, { lastSatisfied: false, lastSize: result.size, lastEvidence: tailEvidence, nextCheckAt: now + diskAlarm.statusPollMs });
 				const alarms = disk.alarms.map((candidate) => (candidate.id === id ? next : candidate));
 				return { alarms, outbox: disk.outbox, adopted: new Map([[id, next]]), result: { alarm: next, events: [] } };
+			}
+			if (shouldEmit && !this.outboxCapacityFree(disk, id, 1)) {
+				// Freeze the occurrence: keep lastSatisfied=true (satisfiedAt unset) and
+				// only retry the outbox slot.
+				const frozen = this.bump(diskAlarm, { lastSatisfied: true, lastSize: result.size, lastEvidence: tailEvidence, nextCheckAt: now + 5_000 });
+				const alarms = disk.alarms.map((candidate) => (candidate.id === id ? frozen : candidate));
+				return { alarms, outbox: disk.outbox, adopted: new Map([[id, frozen]]), result: { alarm: frozen, events: [] } };
 			}
 			const fired = this.bump(diskAlarm, { lastSatisfied: true, lastSize: result.size, lastEvidence: tailEvidence, active: false, pauseReason: `condition met: ${diskAlarm.condition}`, satisfiedAt: now, nextCheckAt: now + diskAlarm.statusPollMs });
 			const event: FiredEvent = { kind: "condition", fingerprint: `condition:${id}:${now}`, evidence: tailEvidence };
@@ -1500,7 +1545,7 @@ export class WakeAlarmRuntime {
 		if (!params.id || !params.name || !params.container || !params.events) throw new Error("id, name, container, and events are required for watch_container");
 		const id = validateAlarmId(params.id);
 		if (this.alarms.has(id)) throw new Error(`alarm already exists: ${id}`);
-		let alarm = createContainerAlarm({ id, name: params.name, container: params.container, events: params.events, policy: params.policy, logPath: params.logPath ? validateRemoteLogPath(params.logPath, config.remote.allowedRemoteLogRoots) : undefined, logPattern: params.logPattern, allowedRemoteLogRoots: config.remote.allowedRemoteLogRoots, now: Date.now(), statusPollMs: params.statusPoll ? parseDuration(params.statusPoll, "statusPoll") : config.statusPollMs, deadlineMs: params.deadline ? parseDuration(params.deadline, "deadline") : undefined, ownerSessionFile: context?.ownerSessionFile });
+		let alarm = createContainerAlarm({ id, name: params.name, container: params.container, events: params.events, policy: params.policy, logPath: params.logPath ? validateRemoteLogPath(params.logPath, config.remote.allowedRemoteLogRoots) : undefined, logPattern: params.logPattern, allowedRemoteLogRoots: config.remote.allowedRemoteLogRoots, now: Date.now(), statusPollMs: params.statusPoll ? parseDuration(params.statusPoll, "statusPoll") : config.statusPollMs, deadlineMs: params.deadline ? parseDuration(params.deadline, "deadline") : undefined, ownerSessionFile: context?.ownerSessionFile, logTailLines: params.logTailLines });
 		const baseline = await this.probe(alarm, true, true);
 		if (!baseline.exists) throw new Error(`container does not exist: ${alarm.container}`);
 		alarm = applyBaseline(alarm, baseline, Date.now());
@@ -1569,27 +1614,44 @@ export class WakeAlarmRuntime {
 		}
 		if (current.kind === "group") {
 			if (params.after !== undefined || params.at !== undefined) throw new Error("group reset does not accept after or at");
-			// Rebaseline EVERY member (fresh probes, cleared fingerprints/status) and
-			// re-arm the group in ONE transaction, so a reset can never re-fire the
-			// previous run's terminal state.
+			// Phase A: snapshot the group AND its members (revision/kind/groupId) BEFORE
+			// the (slow) rebaseline probes, so a concurrent remove/recreate cannot be
+			// overwritten by this reset (ABA).
+			const snapshot = await this.readDiskState();
+			const snapGroup = snapshot.alarms.find((candidate) => candidate.id === id);
+			if (!snapGroup || snapGroup.kind !== "group") throw new Error(`unknown group alarm: ${id}`);
+			const snapMembers = new Map<string, ContainerAlarmState>();
+			for (const memberId of snapGroup.memberIds) {
+				const member = snapshot.alarms.find((candidate) => candidate.id === memberId);
+				if (!member || member.kind !== "container" || member.groupId !== id) throw new Error(`group member ${memberId} is invalid; remove and recreate the group`);
+				snapMembers.set(memberId, member);
+			}
+			// Rebaseline EVERY member (fresh probes, cleared fingerprints/status).
 			const freshMembers: ContainerAlarmState[] = [];
-			for (const memberId of current.memberIds) {
-				const member = this.alarms.get(memberId);
-				if (!member || member.kind !== "container") throw new Error(`group member ${memberId} is missing; remove and recreate the group`);
+			for (const memberId of snapGroup.memberIds) {
+				const member = snapMembers.get(memberId)!;
 				let fresh = createContainerAlarm({ id: member.id, name: member.name, container: member.container, events: member.events, policy: member.policy, allowedRemoteLogRoots: config.remote?.allowedRemoteLogRoots ?? [], now: Date.now(), statusPollMs: member.statusPollMs, ownerSessionFile: member.ownerSessionFile, groupId: member.groupId, logTailLines: member.logTailLines });
 				const baseline = await this.probe(fresh, true, true);
 				if (!baseline.exists) throw new Error(`container does not exist: ${member.container}`);
 				freshMembers.push(applyBaseline(fresh, baseline, Date.now()));
 			}
-			const reset: GroupAlarmState = { ...current, active: true, pauseReason: undefined, firedAt: undefined, conditionMetAt: undefined, lastTriggeredAt: undefined, nextCheckAt: Date.now() };
+			// Phase B: re-validate under the lock; any change discards the reset.
+			const reset: GroupAlarmState = { ...current, active: true, pauseReason: undefined, firedAt: undefined, conditionMetAt: undefined, pendingFire: false, lastTriggeredAt: undefined, nextCheckAt: Date.now() };
 			await this.commitAlarmSet(async (disk) => {
+				const diskGroup = disk.alarms.find((candidate) => candidate.id === id);
+				if (!diskGroup || diskGroup.kind !== "group" || (diskGroup.revision ?? 0) !== (snapGroup.revision ?? 0) || diskGroup.createdAt !== snapGroup.createdAt) throw new Error("group changed concurrently; retry reset");
+				for (const memberId of snapGroup.memberIds) {
+					const diskMember = disk.alarms.find((candidate) => candidate.id === memberId);
+					const snap = snapMembers.get(memberId)!;
+					if (!diskMember || diskMember.kind !== "container" || diskMember.groupId !== id || (diskMember.revision ?? 0) !== (snap.revision ?? 0) || diskMember.createdAt !== snap.createdAt) throw new Error(`group member ${memberId} changed concurrently; retry reset`);
+				}
 				const alarms = disk.alarms.map((candidate) => {
 					const fresh = freshMembers.find((member) => member.id === candidate.id);
 					if (fresh) return this.bump(candidate, fresh);
 					if (candidate.id === id) return this.bump(candidate, reset);
 					return candidate;
 				});
-				const adopted = new Map(alarms.filter((candidate) => candidate.id === id || current.memberIds.includes(candidate.id)).map((candidate) => [candidate.id, candidate]));
+				const adopted = new Map(alarms.filter((candidate) => candidate.id === id || snapGroup.memberIds.includes(candidate.id)).map((candidate) => [candidate.id, candidate]));
 				return { alarms, outbox: disk.outbox, adopted, result: undefined };
 			});
 			this.schedule();
@@ -1690,27 +1752,21 @@ export class WakeAlarmRuntime {
 					if (!params.id) throw new Error("id is required for remove");
 					const id = validateAlarmId(params.id);
 					const alarm = this.alarms.get(id);
-					let purged = 0;
+					const memberIds = alarm?.kind === "group" ? alarm.memberIds : [];
+					const removeIds = new Set([id, ...memberIds]);
+					// Alarms AND (optionally) their wakes are removed in ONE transaction:
+					// a failure cannot leave alarms alive with wakes purged, or orphan members.
 					let pending = 0;
-					if (alarm?.kind === "group") {
-						// A group and its members are removed in ONE transaction — no orphan
-						// members can survive a partial failure. Wakes stay unless explicitly purged.
-						if (params.purgePendingEvents === true) {
-							purged += await this.purgeOutboxEntries(id);
-							for (const memberId of alarm.memberIds) purged += await this.purgeOutboxEntries(memberId);
-						}
-						await this.commitAlarmSet(async (disk) => {
-							const ids = new Set([id, ...alarm.memberIds]);
-							pending = disk.alarms.filter((candidate) => ids.has(candidate.id)).length;
-							const alarms = disk.alarms.filter((candidate) => !ids.has(candidate.id));
-							return { alarms, outbox: disk.outbox, adopted: new Map(), result: undefined };
-						});
-						for (const memberId of alarm.memberIds) { this.alarms.delete(memberId); this.baseRevisions.delete(memberId); this.wakeRetry.delete(memberId); }
-						this.alarms.delete(id); this.baseRevisions.delete(id); this.wakeRetry.delete(id);
-					} else {
-						pending = await this.removeAlarm(id);
-						if (params.purgePendingEvents === true) purged += await this.purgeOutboxEntries(id);
-					}
+					let purged = 0;
+					await this.commitAlarmSet(async (disk) => {
+						pending = disk.outbox.filter((entry) => removeIds.has(entry.alarmId)).length;
+						const alarms = disk.alarms.filter((candidate) => !removeIds.has(candidate.id));
+						const outbox = params.purgePendingEvents === true ? disk.outbox.filter((entry) => !removeIds.has(entry.alarmId)) : disk.outbox;
+						purged = params.purgePendingEvents === true ? disk.outbox.length - outbox.length : 0;
+						return { alarms, outbox, adopted: new Map(), adoptedOutbox: outbox, result: undefined };
+					});
+					for (const removedId of removeIds) { this.alarms.delete(removedId); this.baseRevisions.delete(removedId); this.wakeRetry.delete(removedId); }
+					for (const eventId of [...this.wakeRetry.keys()]) if (!this.outbox.has(eventId)) this.wakeRetry.delete(eventId);
 					this.schedule();
 					const wakeNote = pending ? `${pending} undelivered wake(s) left in the outbox` : "";
 					const purgeNote = purged ? `${wakeNote ? "; " : ""}purged ${purged} wake(s)` : "";

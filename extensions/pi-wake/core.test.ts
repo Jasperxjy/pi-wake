@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -586,3 +586,59 @@ test("real Python condition probe handles a file without a container field", { s
 	assert.equal(missing.exists, false);
 	assert.equal(missing.size, 0);
 });
+
+test("real Python probe returns the strict docker log tail via a fake docker executable", { skip: process.platform === "win32" }, () => {
+	const source = readFileSync(new URL("./runtime.ts", import.meta.url), "utf8");
+	const scriptMatch = source.match(/const PROBE_SCRIPT = String\.raw`([\s\S]*?)`;\r?\n\r?\nconst PROBE_LOADER/);
+	assert.ok(scriptMatch, "embedded PROBE_SCRIPT must remain extractable");
+	const scriptBase64 = Buffer.from(scriptMatch[1], "utf8").toString("base64");
+	const dir = mkdtempSync(path.join(tmpdir(), "dock-"));
+	const fakeBin = path.join(dir, "bin");
+	mkdirSync(fakeBin);
+	const cid = "a".repeat(64);
+	const inspectJson = JSON.stringify([{ Id: cid, LogPath: "", State: { Running: false, Status: "exited", ExitCode: 0, OOMKilled: false, StartedAt: "2026-01-01T00:00:00Z" } }]);
+	const lines = "line1\nline2\nline3\nline4\nline5\n";
+	const fakeDocker = `#!/bin/sh\nif [ "$1" = "inspect" ]; then printf '%s\n' '${inspectJson}'; elif [ "$1" = "logs" ]; then n=5; prev=""; for a in "$@"; do if [ "$prev" = "--tail" ]; then n="$a"; fi; prev="$a"; done; printf '${lines}' | tail -n "$n"; fi\n`;
+	writeFileSync(path.join(fakeBin, "docker"), fakeDocker);
+	spawnSync("chmod", ["+x", path.join(fakeBin, "docker")]);
+	const payload = Buffer.from(JSON.stringify({ container: "job", readLogs: true, tailLinesReq: 3, maxBytes: 4096, tailBytes: 8192, offset: 0 })).toString("base64");
+	const wrapper = ["import base64,sys", `sys.argv=['probe',${JSON.stringify(payload)}]`, `exec(base64.b64decode(${JSON.stringify(scriptBase64)}))`].join("\n");
+	const result = spawnSync("python3", ["-c", wrapper], { encoding: "utf8", env: { ...process.env, PATH: fakeBin + path.delimiter + (process.env.PATH ?? "") } });
+	assert.equal(result.status, 0, result.stdout + result.stderr);
+	const parsed = JSON.parse(result.stdout.trim()) as { tailBase64?: string };
+	const tail = Buffer.from(String(parsed.tailBase64), "base64").toString("utf8");
+	assert.ok(tail.includes("line5") && tail.includes("line3"), "strict tail contains the requested last lines");
+	assert.ok(!tail.includes("line1") && !tail.includes("line2"), "tail is bounded to the requested N lines");
+});
+
+test("real Python condition probe handles a file without a container field", { skip: process.platform === "win32" }, () => {
+	// Runs the ACTUAL embedded probe script against a real file (POSIX paths only,
+	// so it is skipped on native Windows; CI ubuntu and WSL cover it). The payload
+	// deliberately has NO "container" field — the regression this guards against
+	// made watch_condition fail on every real SSH probe.
+	const source = readFileSync(new URL("./runtime.ts", import.meta.url), "utf8");
+	const scriptMatch = source.match(/const PROBE_SCRIPT = String\.raw`([\s\S]*?)`;\r?\n\r?\nconst PROBE_LOADER/);
+	assert.ok(scriptMatch, "embedded PROBE_SCRIPT must remain extractable");
+	const scriptBase64 = Buffer.from(scriptMatch[1], "utf8").toString("base64");
+	const dir = mkdtempSync(path.join(tmpdir(), "cond-"));
+	const file = path.join(dir, "analysis.json");
+	writeFileSync(file, '{"pass": true}\nline2\n');
+	const payload = (overrides: Record<string, unknown> = {}): string => Buffer.from(JSON.stringify({ conditionPath: file, allowedRemoteLogRoots: [dir + "/"], tailBytes: 4096, ...overrides })).toString("base64");
+	const run = (payloadB64: string): { stdout: string; status: number | null } => {
+		const wrapper = ["import base64,sys", `sys.argv=['probe',${JSON.stringify(payloadB64)}]`, `exec(base64.b64decode(${JSON.stringify(scriptBase64)}))`].join("\n");
+		const result = spawnSync("python3", ["-c", wrapper], { encoding: "utf8" });
+		return { stdout: result.stdout.trim(), status: result.status };
+	};
+	const r1 = run(payload());
+	assert.equal(r1.status, 0, r1.stdout);
+	const parsed = JSON.parse(r1.stdout) as { exists?: boolean; size?: number; tailBase64?: string };
+	assert.equal(parsed.exists, true);
+	assert.equal(parsed.size, Buffer.byteLength('{"pass": true}\nline2\n'));
+	const tail = Buffer.from(String(parsed.tailBase64), "base64").toString("utf8");
+	assert.ok(tail.includes('"pass": true'), "contains condition sees the marker");
+	const r2 = run(payload({ conditionPath: path.join(dir, "missing.json") }));
+	const missing = JSON.parse(r2.stdout) as { exists?: boolean; size?: number };
+	assert.equal(missing.exists, false);
+	assert.equal(missing.size, 0);
+});
+
