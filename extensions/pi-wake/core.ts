@@ -8,13 +8,15 @@ export const ERROR_PATTERN = /(?:Traceback|(?:[A-Z][A-Za-z]*)?Error)(?::|\b)/;
 
 export type TriggerPolicy = "pause" | "keep";
 export type ContainerEventKind = "exit" | "abnormal" | "missing" | "replaced" | "log-error" | "log-match" | "deadline" | "connection-failure";
-export type FiredEventKind = "timer" | ContainerEventKind;
+export type FiredEventKind = "timer" | ContainerEventKind | "group" | "condition";
 export type LogMode = "application-file" | "docker-file" | "docker-logs";
+export type GroupCondition = "any_terminal" | "all_terminal" | "any_abnormal" | "n_of_m_terminal";
+export type ConditionKind = "exists" | "contains" | "min_size";
 
 interface AlarmBase {
 	id: string;
 	name: string;
-	kind: "timer" | "container";
+	kind: "timer" | "container" | "group" | "condition";
 	active: boolean;
 	createdAt: number;
 	pauseReason?: string;
@@ -56,9 +58,61 @@ export interface ContainerAlarmState extends AlarmBase {
 	lastExitCode?: number;
 	lastOomKilled?: boolean;
 	lastEvidence?: string;
+	/** When set, this alarm is a member of the group alarm with this id: fires are
+	 * recorded in state but produce NO individual wake — the group emits the summary. */
+	groupId?: string;
+	/** When set, exit/abnormal wake evidence includes the last N lines of the container log. */
+	logTailLines?: number;
 }
 
-export type AlarmState = TimerAlarmState | ContainerAlarmState;
+/**
+ * Batch barrier: watches a set of member container alarms and emits ONE summary
+ * wake when the configured condition first becomes true. Members are created by
+ * `watch_container_group` and produce no individual wakes while they belong to
+ * a group.
+ */
+export interface GroupAlarmState extends AlarmBase {
+	kind: "group";
+	memberIds: string[];
+	condition: GroupCondition;
+	/** Members required to be terminal for n_of_m_terminal; default: all. */
+	required: number;
+	statusPollMs: number;
+	nextCheckAt: number;
+	/** When the condition was first met; used with coalesceWindowMs. */
+	conditionMetAt?: number;
+	/** Wait up to this long after the condition is first met before firing, so the
+	 * summary can include stragglers; all-terminal always fires immediately. */
+	coalesceWindowMs?: number;
+	/** Set when the group fired; the group never re-fires until reset. */
+	firedAt?: number;
+	/** Last evaluation summary, shown by list/check. */
+	summary?: string;
+}
+
+/**
+ * Remote completion-condition watch: polls a file on the probe host (under
+ * allowedRemoteLogRoots) and fires once when the condition holds. This is the
+ * "result file exists / contains marker / size threshold" primitive for
+ * experiments whose true completion is a file, not a container state.
+ */
+export interface ConditionAlarmState extends AlarmBase {
+	kind: "condition";
+	path: string;
+	condition: ConditionKind;
+	/** Literal substring required by "contains". */
+	value?: string;
+	/** Byte threshold required by "min_size". */
+	minSize?: number;
+	statusPollMs: number;
+	nextCheckAt: number;
+	satisfiedAt?: number;
+	lastSatisfied?: boolean;
+	lastSize?: number;
+	lastEvidence?: string;
+}
+
+export type AlarmState = TimerAlarmState | ContainerAlarmState | GroupAlarmState | ConditionAlarmState;
 
 export interface ProbeResult {
 	exists: boolean;
@@ -111,7 +165,7 @@ export interface OutboxEntry {
 }
 
 const CONTAINER_EVENTS: readonly ContainerEventKind[] = ["exit", "abnormal", "missing", "replaced", "log-error", "log-match", "deadline", "connection-failure"];
-const FIRED_EVENTS: readonly FiredEventKind[] = ["timer", ...CONTAINER_EVENTS];
+const FIRED_EVENTS: readonly FiredEventKind[] = ["timer", ...CONTAINER_EVENTS, "group", "condition"];
 const DURATION_RE = /^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/i;
 const DURATION_MULTIPLIERS: Record<string, number> = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
 const CONTAINER_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
@@ -315,6 +369,8 @@ export function createContainerAlarm(input: {
 	statusPollMs?: number;
 	deadlineMs?: number;
 	ownerSessionFile?: string;
+	groupId?: string;
+	logTailLines?: number;
 }): ContainerAlarmState {
 	if (!Number.isSafeInteger(input.now) || input.now < 0) throw new Error("alarm creation time must be a non-negative safe integer");
 	const events = validateContainerEvents(input.events);
@@ -322,6 +378,7 @@ export function createContainerAlarm(input: {
 	if (events.includes("deadline") !== (input.deadlineMs !== undefined)) throw new Error("deadline requires a relative deadline, and a relative deadline requires the deadline event");
 	const policy = input.policy ?? "pause";
 	if (policy !== "pause" && policy !== "keep") throw new Error("policy must be pause or keep");
+	if (input.logTailLines !== undefined && (!Number.isSafeInteger(input.logTailLines) || input.logTailLines < 1 || input.logTailLines > 200)) throw new Error("logTailLines must be an integer from 1 to 200");
 	return {
 		id: validateAlarmId(input.id),
 		name: validateAlarmName(input.name),
@@ -342,6 +399,84 @@ export function createContainerAlarm(input: {
 		eventFingerprints: {},
 		consecutiveFailures: 0,
 		failureNotified: false,
+		groupId: input.groupId === undefined ? undefined : validateAlarmId(input.groupId),
+		logTailLines: input.logTailLines,
+	};
+}
+
+/** The last N lines of a text, bounded for wake evidence. */
+export function tailLines(text: string, lines: number): string {
+	if (!text) return "";
+	const parts = text.split(/\r?\n/);
+	return parts.slice(-lines).join("\n").trim();
+}
+
+export function createGroupAlarm(input: {
+	id: string;
+	name: string;
+	memberIds: readonly string[];
+	condition: GroupCondition;
+	required?: number;
+	now: number;
+	statusPollMs?: number;
+	coalesceWindowMs?: number;
+	ownerSessionFile?: string;
+}): GroupAlarmState {
+	if (!Number.isSafeInteger(input.now) || input.now < 0) throw new Error("alarm creation time must be a non-negative safe integer");
+	if (!Array.isArray(input.memberIds) || input.memberIds.length < 1 || input.memberIds.length > 64) throw new Error("a group needs 1-64 member alarms");
+	const memberIds = input.memberIds.map((id) => validateAlarmId(id));
+	if (new Set(memberIds).size !== memberIds.length) throw new Error("group members must be unique");
+	const condition = input.condition;
+	if (!["any_terminal", "all_terminal", "any_abnormal", "n_of_m_terminal"].includes(condition)) throw new Error("condition must be any_terminal, all_terminal, any_abnormal, or n_of_m_terminal");
+	const required = input.required === undefined ? memberIds.length : input.required;
+	if (!Number.isSafeInteger(required) || required < 1 || required > memberIds.length) throw new Error(`required must be an integer from 1 to ${memberIds.length}`);
+	if (input.coalesceWindowMs !== undefined && (!Number.isSafeInteger(input.coalesceWindowMs) || input.coalesceWindowMs < 0 || input.coalesceWindowMs > MAX_TIMER_DELAY_MS)) throw new Error("coalesceWindow is outside the supported range");
+	return {
+		id: validateAlarmId(input.id),
+		name: validateAlarmName(input.name),
+		kind: "group",
+		active: true,
+		createdAt: input.now,
+		ownerSessionFile: input.ownerSessionFile === undefined ? undefined : validateOwnerSessionFile(input.ownerSessionFile),
+		memberIds,
+		condition,
+		required,
+		statusPollMs: validatePollingDuration(input.statusPollMs ?? DEFAULT_STATUS_POLL_MS),
+		nextCheckAt: input.now,
+		coalesceWindowMs: input.coalesceWindowMs,
+	};
+}
+
+export function createConditionAlarm(input: {
+	id: string;
+	name: string;
+	path: string;
+	condition: ConditionKind;
+	value?: string;
+	minSize?: number;
+	allowedRemoteLogRoots?: readonly string[];
+	now: number;
+	statusPollMs?: number;
+	ownerSessionFile?: string;
+}): ConditionAlarmState {
+	if (!Number.isSafeInteger(input.now) || input.now < 0) throw new Error("alarm creation time must be a non-negative safe integer");
+	const condition = input.condition;
+	if (!["exists", "contains", "min_size"].includes(condition)) throw new Error("condition must be exists, contains, or min_size");
+	if (condition === "contains" && (!input.value || input.value.length > 256 || input.value.includes("\0"))) throw new Error("contains requires a literal value no longer than 256 characters");
+	if (condition === "min_size" && (!Number.isSafeInteger(input.minSize) || (input.minSize as number) < 1)) throw new Error("min_size requires a positive integer minSize");
+	return {
+		id: validateAlarmId(input.id),
+		name: validateAlarmName(input.name),
+		kind: "condition",
+		active: true,
+		createdAt: input.now,
+		ownerSessionFile: input.ownerSessionFile === undefined ? undefined : validateOwnerSessionFile(input.ownerSessionFile),
+		path: validateRemoteLogPath(input.path, input.allowedRemoteLogRoots ?? []),
+		condition,
+		value: condition === "contains" ? input.value : undefined,
+		minSize: condition === "min_size" ? input.minSize : undefined,
+		statusPollMs: validatePollingDuration(input.statusPollMs ?? DEFAULT_STATUS_POLL_MS),
+		nextCheckAt: input.now,
 	};
 }
 
@@ -438,8 +573,12 @@ export function applyProbe(alarm: ContainerAlarmState, probe: ProbeResult, now: 
 	if (!abnormal) delete eventFingerprints.abnormal;
 	if (missing) addEvent(alarm, next, fired, "missing", `missing:${alarm.container}`);
 	if (replaced) addEvent(alarm, next, fired, "replaced", `replaced:${alarm.containerId ?? "unbound"}:${probe.containerId ?? "unknown"}`);
-	if (cleanExit) addEvent(alarm, next, fired, "exit", `exit:${probe.containerId ?? alarm.containerId ?? alarm.container}:${probe.startedAt ?? "unknown"}:${probe.exitCode}`);
-	if (abnormal) addEvent(alarm, next, fired, "abnormal", `abnormal:${probe.containerId ?? alarm.containerId ?? alarm.container}:${probe.startedAt ?? "unknown"}:${probe.containerStatus}:${probe.exitCode ?? "unknown"}:${Boolean(probe.oomKilled)}`);
+	const exitFingerprint = `exit:${probe.containerId ?? alarm.containerId ?? alarm.container}:${probe.startedAt ?? "unknown"}:${probe.exitCode}`;
+	const abnormalFingerprint = `abnormal:${probe.containerId ?? alarm.containerId ?? alarm.container}:${probe.startedAt ?? "unknown"}:${probe.containerStatus}:${probe.exitCode ?? "unknown"}:${Boolean(probe.oomKilled)}`;
+	// Optional bounded log tail attached to exit/abnormal wake evidence.
+	const tailEvidence = alarm.logTailLines ? tailLines(probe.tail, alarm.logTailLines) : undefined;
+	if (cleanExit) addEvent(alarm, next, fired, "exit", exitFingerprint, tailEvidence);
+	if (abnormal) addEvent(alarm, next, fired, "abnormal", abnormalFingerprint, tailEvidence);
 	if (alarm.deadlineAt !== undefined && now >= alarm.deadlineAt) addEvent(alarm, next, fired, "deadline", `deadline:${alarm.id}:${alarm.deadlineAt}`);
 
 	if (fired.length) {
@@ -478,9 +617,12 @@ export function applyCheckFailure(alarm: ContainerAlarmState, now: number, maxCo
 
 export function resumeAlarm(alarm: AlarmState, now: number): AlarmState {
 	if (alarm.kind === "timer" && alarm.triggeredAt !== undefined) throw new Error("a fired timer must be reset with a new after or at value");
-	return alarm.kind === "timer"
-		? { ...alarm, active: true, pauseReason: undefined }
-		: { ...alarm, active: true, pauseReason: undefined, consecutiveFailures: 0, failureNotified: false, nextCheckAt: now };
+	if (alarm.kind === "group" && alarm.firedAt !== undefined) throw new Error("a completed group must be reset, not resumed");
+	if (alarm.kind === "condition" && alarm.satisfiedAt !== undefined) throw new Error("a satisfied condition alarm must be reset, not resumed");
+	if (alarm.kind === "timer") return { ...alarm, active: true, pauseReason: undefined };
+	if (alarm.kind === "group") return { ...alarm, active: true, pauseReason: undefined, nextCheckAt: now };
+	if (alarm.kind === "condition") return { ...alarm, active: true, pauseReason: undefined, nextCheckAt: now };
+	return { ...alarm, active: true, pauseReason: undefined, consecutiveFailures: 0, failureNotified: false, nextCheckAt: now };
 }
 
 function requiredString(record: Record<string, unknown>, name: string, maxLength: number): string {
@@ -596,7 +738,56 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 		if (triggeredAt !== undefined && base.active) throw new Error("a triggered timer must not be active");
 		return { ...base, kind: "timer", dueAt: requiredInteger(record, "dueAt"), triggeredAt };
 	}
-	assertKnown(record, [...baseFields, "container", "containerId", "logPath", "logMode", "selectedLogPath", "logFileId", "events", "policy", "logPattern", "deadlineAt", "statusPollMs", "nextCheckAt", "logOffset", "logCursor", "scanCarry", "eventFingerprints", "consecutiveFailures", "failureNotified", "lastCheckAt", "lastContainerStatus", "lastStartedAt", "lastExitCode", "lastOomKilled", "lastEvidence"]);
+	if (base.kind === "group") {
+		assertKnown(record, [...baseFields, "memberIds", "condition", "required", "statusPollMs", "nextCheckAt", "conditionMetAt", "coalesceWindowMs", "firedAt", "summary"]);
+		if (!Array.isArray(record.memberIds) || record.memberIds.length < 1 || record.memberIds.length > 64) throw new Error("memberIds must be a non-empty bounded array");
+		const memberIds = record.memberIds.map((value) => validateAlarmId(String(value)));
+		if (new Set(memberIds).size !== memberIds.length) throw new Error("memberIds must be unique");
+		const condition = requiredString(record, "condition", 32);
+		if (!["any_terminal", "all_terminal", "any_abnormal", "n_of_m_terminal"].includes(condition)) throw new Error("condition is invalid");
+		const required = requiredInteger(record, "required", 1, memberIds.length);
+		const coalesceWindowMs = optionalInteger(record, "coalesceWindowMs", 0, MAX_TIMER_DELAY_MS);
+		const firedAt = optionalInteger(record, "firedAt");
+		if (firedAt !== undefined && base.active) throw new Error("a fired group must not be active");
+		return {
+			...base,
+			kind: "group",
+			memberIds,
+			condition: condition as GroupCondition,
+			required,
+			statusPollMs: validatePollingDuration(requiredInteger(record, "statusPollMs", 1), "statusPollMs"),
+			nextCheckAt: requiredInteger(record, "nextCheckAt"),
+			conditionMetAt: optionalInteger(record, "conditionMetAt"),
+			coalesceWindowMs,
+			firedAt,
+			summary: optionalString(record, "summary", 2000),
+		};
+	}
+	if (base.kind === "condition") {
+		assertKnown(record, [...baseFields, "path", "condition", "value", "minSize", "statusPollMs", "nextCheckAt", "satisfiedAt", "lastSatisfied", "lastSize", "lastEvidence"]);
+		const condition = requiredString(record, "condition", 16);
+		if (!["exists", "contains", "min_size"].includes(condition)) throw new Error("condition is invalid");
+		const value = condition === "contains" ? validateLogPattern(requiredString(record, "value", 256)) : undefined;
+		const minSize = condition === "min_size" ? requiredInteger(record, "minSize", 1) : undefined;
+		const satisfiedAt = optionalInteger(record, "satisfiedAt");
+		if (satisfiedAt !== undefined && base.active) throw new Error("a satisfied condition alarm must not be active");
+		if ("lastSatisfied" in record && typeof record.lastSatisfied !== "boolean") throw new Error("lastSatisfied must be boolean");
+		return {
+			...base,
+			kind: "condition",
+			path: validateRemoteLogPath(requiredString(record, "path", 4096), allowedRemoteLogRoots),
+			condition: condition as ConditionKind,
+			value,
+			minSize,
+			statusPollMs: validatePollingDuration(requiredInteger(record, "statusPollMs", 1), "statusPollMs"),
+			nextCheckAt: requiredInteger(record, "nextCheckAt"),
+			satisfiedAt,
+			lastSatisfied: record.lastSatisfied as boolean | undefined,
+			lastSize: optionalInteger(record, "lastSize"),
+			lastEvidence: optionalString(record, "lastEvidence", 2000),
+		};
+	}
+	assertKnown(record, [...baseFields, "container", "containerId", "logPath", "logMode", "selectedLogPath", "logFileId", "events", "policy", "logPattern", "deadlineAt", "statusPollMs", "nextCheckAt", "logOffset", "logCursor", "scanCarry", "eventFingerprints", "consecutiveFailures", "failureNotified", "lastCheckAt", "lastContainerStatus", "lastStartedAt", "lastExitCode", "lastOomKilled", "lastEvidence", "groupId", "logTailLines"]);
 	if (!Array.isArray(record.events)) throw new Error("events must be an array");
 	const events = validateContainerEvents(record.events as string[]);
 	const policy = requiredString(record, "policy", 16);
@@ -649,12 +840,16 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 		lastExitCode: optionalInteger(record, "lastExitCode", 0, 2_147_483_647),
 		lastOomKilled: record.lastOomKilled as boolean | undefined,
 		lastEvidence: optionalString(record, "lastEvidence", 2000),
+		groupId: (() => { const groupId = optionalString(record, "groupId", 64); return groupId ? validateAlarmId(groupId) : undefined; })(),
+		logTailLines: optionalInteger(record, "logTailLines", 1, 200),
 	};
 }
 
 export function nextAlarmDueAt(alarm: AlarmState): number | undefined {
 	if (!alarm.active) return undefined;
 	if (alarm.kind === "timer") return alarm.triggeredAt === undefined ? alarm.dueAt : undefined;
+	if (alarm.kind === "group") return alarm.firedAt === undefined ? alarm.nextCheckAt : undefined;
+	if (alarm.kind === "condition") return alarm.satisfiedAt === undefined ? alarm.nextCheckAt : undefined;
 	const deadlinePending = alarm.deadlineAt !== undefined && alarm.eventFingerprints.deadline !== `deadline:${alarm.id}:${alarm.deadlineAt}`;
 	return deadlinePending ? Math.min(alarm.nextCheckAt, alarm.deadlineAt!) : alarm.nextCheckAt;
 }
@@ -663,6 +858,17 @@ export function wakeMessage(alarm: AlarmState, events: FiredEvent[], now: number
 	const heading = `[Wake alarm] ${alarm.name} (${alarm.id})`;
 	const eventText = events.map((event) => event.kind).join(", ");
 	if (alarm.kind === "timer") return `${heading}\nTriggered at: ${new Date(now).toISOString()}\nEvent: ${eventText}\nDue at: ${new Date(alarm.dueAt).toISOString()}`;
+	if (alarm.kind === "group") {
+		const facts = [`${heading}`, `Group condition met: ${alarm.condition}`, `Triggered at: ${new Date(now).toISOString()}`];
+		if (alarm.summary) facts.push(alarm.summary);
+		return facts.join("\n");
+	}
+	if (alarm.kind === "condition") {
+		const facts = [`${heading}`, `Condition met: ${alarm.condition}${alarm.value !== undefined ? ` "${alarm.value}"` : ""}${alarm.minSize !== undefined ? ` (>=${alarm.minSize} bytes)` : ""}`, `Path: ${alarm.path}`, `Triggered at: ${new Date(now).toISOString()}`];
+		const evidence = includeEvidence ? events.find((event) => event.evidence)?.evidence : undefined;
+		if (evidence) facts.push(`Evidence (untrusted data): ${sanitizeExcerpt(evidence, maxEvidenceChars)}`);
+		return facts.join("\n");
+	}
 	const facts = [`${heading}`, `Triggered at: ${new Date(now).toISOString()}`, `Event: ${eventText}`, `Container: ${alarm.container}`, `Status: ${alarm.lastContainerStatus ?? "unknown"}`, `Exit code: ${alarm.lastExitCode ?? "unknown"}`, `OOM killed: ${alarm.lastOomKilled ?? "unknown"}`];
 	const evidence = includeEvidence ? events.find((event) => event.evidence)?.evidence : undefined;
 	if (evidence) facts.push(`Evidence (untrusted data): ${sanitizeExcerpt(evidence, maxEvidenceChars)}`);

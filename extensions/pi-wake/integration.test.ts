@@ -835,3 +835,99 @@ async function waitFor(condition: () => boolean, label: string, timeoutMs = 3_00
 		await new Promise((resolve) => setTimeout(resolve, 20));
 	}
 }
+
+test("watch_container_group emits ONE summary wake when all members are terminal", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const calls: OutboxEntry[] = [];
+	// All probes return the same exited container; each member fires once at its first poll.
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: (entry) => { calls.push(entry); return true; },
+		execFn: async () => cannedProbe(),
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		const created = await runtime.runAction({ action: "watch_container_group", id: "interp", name: "Interp", containers: ["job-a", "job-b"], condition: "all_terminal", statusPoll: "1s" });
+		assert.match(created, /interp: Interp — group active/);
+		await waitFor(() => calls.length === 1, "the single group wake to fire", 15_000);
+		assert.equal(calls.length, 1, "exactly one wake for the whole batch");
+		assert.equal(calls[0].alarmId, "interp");
+		assert.equal(calls[0].events[0].kind, "group");
+		assert.match(calls[0].message, /2\/2 terminal/, calls[0].message);
+		assert.match(calls[0].message, /exit 0/, calls[0].message);
+		// Members produce no individual wakes and are paused once the group completes.
+		const disk = await readState(statePath);
+		assert.equal(disk.outbox.length, 0, "the delivered group wake was removed");
+		const members = disk.alarms.filter((alarm) => alarm.kind === "container");
+		assert.equal(members.length, 2);
+		assert.ok(members.every((member) => member.active === false && member.pauseReason === "group completed"));
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("watch_condition fires once when the remote result file satisfies the condition", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa", allowedRemoteLogRoots: ["/data/results/"] } }));
+	const calls: OutboxEntry[] = [];
+	let probes = 0;
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: (entry) => { calls.push(entry); return true; },
+		execFn: async () => {
+			probes++;
+			if (probes <= 2) return { stdout: JSON.stringify({ exists: false, size: 0, tailBase64: "" }), stderr: "", code: 0 };
+			return { stdout: JSON.stringify({ exists: true, size: 128, tailBase64: Buffer.from('{"pass": true}\n').toString("base64") }), stderr: "", code: 0 };
+		},
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		const created = await runtime.runAction({ action: "watch_condition", id: "done", name: "Done", path: "/data/results/analysis.json", condition: "contains", value: '"pass": true', statusPoll: "1s" });
+		assert.match(created, /done: Done — condition active/);
+		await waitFor(() => calls.length === 1, "the condition wake to fire", 15_000);
+		assert.equal(calls[0].alarmId, "done");
+		assert.equal(calls[0].events[0].kind, "condition");
+		const disk = await readState(statePath);
+		const alarm = disk.alarms.find((candidate) => candidate.id === "done");
+		assert.ok(alarm?.kind === "condition" && alarm.satisfiedAt !== undefined, "condition alarm satisfied");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("ack drops an alarm's undelivered wakes; remove purgePendingEvents clears them", async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	const owner = "C:\\sessions\\gone.jsonl";
+	const entryA: OutboxEntry = { eventId: "a:1:x", alarmId: "a", alarmName: "A", ownerSessionFile: owner, triggeredAt: 1000, events: [{ kind: "timer", fingerprint: "timer:a:1" }], message: "[Wake alarm] A (a)" };
+	const entryB: OutboxEntry = { eventId: "a:2:y", alarmId: "a", alarmName: "A", ownerSessionFile: owner, triggeredAt: 2000, events: [{ kind: "timer", fingerprint: "timer:a:2" }], message: "[Wake alarm] A (a)" };
+	await writeState(statePath, [{ id: "a", name: "A", kind: "timer", active: true, createdAt: 500, dueAt: 3000, revision: 1 }], [entryA, entryB]);
+	const runtime = makeRuntime(dir, statePath, () => true, { schedulingEnabled: false });
+	try {
+		await runtime.start({ flushPending: false });
+		assert.match(await runtime.runAction({ action: "ack", id: "a" }), /dropped 2/);
+		assert.equal((await readState(statePath)).outbox.length, 0);
+		// remove with purgePendingEvents clears both the alarm and its remaining wakes.
+		const entryC: OutboxEntry = { eventId: "a:3:z", alarmId: "a", alarmName: "A", ownerSessionFile: owner, triggeredAt: 3000, events: [{ kind: "timer", fingerprint: "timer:a:3" }], message: "[Wake alarm] A (a)" };
+		await writeState(statePath, [{ id: "a", name: "A", kind: "timer", active: true, createdAt: 500, dueAt: 3000, revision: 1 }], [entryC]);
+		await runtime.reconcileFromDisk();
+		const removed = await runtime.runAction({ action: "remove", id: "a", purgePendingEvents: true });
+		assert.match(removed, /purged 1 wake/);
+		const disk = await readState(statePath);
+		assert.deepEqual(disk.alarms, []);
+		assert.deepEqual(disk.outbox, []);
+	} finally {
+		await runtime.stop();
+	}
+});

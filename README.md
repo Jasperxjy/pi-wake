@@ -57,7 +57,7 @@ Tool JSON (the agent calls `wake_alarm`; you can also use the slash command):
 }
 ```
 
-Lifecycle: `{"action":"list"}`, `{"action":"check","id":"…"}`, `pause`, `resume`, `reset`, `remove`, and `evidence` (opt-in historical log excerpts, see below). Outbox (undelivered wakes) is managed separately: `list_wakes`, `drop_wake` (by `eventId`), `purge_wakes` (by alarm `id`). Slash form: `/wake-alarm list`, `/wake-alarm check train-run`, …
+Lifecycle: `{"action":"list"}`, `{"action":"check","id":"…"}`, `pause`, `resume`, `reset`, `remove`, and `evidence` (opt-in historical log excerpts, see below). Outbox (undelivered wakes) is managed separately: `list_wakes`, `drop_wake` (by `eventId`), `purge_wakes` (by alarm `id`), and `ack` (drop every undelivered wake of an alarm, including all members of a group). `remove` accepts `purgePendingEvents: true` to also clear the alarm's undelivered wakes. Slash form: `/wake-alarm list`, `/wake-alarm check train-run`, …
 
 ### Container events
 
@@ -73,6 +73,56 @@ Lifecycle: `{"action":"list"}`, `{"action":"check","id":"…"}`, `pause`, `resum
 | `connection-failure` | consecutive SSH/probe failures reach the configured threshold |
 
 Creation establishes a log baseline, so historical log content never fires. An explicit `logPath` is authoritative and must stay under `remote.allowedRemoteLogRoots`; it never silently falls back to Docker output. `policy: "pause"` (default) fires once then pauses for the agent to re-arm; `policy: "keep"` stays active and dedupes stable terminal states.
+
+### Batch barriers: `watch_container_group`
+
+For multi-container batches, create one group instead of N independent alarms:
+
+```json
+{
+  "action": "watch_container_group",
+  "id": "interp-local",
+  "name": "Interp local",
+  "containers": ["ctx-a", "ctx-b", "ctx-c", "ctx-d", "ctx-e", "ctx-f"],
+  "condition": "all_terminal",
+  "statusPoll": "30s"
+}
+```
+
+Conditions: `any_terminal` (first terminal member), `all_terminal` (every member terminal; default), `any_abnormal` (any abnormal exit/OOM), `n_of_m_terminal` (with `required`). Members are created automatically (events exit/abnormal/missing/replaced, keep policy, `logTailLines` optional) and produce **no individual wakes** — the group emits exactly **one summary wake** when the condition is met:
+
+```text
+[Wake alarm] Interp local (interp-local)
+Group condition met: all_terminal
+3/6 terminal; 3 exit 0; 0 abnormal; 0 missing; 0 replaced
+Members:
+  interp-local-1 (ctx-a): exited, code 0
+  ...
+```
+
+Optional `coalesceWindow` (e.g. `30s`) delays a partial-condition fire so the summary can include stragglers; all-terminal always fires immediately. Once fired, the group and its members pause; `reset` re-arms. `remove` on a group also removes its members; `ack` on a group drops every member's undelivered wakes.
+
+### Completion files: `watch_condition`
+
+When an experiment's true completion is a result file rather than a container state:
+
+```json
+{
+  "action": "watch_condition",
+  "id": "analysis-done",
+  "name": "Analysis done",
+  "path": "/data/results/analysis.json",
+  "condition": "contains",
+  "value": "\"pass\": true",
+  "statusPoll": "30s"
+}
+```
+
+Conditions: `exists`, `contains` (literal substring in the file tail), `min_size` (byte threshold with `minSize`). Fires once when satisfied, with a bounded tail excerpt as evidence; `reset` re-arms.
+
+### Wake result summaries
+
+`logTailLines` (1-200) on `watch_container` / `watch_container_group` attaches the last N container log lines to exit/abnormal wake evidence, so a wake can answer "what did it print at the end" without an extra SSH round-trip. Evidence stays sanitized, length-bounded, and labeled untrusted.
 
 ## How waking works
 

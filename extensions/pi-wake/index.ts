@@ -24,6 +24,7 @@ const TOOL_PARAMETERS = Type.Object({
 	after: Type.Optional(Type.String({ description: "Relative timer delay, e.g. 30m; timer reset also accepts it" })),
 	at: Type.Optional(Type.String({ description: "Absolute timer timestamp; exactly one of after or at for timers" })),
 	container: Type.Optional(Type.String({ description: "Docker container name or ID for watch_container" })),
+	containers: Type.Optional(Type.Array(Type.String({ description: "Container names for watch_container_group" }), { minItems: 1, maxItems: 64, description: "Batch containers" })),
 	events: Type.Optional(Type.Array(StringEnum(["exit", "abnormal", "missing", "replaced", "log-error", "log-match", "deadline", "connection-failure"] as const), { minItems: 1, maxItems: 8, description: "OR-combined container events" })),
 	policy: Type.Optional(StringEnum(["pause", "keep"] as const, { description: "pause after a trigger (default), or keep monitoring with dedupe" })),
 	logPath: Type.Optional(Type.String({ description: "Authoritative absolute remote application log path" })),
@@ -31,6 +32,14 @@ const TOOL_PARAMETERS = Type.Object({
 	deadline: Type.Optional(Type.String({ description: "Relative container-watch deadline required with the deadline event" })),
 	statusPoll: Type.Optional(Type.String({ description: "Deterministic model-free condition polling interval, e.g. 60s" })),
 	eventId: Type.Optional(Type.String({ description: "Outbox wake eventId; required for drop_wake" })),
+	condition: Type.Optional(StringEnum(["any_terminal", "all_terminal", "any_abnormal", "n_of_m_terminal", "exists", "contains", "min_size"] as const, { description: "Group barrier or remote file condition" })),
+	required: Type.Optional(Type.Integer({ description: "Members that must be terminal for n_of_m_terminal (default: all)" })),
+	coalesceWindow: Type.Optional(Type.String({ description: "Group wake coalescing window, e.g. 30s; all-terminal fires immediately" })),
+	logTailLines: Type.Optional(Type.Integer({ description: "Attach the last N container log lines to exit/abnormal wake evidence (1-200)" })),
+	path: Type.Optional(Type.String({ description: "Absolute remote file path for watch_condition (must be under allowedRemoteLogRoots)" })),
+	value: Type.Optional(Type.String({ description: "Literal substring for the contains condition" })),
+	minSize: Type.Optional(Type.Integer({ description: "Byte threshold for the min_size condition" })),
+	purgePendingEvents: Type.Optional(Type.Boolean({ description: "remove also clears this alarm's undelivered wakes" })),
 });
 
 export default function wakeAlarmExtension(pi: ExtensionAPI) {

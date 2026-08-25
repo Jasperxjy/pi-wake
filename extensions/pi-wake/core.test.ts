@@ -167,6 +167,22 @@ test("event filtering distinguishes normal exit from abnormal/nonzero/OOM", () =
 	}
 });
 
+test("logTailLines attaches the last N container log lines to exit/abnormal wake evidence", () => {
+	const tail = "line1\nline2\nline3\nline4\nline5\nline6";
+	const alarm = createContainerAlarm({ id: "tailed", name: "Tailed", container: "job", events: ["exit", "abnormal"], logTailLines: 3, now: 1000, statusPollMs: 60_000 });
+	const baseline = applyBaseline(alarm, runningProbe({ tail }), 1000);
+	const exited = applyProbe(baseline, runningProbe({ running: false, status: "exited", containerStatus: "exited", tail }), 2000);
+	const exitEvent = exited.events.find((event) => event.kind === "exit");
+	assert.ok(exitEvent, "clean exit fired");
+	assert.equal(exitEvent?.evidence, "line4\nline5\nline6", "evidence is the bounded tail");
+	const abnormal = applyProbe(baseline, runningProbe({ running: false, status: "exited", containerStatus: "exited", exitCode: 1, tail: "boom\nfatal error\nend" }), 3000);
+	const abnormalEvent = abnormal.events.find((event) => event.kind === "abnormal");
+	assert.equal(abnormalEvent?.evidence, "boom\nfatal error\nend");
+	// Without logTailLines there is no tail evidence.
+	const plain = applyProbe(createContainerAlarm({ id: "plain", name: "Plain", container: "job", events: ["exit"], now: 1000 }), runningProbe({ running: false, status: "exited", containerStatus: "exited", tail: "x\ny" }), 2000);
+	assert.equal(plain.events[0].evidence, undefined);
+});
+
 test("pause policy pauses after a trigger while keep policy dedupes stable terminal state", () => {
 	const pausedBase = applyBaseline(makeContainer(["exit"]), runningProbe(), 1000);
 	const paused = applyProbe(pausedBase, runningProbe({ running: false, status: "exited", containerStatus: "exited" }), 2000);
