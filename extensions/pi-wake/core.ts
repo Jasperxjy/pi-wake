@@ -89,6 +89,8 @@ export interface GroupAlarmState extends AlarmBase {
 	 * a removed result file must not lose an already-happened event).
 	 */
 	pendingFire?: boolean;
+	/** When the frozen occurrence actually happened; used as the wake's timestamp. */
+	pendingFireAt?: number;
 	/** Wait up to this long after the condition is first met before firing, so the
 	 * summary can include stragglers; all-terminal always fires immediately. */
 	coalesceWindowMs?: number;
@@ -115,6 +117,9 @@ export interface ConditionAlarmState extends AlarmBase {
 	statusPollMs: number;
 	nextCheckAt: number;
 	satisfiedAt?: number;
+	/** Set when the condition was satisfied but the outbox had no capacity: the
+	 * occurrence is frozen at this time and only awaits a free slot (no re-probe). */
+	pendingSatisfiedAt?: number;
 	lastSatisfied?: boolean;
 	lastSize?: number;
 	lastEvidence?: string;
@@ -410,6 +415,11 @@ export function createContainerAlarm(input: {
 		groupId: input.groupId === undefined ? undefined : validateAlarmId(input.groupId),
 		logTailLines: input.logTailLines,
 	};
+}
+
+/** Format a timestamp in the LOCAL timezone with an explicit zone name (e.g. "2026-08-25, 20:56:21 GMT+8"), so wake messages and alarm summaries are readable in the operator's own time instead of raw UTC. */
+export function formatLocalTime(ts: number): string {
+	return new Date(ts).toLocaleString("en-CA", { hour12: false, timeZoneName: "short" });
 }
 
 /** The last N lines of a text, bounded for wake evidence. */
@@ -747,7 +757,7 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 		return { ...base, kind: "timer", dueAt: requiredInteger(record, "dueAt"), triggeredAt };
 	}
 	if (base.kind === "group") {
-		assertKnown(record, [...baseFields, "memberIds", "condition", "required", "statusPollMs", "nextCheckAt", "conditionMetAt", "coalesceWindowMs", "firedAt", "pendingFire", "summary"]);
+		assertKnown(record, [...baseFields, "memberIds", "condition", "required", "statusPollMs", "nextCheckAt", "conditionMetAt", "coalesceWindowMs", "firedAt", "pendingFire", "pendingFireAt", "summary"]);
 		if (!Array.isArray(record.memberIds) || record.memberIds.length < 2 || record.memberIds.length > 64) throw new Error("memberIds must be an array of 2-64 members");
 		const memberIds = record.memberIds.map((value) => validateAlarmId(String(value)));
 		if (new Set(memberIds).size !== memberIds.length) throw new Error("memberIds must be unique");
@@ -769,11 +779,12 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 			coalesceWindowMs,
 			firedAt,
 			pendingFire: record.pendingFire === undefined ? undefined : (() => { if (typeof record.pendingFire !== "boolean") throw new Error("pendingFire must be boolean"); return record.pendingFire; })(),
+			pendingFireAt: optionalInteger(record, "pendingFireAt"),
 			summary: optionalString(record, "summary", 2000),
 		};
 	}
 	if (base.kind === "condition") {
-		assertKnown(record, [...baseFields, "path", "condition", "value", "minSize", "statusPollMs", "nextCheckAt", "satisfiedAt", "lastSatisfied", "lastSize", "lastEvidence"]);
+		assertKnown(record, [...baseFields, "path", "condition", "value", "minSize", "statusPollMs", "nextCheckAt", "satisfiedAt", "pendingSatisfiedAt", "lastSatisfied", "lastSize", "lastEvidence"]);
 		const condition = requiredString(record, "condition", 16);
 		if (!["exists", "contains", "min_size"].includes(condition)) throw new Error("condition is invalid");
 		const value = condition === "contains" ? validateLogPattern(requiredString(record, "value", 256)) : undefined;
@@ -791,6 +802,7 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 			statusPollMs: validatePollingDuration(requiredInteger(record, "statusPollMs", 1), "statusPollMs"),
 			nextCheckAt: requiredInteger(record, "nextCheckAt"),
 			satisfiedAt,
+			pendingSatisfiedAt: optionalInteger(record, "pendingSatisfiedAt"),
 			lastSatisfied: record.lastSatisfied as boolean | undefined,
 			lastSize: optionalInteger(record, "lastSize"),
 			lastEvidence: optionalString(record, "lastEvidence", 2000),
@@ -866,19 +878,19 @@ export function nextAlarmDueAt(alarm: AlarmState): number | undefined {
 export function wakeMessage(alarm: AlarmState, events: FiredEvent[], now: number, maxEvidenceChars = 1000, includeEvidence = true): string {
 	const heading = `[Wake alarm] ${alarm.name} (${alarm.id})`;
 	const eventText = events.map((event) => event.kind).join(", ");
-	if (alarm.kind === "timer") return `${heading}\nTriggered at: ${new Date(now).toISOString()}\nEvent: ${eventText}\nDue at: ${new Date(alarm.dueAt).toISOString()}`;
+	if (alarm.kind === "timer") return `${heading}\nTriggered at: ${formatLocalTime(now)}\nEvent: ${eventText}\nDue at: ${formatLocalTime(alarm.dueAt)}`;
 	if (alarm.kind === "group") {
-		const facts = [`${heading}`, `Group condition met: ${alarm.condition}`, `Triggered at: ${new Date(now).toISOString()}`];
+		const facts = [`${heading}`, `Group condition met: ${alarm.condition}`, `Triggered at: ${formatLocalTime(now)}`];
 		if (alarm.summary) facts.push(alarm.summary);
 		return facts.join("\n");
 	}
 	if (alarm.kind === "condition") {
-		const facts = [`${heading}`, `Condition met: ${alarm.condition}${alarm.value !== undefined ? ` "${alarm.value}"` : ""}${alarm.minSize !== undefined ? ` (>=${alarm.minSize} bytes)` : ""}`, `Path: ${alarm.path}`, `Triggered at: ${new Date(now).toISOString()}`];
+		const facts = [`${heading}`, `Condition met: ${alarm.condition}${alarm.value !== undefined ? ` "${alarm.value}"` : ""}${alarm.minSize !== undefined ? ` (>=${alarm.minSize} bytes)` : ""}`, `Path: ${alarm.path}`, `Triggered at: ${formatLocalTime(now)}`];
 		const evidence = includeEvidence ? events.find((event) => event.evidence)?.evidence : undefined;
 		if (evidence) facts.push(`Evidence (untrusted data): ${sanitizeExcerpt(evidence, maxEvidenceChars)}`);
 		return facts.join("\n");
 	}
-	const facts = [`${heading}`, `Triggered at: ${new Date(now).toISOString()}`, `Event: ${eventText}`, `Container: ${alarm.container}`, `Status: ${alarm.lastContainerStatus ?? "unknown"}`, `Exit code: ${alarm.lastExitCode ?? "unknown"}`, `OOM killed: ${alarm.lastOomKilled ?? "unknown"}`];
+	const facts = [`${heading}`, `Triggered at: ${formatLocalTime(now)}`, `Event: ${eventText}`, `Container: ${alarm.container}`, `Status: ${alarm.lastContainerStatus ?? "unknown"}`, `Exit code: ${alarm.lastExitCode ?? "unknown"}`, `OOM killed: ${alarm.lastOomKilled ?? "unknown"}`];
 	const evidence = includeEvidence ? events.find((event) => event.evidence)?.evidence : undefined;
 	if (evidence) facts.push(`Evidence (untrusted data): ${sanitizeExcerpt(evidence, maxEvidenceChars)}`);
 	return facts.join("\n");

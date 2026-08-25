@@ -1302,3 +1302,90 @@ test("a member replaced by a different alarm kind triggers a group integrity fai
 		await runtime.stop();
 	}
 });
+
+test("a frozen condition no longer depends on SSH: permanent remote failure cannot block delivery", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa", allowedRemoteLogRoots: ["/data/results/"] }, maxOutboxEntries: 1 }));
+	const calls: OutboxEntry[] = [];
+	let sshDown = false;
+	let probes = 0;
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: (entry) => { calls.push(entry); return false; },
+		execFn: async () => {
+			probes++;
+			if (sshDown) throw new Error("ssh: connection refused");
+			return { stdout: JSON.stringify({ exists: true, size: 128, tailBase64: Buffer.from("done\n").toString("base64") }), stderr: "", code: 0 };
+		},
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "set_timer", id: "t1", name: "T1", after: "1s" });
+		await waitFor(() => readStateSync(statePath).outbox.length === 1, "the outbox to fill to its cap", 10_000);
+		await runtime.runAction({ action: "watch_condition", id: "done", name: "Done", path: "/data/results/analysis.json", condition: "exists", statusPoll: "1s" });
+		await waitFor(() => {
+			const state = readStateSync(statePath);
+			const alarm = state.alarms.find((candidate) => candidate.id === "done");
+			return alarm?.kind === "condition" && alarm.lastSatisfied === true && alarm.satisfiedAt === undefined;
+		}, "the condition to freeze satisfied", 15_000);
+		const probesAtFreeze = probes;
+		// The remote host goes permanently offline: the frozen occurrence must be
+		// deliverable WITHOUT any further SSH, and the frozen evidence must survive.
+		sshDown = true;
+		await new Promise((resolve) => setTimeout(resolve, 6_500)); // spans the 5s retry
+		assert.equal(probes, probesAtFreeze, "no SSH probe after the freeze");
+		const after = readStateSync(statePath);
+		const alarmAfter = after.alarms.find((candidate) => candidate.id === "done");
+		assert.equal(alarmAfter?.kind === "condition" && alarmAfter.lastSatisfied, true, "frozen satisfaction intact");
+		assert.equal(alarmAfter?.kind === "condition" && alarmAfter.lastEvidence, "done", "frozen evidence not overwritten by SSH errors");
+		await runtime.runAction({ action: "drop_wake", eventId: after.outbox[0].eventId });
+		await waitFor(() => calls.some((entry) => entry.alarmId === "done"), "the frozen condition wake to be delivered without SSH", 15_000);
+		assert.equal(calls.filter((entry) => entry.alarmId === "done").length, 1, "exactly one frozen wake");
+		assert.equal(probes, probesAtFreeze, "delivery itself performed no SSH probe");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("a frozen occurrence keeps its real timestamp: Triggered at is the freeze time, not the delivery time", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa", allowedRemoteLogRoots: ["/data/results/"] }, maxOutboxEntries: 1 }));
+	const calls: OutboxEntry[] = [];
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: (entry) => { calls.push(entry); return false; },
+		execFn: async () => ({ stdout: JSON.stringify({ exists: true, size: 128, tailBase64: Buffer.from("done\n").toString("base64") }), stderr: "", code: 0 }),
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "set_timer", id: "t1", name: "T1", after: "1s" });
+		await waitFor(() => readStateSync(statePath).outbox.length === 1, "the outbox to fill to its cap", 10_000);
+		await runtime.runAction({ action: "watch_condition", id: "done", name: "Done", path: "/data/results/analysis.json", condition: "exists", statusPoll: "1s" });
+		await waitFor(() => {
+			const state = readStateSync(statePath);
+			const alarm = state.alarms.find((candidate) => candidate.id === "done");
+			return alarm?.kind === "condition" && alarm.pendingSatisfiedAt !== undefined;
+		}, "the condition to freeze satisfied", 15_000);
+		const frozenAt = (readStateSync(statePath).alarms.find((candidate) => candidate.id === "done") as { pendingSatisfiedAt?: number }).pendingSatisfiedAt!;
+		// Free a slot well after the freeze.
+		await new Promise((resolve) => setTimeout(resolve, 3_000));
+		const before = readStateSync(statePath);
+		await runtime.runAction({ action: "drop_wake", eventId: before.outbox[0].eventId });
+		await waitFor(() => calls.length === 1, "the frozen condition wake to be delivered", 15_000);
+		const deliveredAt = Date.now();
+		assert.ok(Math.abs(calls[0].triggeredAt - frozenAt) < 2_000, `wake timestamp is the freeze time (frozen=${frozenAt}, triggered=${calls[0].triggeredAt})`);
+		assert.ok(calls[0].triggeredAt < deliveredAt - 2_000, "the wake timestamp predates the delivery, preserving the occurrence audit time");
+	} finally {
+		await runtime.stop();
+	}
+});

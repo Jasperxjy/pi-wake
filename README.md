@@ -5,7 +5,7 @@ Programmable event subscriptions for the [Pi coding agent](https://github.com/ea
 - **While the session is open**, the wake is inserted into the running agent loop like a notification (queued behind any in-flight turn, never interrupting it).
 - **When no session is open**, a small daemon resumes the alarm's owner session headlessly (`pi --session <file> --print <facts>`), so the agent continues with its full original context, handles the event, and exits.
 
-Polling and timing are deterministic and model-free — no tokens are spent until an event actually fires. Wake messages contain facts only (event kind, status, exit code, bounded log evidence). There is no hidden prompt: the woken agent decides what to do next. It can set new alarms, which makes multi-stage workflows with unpredictable waits (train → evaluate → recertify → …) cheap to run.
+Polling and timing are deterministic and model-free — no tokens are spent until an event actually fires. Wake messages contain facts only (event kind, status, exit code, bounded log evidence). Timestamps in wake messages, `list`/`list_wakes`/`check` output are shown in the **local timezone of the machine running Pi** (with the zone name, e.g. `GMT+8`), not UTC. There is no hidden prompt: the woken agent decides what to do next. It can set new alarms, which makes multi-stage workflows with unpredictable waits (train → evaluate → recertify → …) cheap to run.
 
 ## Features
 
