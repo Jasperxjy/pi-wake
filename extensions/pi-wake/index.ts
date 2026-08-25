@@ -24,7 +24,7 @@ const TOOL_PARAMETERS = Type.Object({
 	after: Type.Optional(Type.String({ description: "Relative timer delay, e.g. 30m; timer reset also accepts it" })),
 	at: Type.Optional(Type.String({ description: "Absolute timer timestamp; exactly one of after or at for timers" })),
 	container: Type.Optional(Type.String({ description: "Docker container name or ID for watch_container" })),
-	containers: Type.Optional(Type.Array(Type.String({ description: "Container names for watch_container_group" }), { minItems: 1, maxItems: 64, description: "Batch containers" })),
+	containers: Type.Optional(Type.Array(Type.String({ description: "Container names for watch_container_group (unique, 2-64)" }), { minItems: 2, maxItems: 64, description: "Batch containers" })),
 	events: Type.Optional(Type.Array(StringEnum(["exit", "abnormal", "missing", "replaced", "log-error", "log-match", "deadline", "connection-failure"] as const), { minItems: 1, maxItems: 8, description: "OR-combined container events" })),
 	policy: Type.Optional(StringEnum(["pause", "keep"] as const, { description: "pause after a trigger (default), or keep monitoring with dedupe" })),
 	logPath: Type.Optional(Type.String({ description: "Authoritative absolute remote application log path" })),
@@ -104,9 +104,9 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "wake_alarm",
 		label: "Wake Alarm",
-		description: "Set and manage persistent one-shot time alarms and condition-based remote container alarms. Deterministic polling never wakes the model unless a configured event occurs.",
-		promptSnippet: "Set named timers or container-event alarms and manage their lifecycle",
-		promptGuidelines: ["Use wake_alarm as a scheduling/event primitive. Alarm names are short labels, not plans or continuation instructions."],
+		description: "Set and manage persistent alarms: one-shot timers, remote Docker container watches, batch barriers over many containers (watch_container_group — ONE summary wake when any/all/required members are terminal), completion-file conditions (watch_condition — a remote result file exists/contains a marker/reaches a size), bounded container log tails in exit wakes (logTailLines), and an explicit outbox (list_wakes, drop_wake, purge_wakes, ack). Deterministic polling never wakes the model unless a configured event occurs.",
+		promptSnippet: "Set named timers, container/group barriers, and completion-file conditions; manage wakes with ack/drop_wake",
+		promptGuidelines: ["Use wake_alarm as a scheduling/event primitive. Prefer one watch_container_group for multi-container batches instead of many individual alarms: it emits a single summary wake. Alarm names are short labels, not plans or continuation instructions. Use ack/drop_wake to clear undelivered wakes you have already acted on."],
 		parameters: TOOL_PARAMETERS,
 		async execute(_toolCallId, params) {
 			const details: { action: string; error?: boolean } = { action: params.action as string };

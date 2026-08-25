@@ -423,7 +423,7 @@ export function createGroupAlarm(input: {
 	ownerSessionFile?: string;
 }): GroupAlarmState {
 	if (!Number.isSafeInteger(input.now) || input.now < 0) throw new Error("alarm creation time must be a non-negative safe integer");
-	if (!Array.isArray(input.memberIds) || input.memberIds.length < 1 || input.memberIds.length > 64) throw new Error("a group needs 1-64 member alarms");
+	if (!Array.isArray(input.memberIds) || input.memberIds.length < 2 || input.memberIds.length > 64) throw new Error("a group needs 2-64 member alarms");
 	const memberIds = input.memberIds.map((id) => validateAlarmId(id));
 	if (new Set(memberIds).size !== memberIds.length) throw new Error("group members must be unique");
 	const condition = input.condition;
@@ -740,7 +740,7 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 	}
 	if (base.kind === "group") {
 		assertKnown(record, [...baseFields, "memberIds", "condition", "required", "statusPollMs", "nextCheckAt", "conditionMetAt", "coalesceWindowMs", "firedAt", "summary"]);
-		if (!Array.isArray(record.memberIds) || record.memberIds.length < 1 || record.memberIds.length > 64) throw new Error("memberIds must be a non-empty bounded array");
+		if (!Array.isArray(record.memberIds) || record.memberIds.length < 2 || record.memberIds.length > 64) throw new Error("memberIds must be an array of 2-64 members");
 		const memberIds = record.memberIds.map((value) => validateAlarmId(String(value)));
 		if (new Set(memberIds).size !== memberIds.length) throw new Error("memberIds must be unique");
 		const condition = requiredString(record, "condition", 32);

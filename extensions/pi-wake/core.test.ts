@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { tmpdir } from "node:os";
 import {
 	MAX_TIMER_DELAY_MS,
 	applyBaseline,
@@ -552,4 +554,35 @@ test("headless session resume arguments keep the wake message positional", () =>
 	assert.throws(() => buildResumeArgs("relative.jsonl", "msg"));
 	assert.throws(() => buildResumeArgs("/s.jsonl", ""));
 	assert.throws(() => buildResumeArgs("/s.jsonl", "x".repeat(4001)));
+});
+
+test("real Python condition probe handles a file without a container field", { skip: process.platform === "win32" }, () => {
+	// Runs the ACTUAL embedded probe script against a real file (POSIX paths only,
+	// so it is skipped on native Windows; CI ubuntu and WSL cover it). The payload
+	// deliberately has NO "container" field — the regression this guards against
+	// made watch_condition fail on every real SSH probe.
+	const source = readFileSync(new URL("./runtime.ts", import.meta.url), "utf8");
+	const scriptMatch = source.match(/const PROBE_SCRIPT = String\.raw`([\s\S]*?)`;\r?\n\r?\nconst PROBE_LOADER/);
+	assert.ok(scriptMatch, "embedded PROBE_SCRIPT must remain extractable");
+	const scriptBase64 = Buffer.from(scriptMatch[1], "utf8").toString("base64");
+	const dir = mkdtempSync(path.join(tmpdir(), "cond-"));
+	const file = path.join(dir, "analysis.json");
+	writeFileSync(file, '{"pass": true}\nline2\n');
+	const payload = (overrides: Record<string, unknown> = {}): string => Buffer.from(JSON.stringify({ conditionPath: file, allowedRemoteLogRoots: [dir + "/"], tailBytes: 4096, ...overrides })).toString("base64");
+	const run = (payloadB64: string): { stdout: string; status: number | null } => {
+		const wrapper = ["import base64,sys", `sys.argv=['probe',${JSON.stringify(payloadB64)}]`, `exec(base64.b64decode(${JSON.stringify(scriptBase64)}))`].join("\n");
+		const result = spawnSync("python3", ["-c", wrapper], { encoding: "utf8" });
+		return { stdout: result.stdout.trim(), status: result.status };
+	};
+	const r1 = run(payload());
+	assert.equal(r1.status, 0, r1.stdout);
+	const parsed = JSON.parse(r1.stdout) as { exists?: boolean; size?: number; tailBase64?: string };
+	assert.equal(parsed.exists, true);
+	assert.equal(parsed.size, Buffer.byteLength('{"pass": true}\nline2\n'));
+	const tail = Buffer.from(String(parsed.tailBase64), "base64").toString("utf8");
+	assert.ok(tail.includes('"pass": true'), "contains condition sees the marker");
+	const r2 = run(payload({ conditionPath: path.join(dir, "missing.json") }));
+	const missing = JSON.parse(r2.stdout) as { exists?: boolean; size?: number };
+	assert.equal(missing.exists, false);
+	assert.equal(missing.size, 0);
 });

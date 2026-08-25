@@ -931,3 +931,162 @@ test("ack drops an alarm's undelivered wakes; remove purgePendingEvents clears t
 		await runtime.stop();
 	}
 });
+
+test("group reset rebaselines members and cannot re-fire the previous run", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const calls: OutboxEntry[] = [];
+	let phase = 0;
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: (entry) => { calls.push(entry); return true; },
+		execFn: async () => {
+			if (phase === 0) return cannedProbe();
+			if (phase === 1) return cannedProbe({ running: true, status: "running", containerStatus: "running", startedAt: "2026-01-01T00:00:00.000Z" });
+			return cannedProbe({ startedAt: "2026-01-01T00:00:09.000Z" });
+		},
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], statusPoll: "1s" });
+		await waitFor(() => calls.length === 1, "first run group wake", 15_000);
+		phase = 1;
+		const reset = await runtime.runAction({ action: "reset", id: "g" });
+		assert.match(reset, /Reset g/);
+		await new Promise((resolve) => setTimeout(resolve, 2_500));
+		assert.equal(calls.length, 1, "reset must not re-fire the previous run's terminal state");
+		phase = 2;
+		await waitFor(() => calls.length === 2, "second run group wake after reset", 15_000);
+		assert.equal(calls[1].alarmId, "g");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("group creation is atomic: a member id collision leaves no orphan members", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const runtime = new WakeAlarmRuntime({ cwd: dir, configPath, statePath, emit: () => true, execFn: async () => cannedProbe() });
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "watch_container", id: "g-2", name: "Pre", container: "job-b", events: ["exit"], statusPoll: "60s" });
+		await assert.rejects(
+			runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], statusPoll: "60s" }),
+			/member alarm already exists: g-2/,
+		);
+		const disk = await readState(statePath);
+		assert.deepEqual(disk.alarms.map((alarm) => alarm.id).sort(), ["g-2"]);
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("removing a group removes its members in one transaction", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const runtime = new WakeAlarmRuntime({ cwd: dir, configPath, statePath, emit: () => true, execFn: async () => cannedProbe() });
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], statusPoll: "60s" });
+		const removed = await runtime.runAction({ action: "remove", id: "g" });
+		assert.match(removed, /Removed g/);
+		const disk = await readState(statePath);
+		assert.deepEqual(disk.alarms.map((alarm) => alarm.id), [], "group and members removed together, no orphans");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("group completion bumps the revision of the group and every changed member", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const runtime = new WakeAlarmRuntime({ cwd: dir, configPath, statePath, emit: () => true, execFn: async () => cannedProbe() });
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], statusPoll: "1s" });
+		await waitFor(() => {
+			const state = readStateSync(statePath);
+			return state.alarms.some((alarm) => alarm.kind === "group" && alarm.firedAt !== undefined);
+		}, "the group to complete", 15_000);
+		const disk = await readState(statePath);
+		const group = disk.alarms.find((alarm) => alarm.id === "g");
+		assert.ok((group?.revision ?? 0) >= 2, "group revision advanced past create");
+		const members = disk.alarms.filter((alarm) => alarm.kind === "container");
+		assert.equal(members.length, 2);
+		for (const member of members) assert.ok((member.revision ?? 0) >= 2, `member ${member.id} revision advanced past create`);
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("a full outbox blocks the group wake until capacity is freed", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" }, maxOutboxEntries: 2 }));
+	const calls: OutboxEntry[] = [];
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: (entry) => { calls.push(entry); return false; },
+		execFn: async () => cannedProbe(),
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "set_timer", id: "t1", name: "T1", after: "1s" });
+		await runtime.runAction({ action: "set_timer", id: "t2", name: "T2", after: "1s" });
+		await waitFor(() => readStateSync(statePath).outbox.length === 2, "the outbox to fill to its cap", 10_000);
+		await runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], statusPoll: "1s" });
+		await new Promise((resolve) => setTimeout(resolve, 3_000));
+		const state1 = readStateSync(statePath);
+		assert.equal(state1.outbox.length, 2, "group wake did not exceed the outbox cap");
+		assert.ok(state1.alarms.some((alarm) => alarm.id === "g" && alarm.active === true), "group stayed active while the outbox was full");
+		await runtime.runAction({ action: "drop_wake", eventId: state1.outbox[0].eventId });
+		await waitFor(() => readStateSync(statePath).alarms.some((alarm) => alarm.id === "g" && (alarm as { firedAt?: number }).firedAt !== undefined), "the group to fire after capacity was freed", 15_000);
+		assert.equal(readStateSync(statePath).outbox.length, 2, "cap respected after the group fired (1 timer + 1 group wake)");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("group summary includes bounded member log tails when logTailLines is set", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const calls: OutboxEntry[] = [];
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: (entry) => { calls.push(entry); return true; },
+		execFn: async () => cannedProbe({ tailBase64: Buffer.from("accuracy=0.91\nsaved checkpoint\n").toString("base64") }),
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], logTailLines: 5, statusPoll: "1s" });
+		await waitFor(() => calls.length === 1, "group wake with member tails", 15_000);
+		assert.match(calls[0].message, /accuracy=0.91/, "member log tail appears in the group summary");
+		assert.match(calls[0].message, /saved checkpoint/, "multi-line member tail is included");
+		assert.match(calls[0].message, /tail:/);
+	} finally {
+		await runtime.stop();
+	}
+});
