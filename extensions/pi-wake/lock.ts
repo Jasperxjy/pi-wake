@@ -126,7 +126,15 @@ export class StateLock {
 				this.identity = { token, ino: stat?.ino ?? 0 };
 				return;
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code === "EPERM" || code === "EACCES" || code === "EBUSY") {
+					// Windows transient: an AV/indexer can briefly hold the file open.
+					// Retry like ordinary contention instead of failing the operation.
+					if (Date.now() > deadline) throw new Error("timed out acquiring the wake-alarm state lock");
+					await this.sleep(10 + Math.floor(Math.random() * 25));
+					continue;
+				}
+				if (code !== "EEXIST") throw error;
 			}
 			const now = Date.now();
 			const observed = await this.observe();
