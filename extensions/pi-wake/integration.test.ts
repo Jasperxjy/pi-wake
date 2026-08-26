@@ -1174,7 +1174,7 @@ test("a satisfied group is frozen when the outbox is full and survives member st
 		await waitFor(() => readStateSync(statePath).alarms.some((alarm) => alarm.id === "g" && alarm.kind === "group" && (alarm as { firedAt?: number }).firedAt !== undefined), "the frozen group to fire after capacity was freed", 15_000);
 		const fired = readStateSync(statePath);
 		assert.equal(fired.outbox.length, 1, "cap respected: the group wake took the freed slot");
-		assert.ok(fired.alarms.some((alarm) => alarm.id === "g" && alarm.kind === "group" && String(alarm.summary).includes("2/2 terminal")), "the fired summary reflects the frozen occurrence");
+		assert.ok(fired.alarms.some((alarm) => alarm.id === "g" && alarm.kind === "group" && String(alarm.summary).includes("abnormal")), "the fired summary reflects the frozen occurrence");
 	} finally {
 		await runtime.stop();
 	}
