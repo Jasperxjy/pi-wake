@@ -1427,11 +1427,13 @@ test("a frozen group survives a member being removed while it awaits capacity", 
 		assert.equal(groupMid?.kind === "group" && (groupMid as { pendingFire?: boolean }).pendingFire, true, "the frozen occurrence survives member removal");
 		assert.ok(!String(groupMid?.kind === "group" ? groupMid.pauseReason : "").includes("integrity"), "no integrity failure on a frozen group");
 		// Free the slot: the FROZEN wake still fires with its frozen timestamp.
+		const frozenAt = (mid.alarms.find((alarm) => alarm.id === "g") as { pendingFireAt?: number }).pendingFireAt!;
 		await runtime.runAction({ action: "drop_wake", eventId: mid.outbox[0].eventId });
 		await waitFor(() => readStateSync(statePath).alarms.some((alarm) => alarm.id === "g" && alarm.kind === "group" && (alarm as { firedAt?: number }).firedAt !== undefined), "the frozen group to fire after capacity was freed", 15_000);
 		const fired = readStateSync(statePath);
 		const groupFired = fired.alarms.find((alarm) => alarm.id === "g");
-		assert.ok(groupFired?.kind === "group" && String(groupFired.summary).includes("2/2 terminal"), "the fired summary is the frozen one");
+		assert.ok(groupFired?.kind === "group" && String(groupFired.summary).includes("abnormal"), "the fired summary is the frozen one (not regenerated after member removal)");
+		assert.ok(groupFired?.kind === "group" && Math.abs((groupFired as { firedAt: number }).firedAt - frozenAt) < 2_000, "the fire uses the frozen occurrence timestamp");
 	} finally {
 		await runtime.stop();
 	}
