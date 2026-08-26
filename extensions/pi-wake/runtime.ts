@@ -1053,6 +1053,15 @@ export class WakeAlarmRuntime {
 	}
 
 	/**
+	 * Ownership test: is this alarm still a member THIS group owns? A same-id alarm
+	 * that is not a container, or whose groupId points elsewhere, is a replacement,
+	 * NOT a member — group lifecycle must never mutate it.
+	 */
+	private ownedGroupMember(alarm: AlarmState | undefined, group: GroupAlarmState): alarm is ContainerAlarmState {
+		return alarm !== undefined && alarm.kind === "container" && alarm.groupId === group.id && group.memberIds.includes(alarm.id);
+	}
+
+	/**
 	 * Batch-barrier evaluation. Reads the freshest member states under the state
 	 * lock, computes the condition summary, and either advances the poll cadence,
 	 * waits out a coalesce window, fires the single group wake, or — when the
@@ -1073,20 +1082,12 @@ export class WakeAlarmRuntime {
 			const now = Date.now();
 			const groupMember = (memberId: string): ContainerAlarmState | undefined => {
 				const candidate = disk.alarms.find((alarm) => alarm.id === memberId);
-				return candidate !== undefined && candidate.kind === "container" && candidate.groupId === group.id ? candidate : undefined;
+				return this.ownedGroupMember(candidate, group) ? candidate : undefined;
 			};
-			const badMembers = group.memberIds.filter((memberId) => groupMember(memberId) === undefined);
-			if (badMembers.length > 0) {
-				// Integrity failure: a member that is missing, replaced by another kind,
-				// or no longer attached to this group is NEVER a terminal result.
-				const diagnostic = `group integrity failure: invalid member alarm(s) ${badMembers.join(", ")}`;
-				const next = this.bump(group, { active: false, pauseReason: diagnostic, summary: diagnostic, pendingFire: false });
-				const alarms = disk.alarms.map((candidate) => candidate.id === id ? next : group.memberIds.includes(candidate.id) ? this.bump(candidate, { active: false, pauseReason: "group integrity failure" }) : candidate);
-				const adopted = new Map(alarms.filter((candidate) => candidate.id === id || group.memberIds.includes(candidate.id)).map((candidate) => [candidate.id, candidate]));
-				return { alarms, outbox: disk.outbox, adopted, result: { alarm: next, events: [] } };
-			}
 			// Frozen occurrence: the condition was already met but the outbox had no
-			// capacity. ONLY retry the slot — never re-evaluate the external condition.
+			// capacity. This fast path runs BEFORE any member/integrity check: the
+			// fact HAPPENED, and the current member world is no longer its precondition
+			// — a member removed or replaced while frozen can never erase it.
 			if (group.pendingFire === true) {
 				if (shouldEmit && !this.outboxCapacityFree(disk, id, 1)) {
 					const next = this.bump(group, { nextCheckAt: now + 5_000 });
@@ -1100,6 +1101,17 @@ export class WakeAlarmRuntime {
 				const entry = createOutboxEntry(fired, [event], occurredAt, this.outboxOptions());
 				const alarms = disk.alarms.map((candidate) => (candidate.id === id ? fired : candidate));
 				return { alarms, outbox: shouldEmit ? [...disk.outbox, entry] : disk.outbox, adopted: new Map([[id, fired]]), adoptedOutbox: shouldEmit ? [...disk.outbox, entry] : undefined, result: { alarm: fired, events: [event] } };
+			}
+			const badMembers = group.memberIds.filter((memberId) => groupMember(memberId) === undefined);
+			if (badMembers.length > 0) {
+				// Integrity failure: a member that is missing, replaced by another kind,
+				// or no longer attached to this group is NEVER a terminal result. Only
+				// ownership-valid members are paused; a same-id replacement is untouched.
+				const diagnostic = `group integrity failure: invalid member alarm(s) ${badMembers.join(", ")}`;
+				const next = this.bump(group, { active: false, pauseReason: diagnostic, summary: diagnostic, pendingFire: false });
+				const alarms = disk.alarms.map((candidate) => candidate.id === id ? next : this.ownedGroupMember(candidate, group) ? this.bump(candidate, { active: false, pauseReason: "group integrity failure" }) : candidate);
+				const adopted = new Map(alarms.filter((candidate) => candidate.id === id || this.ownedGroupMember(candidate, group)).map((candidate) => [candidate.id, candidate]));
+				return { alarms, outbox: disk.outbox, adopted, result: { alarm: next, events: [] } };
 			}
 			const members = group.memberIds.map(groupMember).filter((member): member is ContainerAlarmState => member !== undefined);
 			let terminal = 0;
@@ -1155,8 +1167,8 @@ export class WakeAlarmRuntime {
 				// delete the fingerprints that justify this wake, keep the summary, and
 				// retry only the outbox slot.
 				const frozen = this.bump(group, { summary: firedSummary, pendingFire: true, pendingFireAt: now, conditionMetAt: undefined, nextCheckAt: now + 5_000 });
-				const alarms = disk.alarms.map((candidate) => candidate.id === id ? frozen : group.memberIds.includes(candidate.id) && candidate.kind === "container" ? this.bump(candidate, { active: false, pauseReason: "group completed (awaiting outbox capacity)" }) : candidate);
-				const adopted = new Map(alarms.filter((candidate) => candidate.id === id || group.memberIds.includes(candidate.id)).map((candidate) => [candidate.id, candidate]));
+				const alarms = disk.alarms.map((candidate) => candidate.id === id ? frozen : this.ownedGroupMember(candidate, group) ? this.bump(candidate, { active: false, pauseReason: "group completed (awaiting outbox capacity)" }) : candidate);
+				const adopted = new Map(alarms.filter((candidate) => candidate.id === id || this.ownedGroupMember(candidate, group)).map((candidate) => [candidate.id, candidate]));
 				return { alarms, outbox: disk.outbox, adopted, result: { alarm: frozen, events: [] } };
 			}
 			// Fire: the group pauses (never re-fires until reset) and its members pause too.
@@ -1173,10 +1185,10 @@ export class WakeAlarmRuntime {
 			const entry = createOutboxEntry(fired, [event], now, this.outboxOptions());
 			const alarms = disk.alarms.map((candidate) => {
 				if (candidate.id === id) return fired;
-				if (group.memberIds.includes(candidate.id) && candidate.kind === "container") return this.bump(candidate, { active: false, pauseReason: "group completed" });
+				if (this.ownedGroupMember(candidate, group)) return this.bump(candidate, { active: false, pauseReason: "group completed" });
 				return candidate;
 			});
-			const adopted = new Map(alarms.filter((candidate) => candidate.id === id || group.memberIds.includes(candidate.id)).map((candidate) => [candidate.id, candidate]));
+			const adopted = new Map(alarms.filter((candidate) => candidate.id === id || this.ownedGroupMember(candidate, group)).map((candidate) => [candidate.id, candidate]));
 			return {
 				alarms,
 				outbox: shouldEmit ? [...disk.outbox, entry] : disk.outbox,
@@ -1705,7 +1717,7 @@ export class WakeAlarmRuntime {
 		}
 		if (current.kind === "condition") {
 			if (params.after !== undefined || params.at !== undefined) throw new Error("condition reset does not accept after or at");
-			const reset: ConditionAlarmState = { ...current, active: true, pauseReason: undefined, satisfiedAt: undefined, lastSatisfied: false, lastTriggeredAt: undefined, nextCheckAt: Date.now() };
+			const reset: ConditionAlarmState = { ...current, active: true, pauseReason: undefined, satisfiedAt: undefined, pendingSatisfiedAt: undefined, lastSatisfied: false, lastTriggeredAt: undefined, nextCheckAt: Date.now() };
 			await this.replaceAlarm(id, reset, { force: true, intent: () => reset }); this.schedule(); return reset;
 		}
 		if (params.after !== undefined || params.at !== undefined) throw new Error("container reset does not accept after or at");
@@ -1761,11 +1773,13 @@ export class WakeAlarmRuntime {
 					if (!current) throw new Error(`unknown alarm: ${id}`);
 					if (current.kind === "group") {
 						// Group lifecycle controls members: pausing the barrier stops member polling too.
-						// The affected set is derived from the FRESH disk group inside the lock, so a
-						// concurrent remove/recreate can never be applied to a stale member list.
+						// The affected set is derived from the FRESH disk group inside the lock, and only
+						// ownership-valid members are touched — a same-id replacement is never mutated.
 						const count = await this.commitAlarmSet(async (disk) => {
 							const diskGroup = disk.alarms.find((candidate) => candidate.id === id);
 							if (!diskGroup || diskGroup.kind !== "group") throw new Error(`unknown group alarm: ${id}`);
+							const invalid = diskGroup.memberIds.filter((memberId) => !this.ownedGroupMember(disk.alarms.find((candidate) => candidate.id === memberId), diskGroup));
+							if (invalid.length > 0) throw new Error(`group integrity failure: invalid member alarm(s) ${invalid.join(", ")}`);
 							const memberIds = new Set(diskGroup.memberIds);
 							const alarms = disk.alarms.map((candidate) => (candidate.id === id || memberIds.has(candidate.id)) ? this.bump(candidate, { active: false, pauseReason: "paused explicitly" }) : candidate);
 							const adopted = new Map(alarms.filter((candidate) => candidate.id === id || memberIds.has(candidate.id)).map((candidate) => [candidate.id, candidate]));
@@ -1785,6 +1799,8 @@ export class WakeAlarmRuntime {
 							const diskGroup = disk.alarms.find((candidate) => candidate.id === id);
 							if (!diskGroup || diskGroup.kind !== "group") throw new Error(`unknown group alarm: ${id}`);
 							if (diskGroup.firedAt !== undefined) throw new Error("a completed group must be reset, not resumed");
+							const invalid = diskGroup.memberIds.filter((memberId) => !this.ownedGroupMember(disk.alarms.find((candidate) => candidate.id === memberId), diskGroup));
+							if (invalid.length > 0) throw new Error(`group integrity failure: invalid member alarm(s) ${invalid.join(", ")}`);
 							const memberIds = new Set(diskGroup.memberIds);
 							const alarms = disk.alarms.map((candidate) => {
 								if (candidate.id === id || memberIds.has(candidate.id)) return this.bump(candidate, resumeAlarm(candidate, Date.now()));
@@ -1811,7 +1827,13 @@ export class WakeAlarmRuntime {
 					const removeIds = await this.commitAlarmSet(async (disk) => {
 						const diskAlarm = disk.alarms.find((candidate) => candidate.id === id);
 						const ids = new Set<string>([id]);
-						if (diskAlarm?.kind === "group") for (const memberId of diskAlarm.memberIds) ids.add(memberId);
+						// Only ownership-valid members are removed with the group: a same-id
+						// replacement (e.g. an unrelated timer) is NEVER a casualty.
+						if (diskAlarm?.kind === "group") {
+							for (const memberId of diskAlarm.memberIds) {
+								if (this.ownedGroupMember(disk.alarms.find((candidate) => candidate.id === memberId), diskAlarm)) ids.add(memberId);
+							}
+						}
 						// Alarms AND (optionally) their wakes are removed in ONE transaction:
 						// a failure cannot leave alarms alive with wakes purged, or orphan members.
 						pending = disk.outbox.filter((entry) => ids.has(entry.alarmId)).length;

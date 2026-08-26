@@ -1389,3 +1389,122 @@ test("a frozen occurrence keeps its real timestamp: Triggered at is the freeze t
 		await runtime.stop();
 	}
 });
+
+test("a frozen group survives a member being removed while it awaits capacity", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" }, maxOutboxEntries: 1 }));
+	let probes = 0;
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: () => false,
+		execFn: async () => {
+			probes++;
+			if (probes <= 2) return cannedProbe({ running: true, status: "running", containerStatus: "running", exitCode: undefined });
+			return cannedProbe({ exitCode: 1 });
+		},
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "set_timer", id: "t1", name: "T1", after: "1s" });
+		await waitFor(() => readStateSync(statePath).outbox.length === 1, "the outbox to fill to its cap", 10_000);
+		await runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], condition: "any_abnormal", statusPoll: "1s" });
+		await waitFor(() => {
+			const state = readStateSync(statePath);
+			const group = state.alarms.find((alarm) => alarm.id === "g");
+			return group?.kind === "group" && (group as { pendingFire?: boolean }).pendingFire === true;
+		}, "the group to freeze with pendingFire", 15_000);
+		// A member alarm is removed while the occurrence is frozen: the frozen fact
+		// must NOT be converted into an integrity failure.
+		await runtime.runAction({ action: "remove", id: "g-1" });
+		await new Promise((resolve) => setTimeout(resolve, 6_000)); // spans one 5s retry
+		const mid = readStateSync(statePath);
+		const groupMid = mid.alarms.find((alarm) => alarm.id === "g");
+		assert.equal(groupMid?.kind === "group" && (groupMid as { pendingFire?: boolean }).pendingFire, true, "the frozen occurrence survives member removal");
+		assert.ok(!String(groupMid?.kind === "group" ? groupMid.pauseReason : "").includes("integrity"), "no integrity failure on a frozen group");
+		// Free the slot: the FROZEN wake still fires with its frozen timestamp.
+		await runtime.runAction({ action: "drop_wake", eventId: mid.outbox[0].eventId });
+		await waitFor(() => readStateSync(statePath).alarms.some((alarm) => alarm.id === "g" && alarm.kind === "group" && (alarm as { firedAt?: number }).firedAt !== undefined), "the frozen group to fire after capacity was freed", 15_000);
+		const fired = readStateSync(statePath);
+		const groupFired = fired.alarms.find((alarm) => alarm.id === "g");
+		assert.ok(groupFired?.kind === "group" && String(groupFired.summary).includes("2/2 terminal"), "the fired summary is the frozen one");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("group lifecycle never mutates a same-id alarm that is no longer a group member", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: () => true,
+		execFn: async () => cannedProbe({ running: true, status: "running", containerStatus: "running", exitCode: undefined }),
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], statusPoll: "1s" });
+		// Replace member g-1 with an unrelated timer of the same id.
+		await runtime.runAction({ action: "remove", id: "g-1" });
+		await runtime.runAction({ action: "set_timer", id: "g-1", name: "Imposter", after: "1h" });
+		await waitFor(() => {
+			const state = readStateSync(statePath);
+			const group = state.alarms.find((alarm) => alarm.id === "g");
+			return group?.kind === "group" && String(group.pauseReason).includes("integrity failure");
+		}, "the group to report an integrity failure", 15_000);
+		// The integrity handling must NOT pause the same-id replacement.
+		const mid = readStateSync(statePath);
+		const imposter = mid.alarms.find((alarm) => alarm.id === "g-1");
+		assert.equal(imposter?.active, true, "the same-id replacement timer is not touched by the integrity failure");
+		assert.equal(mid.alarms.find((alarm) => alarm.id === "g-2")?.active, false, "the still-valid member is paused");
+		// remove(group) deletes the group and its VALID member only; the replacement survives.
+		await runtime.runAction({ action: "remove", id: "g" });
+		const after = readStateSync(statePath);
+		assert.deepEqual(after.alarms.map((alarm) => alarm.id), ["g-1"], "the replacement survives group removal");
+		assert.equal(after.alarms[0].active, true);
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("condition reset clears the pending freeze state", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa", allowedRemoteLogRoots: ["/data/results/"] }, maxOutboxEntries: 1 }));
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: () => false,
+		execFn: async () => ({ stdout: JSON.stringify({ exists: true, size: 128, tailBase64: Buffer.from("done\n").toString("base64") }), stderr: "", code: 0 }),
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "set_timer", id: "t1", name: "T1", after: "1s" });
+		await waitFor(() => readStateSync(statePath).outbox.length === 1, "the outbox to fill to its cap", 10_000);
+		await runtime.runAction({ action: "watch_condition", id: "done", name: "Done", path: "/data/results/analysis.json", condition: "exists", statusPoll: "1s" });
+		await waitFor(() => {
+			const state = readStateSync(statePath);
+			const alarm = state.alarms.find((candidate) => candidate.id === "done");
+			return alarm?.kind === "condition" && alarm.pendingSatisfiedAt !== undefined;
+		}, "the condition to freeze", 15_000);
+		await runtime.runAction({ action: "reset", id: "done" });
+		const alarm = readStateSync(statePath).alarms.find((candidate) => candidate.id === "done");
+		assert.equal(alarm?.kind === "condition" && alarm.pendingSatisfiedAt, undefined, "reset clears the pending freeze state");
+		assert.equal(alarm?.kind === "condition" && alarm.lastSatisfied, false);
+		assert.equal(alarm?.kind === "condition" && alarm.active, true);
+	} finally {
+		await runtime.stop();
+	}
+});
