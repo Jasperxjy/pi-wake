@@ -731,7 +731,7 @@ function assertKnown(record: Record<string, unknown>, fields: readonly string[])
 function restoreBase(record: Record<string, unknown>): AlarmBase {
 	if (typeof record.active !== "boolean") throw new Error("active must be boolean");
 	const kind = requiredString(record, "kind", 16);
-	if (kind !== "timer" && kind !== "container") throw new Error("kind must be timer or container");
+	if (kind !== "timer" && kind !== "container" && kind !== "group" && kind !== "condition") throw new Error("kind must be timer, container, group, or condition");
 	return {
 		id: validateAlarmId(requiredString(record, "id", 64)),
 		name: validateAlarmName(requiredString(record, "name", 160)),

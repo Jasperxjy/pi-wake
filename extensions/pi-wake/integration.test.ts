@@ -1579,3 +1579,73 @@ test("ack(group) purges the group's own wakes and valid members' wakes", { timeo
 		await runtime.stop();
 	}
 });
+
+test("all four alarm kinds survive a full restart (loadStateFromDisk)", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa", allowedRemoteLogRoots: ["/data/results/"] } }));
+	const mk = (): WakeAlarmRuntime => new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: () => true,
+		execFn: async () => cannedProbe({ running: true, status: "running", containerStatus: "running", exitCode: undefined }),
+	});
+	const first = mk();
+	try {
+		await first.start({ flushPending: false });
+		await first.runAction({ action: "set_timer", id: "t1", name: "T1", after: "1h" });
+		await first.runAction({ action: "watch_container", id: "c1", name: "C1", container: "job-c", events: ["exit"], statusPoll: "60s" });
+		await first.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], statusPoll: "60s" });
+		await first.runAction({ action: "watch_condition", id: "done", name: "Done", path: "/data/results/analysis.json", condition: "exists", statusPoll: "60s" });
+		// Fresh runtime: full loadStateFromDisk over the persisted state.
+		const second = mk();
+		await second.start({ flushPending: false });
+		assert.equal(second.alarmCount, 6, "timer, container, group + 2 members, and condition restored");
+		const list = await second.runAction({ action: "list" });
+		assert.match(list, /t1: T1 — timer/);
+		assert.match(list, /c1: C1 — container/);
+		assert.match(list, /g: G — group/);
+		assert.match(list, /done: Done — condition/);
+		const disk = await readState(statePath);
+		const group = disk.alarms.find((alarm) => alarm.id === "g");
+		assert.equal(group?.kind === "group" && group.memberIds.length, 2, "group members restored");
+		const condition = disk.alarms.find((alarm) => alarm.id === "done");
+		assert.equal(condition?.kind === "condition" && condition.path, "/data/results/analysis.json", "condition path restored");
+		await second.stop();
+	} finally {
+		await first.stop();
+	}
+});
+
+test("group and condition states restore through the installed-package daemon (state fixture)", { timeout: 60_000 }, async () => {
+	// Mirrors the production scenario: a state file containing a group and a
+	// condition must load without "kind must be timer or container".
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	const now = Date.now();
+	const fixture = {
+		version: 3,
+		alarms: [
+			{ id: "g", name: "G", kind: "group", active: true, createdAt: now, memberIds: ["g-1", "g-2"], condition: "all_terminal", required: 2, statusPollMs: 60_000, nextCheckAt: now, revision: 1 },
+			{ id: "g-1", name: "G #1", kind: "container", active: true, createdAt: now, container: "job-a", events: ["exit", "abnormal", "missing", "replaced"], policy: "keep", statusPollMs: 60_000, nextCheckAt: now, logOffset: 0, scanCarry: "", eventFingerprints: {}, consecutiveFailures: 0, failureNotified: false, groupId: "g", revision: 1 },
+			{ id: "g-2", name: "G #2", kind: "container", active: true, createdAt: now, container: "job-b", events: ["exit", "abnormal", "missing", "replaced"], policy: "keep", statusPollMs: 60_000, nextCheckAt: now, logOffset: 0, scanCarry: "", eventFingerprints: {}, consecutiveFailures: 0, failureNotified: false, groupId: "g", revision: 1 },
+			{ id: "done", name: "Done", kind: "condition", active: true, createdAt: now, path: "/data/results/analysis.json", condition: "exists", statusPollMs: 60_000, nextCheckAt: now, revision: 1 },
+		],
+		outbox: [],
+	};
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	await fs.writeFile(statePath, `${JSON.stringify(fixture, null, 2)}
+`);
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa", allowedRemoteLogRoots: ["/data/results/"] } }));
+	const runtime = new WakeAlarmRuntime({ cwd: dir, configPath, statePath, emit: () => true, execFn: async () => cannedProbe({ running: true, status: "running", containerStatus: "running", exitCode: undefined }) });
+	try {
+		await runtime.start({ flushPending: false });
+		assert.equal(runtime.alarmCount, 4, "group + members + condition restore without error");
+	} finally {
+		await runtime.stop();
+	}
+});

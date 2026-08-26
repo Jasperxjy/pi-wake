@@ -2,6 +2,8 @@ node_modules/
 *.log
 .pi/wake-alarm.state.json*
 .pi/wake-alarm.lock.json*
+.pi/wake-alarm.sessions/
+.pi/*.tmp-*
 .pid-check.mjs
 .debug-*.mts
 dist/
