@@ -1510,3 +1510,72 @@ test("condition reset clears the pending freeze state", { timeout: 60_000 }, asy
 		await runtime.stop();
 	}
 });
+
+test("ack(group) never purges a same-id replacement's undelivered wakes", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: () => false,
+		execFn: async () => cannedProbe({ running: true, status: "running", containerStatus: "running", exitCode: undefined }),
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], statusPoll: "60s" });
+		// Replace member g-1 with an independent timer that fires and leaves an
+		// undelivered wake in the outbox.
+		await runtime.runAction({ action: "remove", id: "g-1" });
+		await runtime.runAction({ action: "set_timer", id: "g-1", name: "Independent", after: "1s" });
+		await waitFor(() => {
+			const state = readStateSync(statePath);
+			return state.outbox.some((entry) => entry.alarmId === "g-1");
+		}, "the independent timer's undelivered wake", 10_000);
+		const before = readStateSync(statePath);
+		assert.ok(before.outbox.some((entry) => entry.alarmId === "g-1"), "the replacement has a durable wake");
+		// ack(group) must NOT purge that wake: the g-1 id no longer belongs to the group.
+		await runtime.runAction({ action: "ack", id: "g" });
+		const after = readStateSync(statePath);
+		assert.ok(after.outbox.some((entry) => entry.alarmId === "g-1"), "the same-id replacement's wake survives ack(group)");
+		assert.ok(after.alarms.some((alarm) => alarm.id === "g-1" && alarm.kind === "timer"), "the replacement alarm survives");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("ack(group) purges the group's own wakes and valid members' wakes", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa" } }));
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: () => false,
+		execFn: async () => cannedProbe({ running: true, status: "running", containerStatus: "running", exitCode: undefined }),
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		await runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], statusPoll: "60s" });
+		// Inject durable wakes for the group itself and one valid member directly.
+		const inject = async (entry: OutboxEntry): Promise<void> => {
+			const disk = await readState(statePath);
+			await fs.writeFile(statePath, `${JSON.stringify({ version: 3, alarms: disk.alarms, outbox: [...disk.outbox, entry] }, null, 2)}
+`);
+			await runtime.reconcileFromDisk();
+		};
+		await inject({ eventId: "g:1:x", alarmId: "g", alarmName: "G", triggeredAt: 1000, events: [{ kind: "timer", fingerprint: "g:1" }], message: "[Wake alarm] G (g)" });
+		await inject({ eventId: "g-2:1:y", alarmId: "g-2", alarmName: "G #2", triggeredAt: 1000, events: [{ kind: "timer", fingerprint: "g-2:1" }], message: "[Wake alarm] G #2 (g-2)" });
+		await runtime.runAction({ action: "ack", id: "g" });
+		const after = readStateSync(statePath);
+		assert.equal(after.outbox.length, 0, "group and valid-member wakes are purged by ack(group)");
+	} finally {
+		await runtime.stop();
+	}
+});

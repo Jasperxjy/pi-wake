@@ -1852,10 +1852,20 @@ export class WakeAlarmRuntime {
 				case "ack": {
 					if (!params.id) throw new Error("id is required for ack");
 					const id = validateAlarmId(params.id);
-					const alarm = this.alarms.get(id);
-					const targets = alarm?.kind === "group" ? [id, ...alarm.memberIds] : [id];
-					let dropped = 0;
-					for (const target of targets) dropped += await this.purgeOutboxEntries(target);
+					// The purge set is derived from the FRESH disk state inside ONE transaction,
+					// and only wakes of the alarm itself plus ownership-valid members are
+					// dropped — a same-id replacement's durable wakes are never collateral.
+					const dropped = await this.commitAlarmSet(async (disk) => {
+						const diskAlarm = disk.alarms.find((candidate) => candidate.id === id);
+						const ids = new Set<string>([id]);
+						if (diskAlarm?.kind === "group") {
+							for (const memberId of diskAlarm.memberIds) {
+								if (this.ownedGroupMember(disk.alarms.find((candidate) => candidate.id === memberId), diskAlarm)) ids.add(memberId);
+							}
+						}
+						const outbox = disk.outbox.filter((entry) => !ids.has(entry.alarmId));
+						return { alarms: disk.alarms, outbox, adopted: new Map(), adoptedOutbox: outbox, result: disk.outbox.length - outbox.length };
+					});
 					this.schedule();
 					return dropped ? `Acknowledged ${id}: dropped ${dropped} undelivered wake(s).` : `No undelivered wakes for ${id}.`;
 				}
