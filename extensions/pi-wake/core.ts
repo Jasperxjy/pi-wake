@@ -529,7 +529,7 @@ export function applyBaseline(alarm: ContainerAlarmState, probe: ProbeResult, no
 function addEvent(alarm: ContainerAlarmState, next: ContainerAlarmState, events: FiredEvent[], kind: ContainerEventKind, fingerprint: string, evidence?: string): void {
 	if (!alarm.events.includes(kind) || next.eventFingerprints[kind] === fingerprint) return;
 	next.eventFingerprints[kind] = fingerprint;
-	events.push({ kind, fingerprint, evidence });
+	events.push({ kind, fingerprint, evidence: persistedEvidence(evidence) });
 }
 
 export function applyContainerDeadline(alarm: ContainerAlarmState, now: number): { state: ContainerAlarmState; events: FiredEvent[] } {
@@ -601,7 +601,7 @@ export function applyProbe(alarm: ContainerAlarmState, probe: ProbeResult, now: 
 
 	if (fired.length) {
 		next.lastTriggeredAt = now;
-		next.lastEvidence = fired.find((event) => event.evidence)?.evidence;
+		next.lastEvidence = persistedEvidence(fired.find((event) => event.evidence)?.evidence);
 		if (alarm.policy === "pause") {
 			next.active = false;
 			next.pauseReason = `triggered: ${fired.map((event) => event.kind).join(", ")}`;
@@ -627,10 +627,10 @@ export function applyCheckFailure(alarm: ContainerAlarmState, now: number, maxCo
 		lastContainerStatus: `connection failure (${failures}/${maxConsecutiveFailures})`,
 		nextCheckAt: deadlineAfter(now, alarm.statusPollMs, "next check"),
 		lastTriggeredAt: shouldFire ? now : alarm.lastTriggeredAt,
-		lastEvidence: shouldFire ? reason : alarm.lastEvidence,
+		lastEvidence: shouldFire ? persistedEvidence(reason) : alarm.lastEvidence,
 		pauseReason: shouldFire && alarm.policy === "pause" ? "triggered: connection-failure" : alarm.pauseReason,
 	};
-	return { state: next, events: shouldFire ? [{ kind: "connection-failure", fingerprint: eventFingerprints["connection-failure"]!, evidence: reason }] : [] };
+	return { state: next, events: shouldFire ? [{ kind: "connection-failure", fingerprint: eventFingerprints["connection-failure"]!, evidence: persistedEvidence(reason) }] : [] };
 }
 
 export function resumeAlarm(alarm: AlarmState, now: number): AlarmState {
@@ -901,13 +901,16 @@ export function createOutboxEntry(alarm: AlarmState, events: FiredEvent[], now: 
 	if (!events.length) throw new Error("outbox entries require at least one fired event");
 	const message = wakeMessage(alarm, events, now, Math.min(options?.maxEvidenceChars ?? 1000, 3000), options?.includeEvidence ?? true);
 	if (message.length > 4000) throw new Error("wake message exceeded the 4000 character delivery limit");
+	// Only clamp events that CARRY evidence: spreading evidence: undefined would
+	// add a key that the restore path rejects (optionalString honors key presence).
+	const durableEvents = events.map((event) => (event.evidence === undefined ? event : { ...event, evidence: persistedEvidence(event.evidence) }));
 	return {
 		eventId: `${alarm.id}:${now}:${randomUUID().slice(0, 8)}`,
 		alarmId: alarm.id,
 		alarmName: alarm.name,
 		ownerSessionFile: alarm.ownerSessionFile,
 		triggeredAt: now,
-		events,
+		events: durableEvents,
 		message,
 	};
 }
@@ -916,6 +919,49 @@ export function sanitizeExcerpt(value: string, maxChars: number): string {
 	const withoutAnsi = value.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
 	const safe = withoutAnsi.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "�");
 	return safe.length <= maxChars ? safe : `…${safe.slice(-(maxChars - 1))}`;
+}
+
+/**
+ * Evidence bound for DURABLE storage (alarm.lastEvidence / outbox event
+ * evidence). Persistent state must stay within the 2000-char restore cap
+ * regardless of display-side limits like maxEvidenceChars, which only bound
+ * the delivered wake message — so every write path clamps through here.
+ */
+export function persistedEvidence(value: string | undefined): string | undefined {
+	return value === undefined ? undefined : sanitizeExcerpt(value, 2000);
+}
+
+/**
+ * Serialization boundary guard: clamps every durable evidence field that the
+ * restore path caps at 2000 chars (alarm.lastEvidence, group alarm.summary,
+ * outbox event evidence). Mutates the records in place and returns how many
+ * fields were fixed. Used both before persisting (defense in depth) and as a
+ * startup migration so legacy states with overlong evidence load instead of
+ * failing restore.
+ */
+export function clampPersistedState(records: { version?: unknown; alarms?: unknown; outbox?: unknown }): number {
+	if (!Array.isArray(records.alarms) || !Array.isArray(records.outbox)) return 0;
+	let fixed = 0;
+	for (const alarm of records.alarms) {
+		if (typeof alarm !== "object" || alarm === null) continue;
+		const record = alarm as Record<string, unknown>;
+		for (const key of ["lastEvidence", "summary"] as const) {
+			const value = record[key];
+			if (typeof value === "string" && value.length > 2000) { record[key] = persistedEvidence(value); fixed++; }
+		}
+	}
+	for (const entry of records.outbox) {
+		if (typeof entry !== "object" || entry === null) continue;
+		const events = (entry as Record<string, unknown>).events;
+		if (!Array.isArray(events)) continue;
+		for (const event of events) {
+			if (typeof event !== "object" || event === null) continue;
+			const record = event as Record<string, unknown>;
+			const value = record.evidence;
+			if (typeof value === "string" && value.length > 2000) { record.evidence = persistedEvidence(value); fixed++; }
+		}
+	}
+	return fixed;
 }
 
 const OWNER_SESSION_FILE_RE = /^(?:[A-Za-z]:[\\/]|\\\\|\/)/;

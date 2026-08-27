@@ -1649,3 +1649,47 @@ test("group and condition states restore through the installed-package daemon (s
 		await runtime.stop();
 	}
 });
+
+test("legacy state with overlong evidence is clamped on load instead of failing restore", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa", allowedRemoteLogRoots: ["/data/results/"] } }));
+	const now = Date.now();
+	const overlong = "y".repeat(3000);
+	const legacy = {
+		version: 3,
+		alarms: [
+			{ id: "c1", name: "C1", kind: "container", active: true, createdAt: now, container: "job", events: ["exit"], policy: "keep", statusPollMs: 60_000, nextCheckAt: now, logOffset: 0, scanCarry: "", eventFingerprints: {}, consecutiveFailures: 0, failureNotified: false, lastEvidence: overlong, revision: 1 },
+			{ id: "done", name: "Done", kind: "condition", active: true, createdAt: now, path: "/data/results/analysis.json", condition: "exists", statusPollMs: 60_000, nextCheckAt: now, lastEvidence: overlong, revision: 1 },
+		],
+		outbox: [
+			{ eventId: "c1:1000:deadbeef", alarmId: "c1", alarmName: "C1", triggeredAt: 1000, events: [{ kind: "exit", fingerprint: "exit:abc:2026-01-01T00:00:00Z:0", evidence: overlong }], message: "[Wake alarm] C1 (c1)" },
+		],
+	};
+	await fs.writeFile(statePath, `${JSON.stringify(legacy, null, 2)}
+`);
+	const runtime = new WakeAlarmRuntime({ cwd: dir, configPath, statePath, emit: () => true, execFn: async () => cannedProbe({ running: true, status: "running", containerStatus: "running", exitCode: undefined }) });
+	try {
+		// Startup must succeed: the overlong fields are truncated, atomically
+		// rewritten, and only THEN restored.
+		await runtime.start({ flushPending: false });
+		assert.equal(runtime.alarmCount, 2, "both alarms restored after evidence migration");
+		// The migration is durable: the on-disk state no longer carries overlong evidence.
+		const disk = readStateSync(statePath);
+		const c1 = disk.alarms.find((alarm) => alarm.id === "c1");
+		const done = disk.alarms.find((alarm) => alarm.id === "done");
+		assert.ok(c1?.kind === "container" && typeof c1.lastEvidence === "string" && c1.lastEvidence.length <= 2000, "container lastEvidence clamped on disk");
+		assert.ok(done?.kind === "condition" && typeof done.lastEvidence === "string" && done.lastEvidence.length <= 2000, "condition lastEvidence clamped on disk");
+		assert.equal(disk.outbox[0]!.events[0].evidence!.length, 2000, "outbox event evidence clamped on disk");
+		// A second cold start over the migrated state is stable (no rewrite churn).
+		await runtime.stop();
+		const again = new WakeAlarmRuntime({ cwd: dir, configPath, statePath, emit: () => true, execFn: async () => cannedProbe({ running: true, status: "running", containerStatus: "running", exitCode: undefined }) });
+		await again.start({ flushPending: false });
+		assert.equal(again.alarmCount, 2, "restart after migration restores cleanly");
+		await again.stop();
+	} finally {
+		await runtime.stop();
+	}
+});

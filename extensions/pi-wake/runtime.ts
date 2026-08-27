@@ -25,6 +25,8 @@ import {
 	restoreOutbox,
 	resumeAlarm,
 	sanitizeExcerpt,
+	persistedEvidence,
+	clampPersistedState,
 	timerDelay,
 	validateAlarmId,
 	validateContainer,
@@ -532,6 +534,14 @@ export class WakeAlarmRuntime {
 				await this.migrateStateUnderLock();
 				return;
 			}
+			if (clampPersistedState(raw) > 0) {
+				// Legacy state with overlong evidence: rewrite the clamp under the
+				// state lock (migrateStateUnderLock re-reads the freshest file inside
+				// the critical section and clamps again idempotently), so restore
+				// succeeds instead of failing on a too-long evidence string.
+				await this.migrateStateUnderLock();
+				return;
+			}
 			await this.adoptVersionedState(raw);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`Cannot restore ${path.basename(this.statePath)}: ${(error as Error).message}`);
@@ -566,6 +576,11 @@ export class WakeAlarmRuntime {
 		await this.withStateLock(async () => {
 			const raw = JSON.parse(await fs.readFile(this.statePath, "utf8")) as Record<string, unknown>;
 			if (raw.version === 3) {
+				const fixed = clampPersistedState(raw);
+				if (fixed > 0) {
+					await this.writeFullStateLocked(raw.alarms as unknown as AlarmState[], raw.outbox as unknown as OutboxEntry[]);
+					console.log(`[pi-wake] migrated ${fixed} overlong evidence field(s) in ${path.basename(this.statePath)}`);
+				}
 				await this.adoptVersionedState(raw);
 				return;
 			}
@@ -722,6 +737,9 @@ export class WakeAlarmRuntime {
 		await this.stateLock.verifyHeld();
 		const temp = `${this.statePath}.tmp-${process.pid}-${Date.now()}`;
 		const data: StoredState = { version: 3, alarms, outbox };
+		// Serialization boundary guard: never let overlong evidence reach disk.
+		const clamped = clampPersistedState(data);
+		if (clamped > 0) console.warn(`[pi-wake] clamped ${clamped} overlong evidence field(s) before persisting state`);
 		await fs.writeFile(temp, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 		try { await this.renameWithRetry(temp, this.statePath); }
 		catch (error) { await fs.rm(temp, { force: true }); throw error; }
@@ -983,7 +1001,13 @@ export class WakeAlarmRuntime {
 	/** Commit a fire transition and (when emitting) append the outbox entry in one locked transaction. */
 	/** Every persisted change bumps the alarm's revision: revision is the version signal for all caches. */
 	private bump<T extends AlarmState>(alarm: T, patch: Partial<T>): T {
-		return { ...alarm, ...patch, revision: (alarm.revision ?? 0) + 1 } as T;
+		// Durable evidence fields must stay within the 2000-char restore cap:
+		// every state mutation funnels through here, so clamp at the boundary.
+		const clamped: Partial<T> = { ...patch };
+		const durable = clamped as unknown as { lastEvidence?: string; summary?: string };
+		if (typeof durable.lastEvidence === "string") durable.lastEvidence = persistedEvidence(durable.lastEvidence);
+		if (typeof durable.summary === "string") durable.summary = persistedEvidence(durable.summary);
+		return { ...alarm, ...clamped, revision: (alarm.revision ?? 0) + 1 } as T;
 	}
 
 	private outboxCapacityFree(disk: StoredState, alarmId: string, extra: number): boolean {
@@ -1244,7 +1268,7 @@ export class WakeAlarmRuntime {
 				}
 				const pending = this.pendingConditionOutcome(disk, diskAlarm, shouldEmit);
 				if (pending) return pending;
-				const next = this.bump(diskAlarm, { lastEvidence: reason, nextCheckAt: Date.now() + diskAlarm.statusPollMs });
+				const next = this.bump(diskAlarm, { lastEvidence: persistedEvidence(reason), nextCheckAt: Date.now() + diskAlarm.statusPollMs });
 				const alarms = disk.alarms.map((candidate) => (candidate.id === id ? next : candidate));
 				return { alarms, outbox: disk.outbox, adopted: new Map([[id, next]]), result: { alarm: next, events: [] } };
 			});
@@ -1263,7 +1287,7 @@ export class WakeAlarmRuntime {
 			const satisfied = diskAlarm.condition === "exists" ? result.exists
 				: diskAlarm.condition === "contains" ? result.exists && result.tail.includes(diskAlarm.value ?? "")
 				: result.exists && result.size >= (diskAlarm.minSize ?? 0);
-			const tailEvidence = result.exists ? tailLines(result.tail, 10) : undefined;
+			const tailEvidence = result.exists ? persistedEvidence(tailLines(result.tail, 10)) : undefined;
 			if (!satisfied) {
 				const next = this.bump(diskAlarm, { lastSatisfied: false, lastSize: result.size, lastEvidence: tailEvidence, nextCheckAt: now + diskAlarm.statusPollMs });
 				const alarms = disk.alarms.map((candidate) => (candidate.id === id ? next : candidate));

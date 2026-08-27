@@ -1,6 +1,6 @@
 {
 	"name": "pi-wake",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"description": "Programmable event subscriptions for the Pi coding agent: one-shot timers, remote container watches, batch barriers (watch_container_group) and completion-file conditions that wake the same agent session — in-session or via a headless-resume daemon.",
 	"keywords": [
 		"pi-package",

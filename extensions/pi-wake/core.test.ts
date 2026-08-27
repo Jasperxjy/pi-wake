@@ -16,6 +16,7 @@ import {
 	createOutboxEntry,
 	createTimerAlarm,
 	deadlineAfter,
+	clampPersistedState,
 	fileReadWindow,
 	leaseIsAlive,
 	nextAlarmDueAt,
@@ -642,3 +643,45 @@ test("real Python condition probe handles a file without a container field", { s
 	assert.equal(missing.size, 0);
 });
 
+test("overlong tail evidence is clamped to the 2000-char durable cap at every write path", () => {
+	const longLine = "x".repeat(3000);
+	const tail = `${longLine}\n${longLine}`;
+	const base = {
+		id: "c1", name: "C1", kind: "container" as const, active: true, createdAt: 1000,
+		container: "job", events: ["exit", "abnormal", "connection-failure"] as const, policy: "pause" as const,
+		statusPollMs: 60_000, nextCheckAt: 2000, logOffset: 0, scanCarry: "",
+		eventFingerprints: {}, consecutiveFailures: 0, failureNotified: false,
+		logTailLines: 1,
+	};
+	const probe = {
+		exists: true, running: false, containerStatus: "exited", exitCode: 0,
+		oomKilled: false, containerId: "abc", startedAt: "2026-01-01T00:00:00Z",
+		tail, logBytes: new Uint8Array(0), logReset: false, logOffset: 0, fileId: "1:2",
+	};
+	const outcome = applyProbe(base as never, probe as never, 4000);
+	const event = outcome.events.find((value) => value.kind === "exit")!;
+	assert.ok(event.evidence, "exit event carries the tail evidence");
+	assert.ok(event.evidence!.length <= 2000, `event evidence clamped (${event.evidence!.length})`);
+	assert.ok(outcome.state.lastEvidence!.length <= 2000, "lastEvidence clamped");
+	// The clamp preserves the END of the evidence (the informative part).
+	assert.ok(outcome.state.lastEvidence!.endsWith("xxx"), "tail suffix survives");
+	assert.ok(outcome.state.lastEvidence!.startsWith("…"), "clamp marker present");
+	// applyCheckFailure clamps its reason the same way.
+	const failed = applyCheckFailure(base as never, 4000, 1, "boom " + tail);
+	assert.ok(failed.state.lastEvidence!.length <= 2000, "failure reason clamped");
+	// createOutboxEntry clamps event evidence for the durable outbox.
+	const entry = createOutboxEntry(base as never, [{ kind: "exit", fingerprint: "exit:f", evidence: tail }], 4000);
+	assert.ok(entry.events[0].evidence!.length <= 2000, "outbox event evidence clamped");
+	// clampPersistedState returns the number of fixed fields and truncates in place.
+	const raw = {
+		version: 3,
+		alarms: [{ id: "c1", kind: "container", lastEvidence: tail, summary: tail }],
+		outbox: [{ eventId: "e", alarmId: "c1", events: [{ kind: "exit", evidence: tail }] }],
+	};
+	const fixed = clampPersistedState(raw);
+	assert.equal(fixed, 3, "three overlong fields detected");
+	assert.ok((raw.alarms[0] as { lastEvidence: string }).lastEvidence.length <= 2000);
+	assert.ok((raw.outbox[0].events[0] as { evidence: string }).evidence.length <= 2000);
+	// Already-short data is untouched.
+	assert.equal(clampPersistedState({ version: 3, alarms: [{ lastEvidence: "ok" }], outbox: [] }), 0);
+});

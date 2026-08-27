@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 (2026-08-27)
+
+- **FIX: persistent evidence is now hard-capped at 2000 chars on every write path** — `applyProbe` tail evidence, `applyCheckFailure` reason, condition probe tails, group summaries, and outbox event evidence all clamp through `persistedEvidence()`; a serialization boundary guard (`clampPersistedState`) plus the `bump()` entry point guarantee nothing overlong ever reaches disk again (previously `maxEvidenceChars` only bounded the delivered message, so a single 3KB log line could make `lastEvidence` exceed the 2000-char restore cap and fail startup with `Cannot restore`).
+- **Compatibility migration**: legacy v3 states whose `lastEvidence`/`summary`/outbox evidence already exceed 2000 chars are now clamped and atomically rewritten under the state lock at load instead of being rejected — the daemon starts and the migrated state is durable.
+- **Tests**: overlong-tail clamp core test (every write path), legacy-state migration integration test (cold start clamps + rewrites + second cold start is stable), CI package gate now ships a 3KB-evidence fixture and requires the installed daemon to log the migration and restore all alarms.
+
 ## 0.1.0 (unreleased)
 
 Initial public release.
