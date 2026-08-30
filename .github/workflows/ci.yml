@@ -100,14 +100,21 @@ jobs:
           node -e "const fs=require('fs');const now=Date.now();const overlong='y'.repeat(3000);const c=(i)=>({id:'g-'+i,name:'G #'+i,kind:'container',active:true,createdAt:now,container:'job-'+['a','b'][i-1],events:['exit'],policy:'keep',statusPollMs:60000,nextCheckAt:now,logOffset:0,scanCarry:'',eventFingerprints:{},consecutiveFailures:0,failureNotified:false,groupId:'g',revision:1,lastEvidence:overlong});fs.writeFileSync(process.argv[1],JSON.stringify({version:3,alarms:[{id:'g',name:'G',kind:'group',active:true,createdAt:now,memberIds:['g-1','g-2'],condition:'all_terminal',required:2,statusPollMs:60000,nextCheckAt:now,revision:1},c(1),c(2),{id:'done',name:'Done',kind:'condition',active:true,createdAt:now,path:'/data/results/analysis.json',condition:'exists',statusPollMs:60000,nextCheckAt:now,revision:1,lastEvidence:overlong}],outbox:[]}))" "$TMP/.pi/wake-alarm.state.json"
           WAKE_ALARM_CWD="$TMP" WAKE_ALARM_STATE_PATH="$TMP/.pi/wake-alarm.state.json" WAKE_ALARM_SPAWN_DRY_RUN=1 node node_modules/pi-wake/dist/daemon.js >fixture.log 2>&1 &
           FPID=$!
-          sleep 6
-          kill "$FPID" 2>/dev/null || true
-          wait "$FPID" 2>/dev/null || true
+          # Poll for activation instead of a fixed sleep: the single-instance guard
+          # adds a 1-2.5s stagger before activation, and runner load varies.
+          for i in $(seq 1 40); do
+            grep -q "daemon active with 4 alarm(s)" fixture.log 2>/dev/null && break
+            sleep 0.5
+          done
           # The fixture carries overlong 3KB evidence: the installed daemon must
           # MIGRATE it (clamp + rewrite) and still restore all four alarms.
           grep -q "daemon active with 4 alarm(s)" fixture.log || { echo "::error::installed daemon cannot restore group/condition state: $(cat fixture.log)"; exit 1; }
           grep -q "migrated.*overlong evidence" fixture.log || { echo "::error::expected evidence migration log line: $(cat fixture.log)"; exit 1; }
+          # Check the heartbeat WHILE the daemon is alive: a clean SIGTERM shutdown
+          # correctly removes the file, so asserting after kill would always fail.
           test -s "$TMP/.pi/wake-alarm.daemon.json" || { echo "::error::daemon heartbeat file missing"; exit 1; }
+          kill "$FPID" 2>/dev/null || true
+          wait "$FPID" 2>/dev/null || true
           echo "group/condition state + overlong evidence migration + daemon heartbeat exercised by the installed daemon"
           echo "::endgroup::"
       - name: extension load smoke (real Pi, RPC mode)
