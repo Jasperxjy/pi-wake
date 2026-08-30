@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="150" viewBox="0 0 760 150" role="img" aria-label="npm downloads per day">
+ <title>pi-wake: npm downloads per day</title>
+ <rect width="760" height="150" fill="transparent"/>
+ <text x="10" y="16" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#8b949e">npm downloads / day — 5d window · total 425 · max 234/day</text>
+ <line x1="10" y1="30" x2="750" y2="30" stroke="#30363d" stroke-width="1"/>
+  <rect x="33.7" y="30.0" width="100.6" height="96.0" rx="1" fill="#4c8bf5"><title>2026-08-26: 234 download(s)</title></rect>
+  <rect x="181.7" y="66.0" width="100.6" height="60.0" rx="1" fill="#4c8bf5"><title>2026-08-27: 147 download(s)</title></rect>
+  <rect x="329.7" y="116.0" width="100.6" height="10.0" rx="1" fill="#4c8bf5"><title>2026-08-28: 24 download(s)</title></rect>
+  <rect x="477.7" y="118.0" width="100.6" height="8.0" rx="1" fill="#4c8bf5"><title>2026-08-29: 20 download(s)</title></rect>
+  <rect x="625.7" y="126.0" width="100.6" height="0.0" rx="1" fill="#30363d"><title>2026-08-30: 0 download(s)</title></rect>
+ <text x="10" y="142" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#8b949e">2026-08-26</text>
+ <text x="750" y="142" text-anchor="end" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#8b949e">[object Object] (daily refresh)</text>
+</svg>

@@ -1,0 +1,38 @@
+name: metrics
+
+# Daily npm-download chart for the README. The workflow refetches the full
+# history (tiny), regenerates .github/metrics/downloads.{json,svg}, and commits
+# with [skip ci] — ci.yml additionally ignores this path, so the daily data
+# commit never burns a 4-cell test matrix.
+on:
+  schedule:
+    - cron: "23 3 * * *" # daily, off-peak UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: metrics
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+      - run: node scripts/metrics.mjs
+      - name: Commit the refreshed chart
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/metrics
+          if git diff --cached --quiet; then
+            echo "no download-data change today"
+          else
+            git commit -m "metrics: refresh npm download chart [skip ci]"
+            git push
+          fi

@@ -2,6 +2,8 @@ name: ci
 
 on:
   push:
+    paths-ignore:
+      - ".github/metrics/**"
   pull_request:
 
 jobs:

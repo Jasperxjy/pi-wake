@@ -1,5 +1,7 @@
 # pi-wake
 
+[![npm version](https://img.shields.io/npm/v/pi-wake.svg)](https://www.npmjs.com/package/pi-wake) [![npm downloads/month](https://img.shields.io/npm/dm/pi-wake.svg)](https://www.npmjs.com/package/pi-wake) [![npm total](https://img.shields.io/npm/dt/pi-wake.svg)](https://www.npmjs.com/package/pi-wake)
+
 Programmable event subscriptions for the [Pi coding agent](https://github.com/earendil-works/pi). The agent names a condition — a point in time, a container exit, a line in a remote log — and pi-wake wakes **the same session** when it happens:
 
 - **While the session is open**, the wake is inserted into the running agent loop like a notification (queued behind any in-flight turn, never interrupting it).
@@ -252,6 +254,12 @@ Layout: `core.ts` (pure alarm/event logic) · `runtime.ts` (config, SSH probe, s
 - One-shot timers only (no recurring cron) — recurring schedules are deliberately out of scope; see pi-loop / pi-scheduler for in-session recurrence.
 - The headless resume path depends on Pi's `--session` / `--print` CLI surface (and `--approve` only with `headlessTrust: "always"`); track upstream changes when upgrading Pi.
 - Container watching is read-only over SSH (docker inspect + bounded log reads); it never mutates the remote host.
+
+## Downloads
+
+![npm downloads per day (last 60 days, refreshed daily)](.github/metrics/downloads.svg)
+
+Daily data is fetched from the [npm registry download API](https://api.npmjs.org/downloads/point/last-month/pi-wake) by a scheduled workflow and committed back to this repo. Note that registry counts include mirror pulls; downloads ≠ active users — the plugin is fully local and reports nothing.
 
 ## License
 
