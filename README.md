@@ -128,8 +128,10 @@ Conditions: `exists`, `contains` (literal substring in the file tail), `min_size
 
 ## How waking works
 
+**In-session delivery steers into the running turn.** A wake that fires while the agent is mid-turn is injected at the next model step (`deliverAs: "steer"` — the agent loop drains the steering queue before every LLM request), so it interleaves between tool calls like an extra tool result: `思考 → 启动容器 → set_timer → … → 调用工具 → [wake 提醒] → 查看结果`. An idle session gets `triggerTurn` — an immediate new turn.
+
 ```
-session open   →  in-process scheduler → sendMessage(triggerTurn, followUp)  →  wake appears in the live loop
+session open   →  in-process scheduler → sendMessage(triggerTurn, steer)   →  wake lands in the live loop (mid-turn at the next model step)
 session closed →  daemon (owner offline)  → pi --session <owner> --print …   →  same session continues headlessly
 ```
 

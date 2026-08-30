@@ -99,7 +99,12 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		// The outbox entry carries a bounded message snapshot built at fire time with
 		// the configured evidence policy; delivery never recomputes it from the
 		// current alarm state, so a pause/reset in the meantime cannot change it.
-		pi.sendMessage({ customType: "wake-alarm", content: entry.message, display: true, details: { alarmId: entry.alarmId, eventId: entry.eventId, events: entry.events.map((event) => event.kind) } }, { triggerTurn: true, deliverAs: "followUp" });
+		// deliverAs "steer": a wake that fires while the agent is mid-turn is injected
+		// into the RUNNING turn at the next model step (the agent loop drains the
+		// steering queue before every LLM request) — the wake interleaves between
+		// tool calls instead of piling up at the turn boundary. An idle session
+		// still gets triggerTurn => an immediate new turn.
+		pi.sendMessage({ customType: "wake-alarm", content: entry.message, display: true, details: { alarmId: entry.alarmId, eventId: entry.eventId, events: entry.events.map((event) => event.kind) } }, { triggerTurn: true, deliverAs: "steer" });
 		return true;
 	}
 

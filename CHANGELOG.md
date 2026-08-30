@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 (2026-08-30)
+
+- **In-session wakes now steer into the running turn** (`deliverAs: "steer"` instead of `"followUp"`): a wake that fires mid-turn is injected at the next model step — the agent loop drains the steering queue before every LLM request — so wakes interleave between tool calls like tool results instead of piling up at the turn boundary. Idle sessions still get an immediate new turn (triggerTurn). New extension-shell test pins the delivery contract; no state or protocol change.
+
 ## 0.2.0 (2026-08-30)
 
 Usability release driven by real-world usage feedback (30-min-late wake + duplicate delivery incident debrief).
