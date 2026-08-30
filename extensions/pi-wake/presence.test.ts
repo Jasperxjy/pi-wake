@@ -34,6 +34,13 @@ test("daemon heartbeat round-trips and liveness follows freshness", async () => 
 	assert.equal(stale.live, false);
 	assert.ok((stale.ageMs ?? 0) > DAEMON_HEARTBEAT_FRESH_MS);
 	assert.equal(stale.heartbeat?.logTail.length, 2, "the log tail survives for post-mortem");
+	// A FRESH heartbeat whose pid no longer exists is also dead: a hard-killed
+	// daemon (TerminateProcess/SIGKILL) leaves exactly this behind, and treating
+	// it as live would make every successor step down for the whole window.
+	await writeDaemonHeartbeat(dir, beat({ pid: 999_999_001 }));
+	const orphan = await readDaemonLiveness(dir);
+	assert.equal(orphan.live, false, "fresh heartbeat from a dead pid is not live");
+	assert.ok((orphan.ageMs ?? Infinity) < DAEMON_HEARTBEAT_FRESH_MS, "age is still reported for diagnosis");
 	// Absent or garbage files degrade to "not live", never throw.
 	await fs.rm(daemonHeartbeatPath(dir));
 	assert.equal((await readDaemonLiveness(dir)).live, false);
@@ -43,11 +50,11 @@ test("daemon heartbeat round-trips and liveness follows freshness", async () => 
 
 test("clearDaemonHeartbeat removes only its own file", async () => {
 	const dir = await makeDir();
-	await writeDaemonHeartbeat(dir, beat({ pid: 4242 }));
+	await writeDaemonHeartbeat(dir, beat({ pid: process.pid }));
 	await clearDaemonHeartbeat(dir, 1111); // a different (newer) daemon's takeover must survive
 	const kept = await readDaemonLiveness(dir);
-	assert.equal(kept.live, true, "a fresh foreign heartbeat is untouched");
-	assert.equal(kept.heartbeat?.pid, 4242);
-	await clearDaemonHeartbeat(dir, 4242);
+	assert.equal(kept.live, true, "a fresh heartbeat from a live pid is untouched");
+	assert.equal(kept.heartbeat?.pid, process.pid);
+	await clearDaemonHeartbeat(dir, process.pid);
 	await assert.rejects(fs.readFile(daemonHeartbeatPath(dir)), /ENOENT/, "own heartbeat removed on shutdown");
 });

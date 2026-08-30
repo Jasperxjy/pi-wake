@@ -90,6 +90,10 @@ jobs:
           fi
           echo "daemon started via node_modules/.bin/pi-wake-daemon"
           echo "::endgroup::"
+          # The smoke daemon was hard-killed (TerminateProcess on Windows runs no
+          # cleanup), so its heartbeat may still look fresh; remove it so the
+          # fixture daemon below starts from a clean slate.
+          rm -f "$TMP/.pi/wake-alarm.daemon.json"
           echo "::group::group/condition state fixture restore"
           # Release gate: the installed daemon must restore a v3 state containing
           # group and condition alarms (the regression that shipped 0.1.0 with

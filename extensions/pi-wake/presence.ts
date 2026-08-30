@@ -148,8 +148,11 @@ export async function readDaemonLiveness(cwd: string): Promise<DaemonLiveness> {
 		const raw = JSON.parse((await fs.readFile(daemonHeartbeatPath(cwd), "utf8")).trim()) as Partial<DaemonHeartbeat>;
 		if (typeof raw.heartbeatAt !== "number" || typeof raw.pid !== "number") return { live: false };
 		const ageMs = Date.now() - raw.heartbeatAt;
+		// Fresh AND the pid still exists: a daemon that was hard-killed
+		// (TerminateProcess / SIGKILL never runs the cleanup) leaves a fresh-looking
+		// heartbeat behind; its pid being gone is the proof it cannot be writing.
 		return {
-			live: ageMs >= 0 && ageMs <= DAEMON_HEARTBEAT_FRESH_MS,
+			live: ageMs >= 0 && ageMs <= DAEMON_HEARTBEAT_FRESH_MS && pidAlive(raw.pid),
 			heartbeat: { version: 1, pid: raw.pid, startedAt: raw.startedAt ?? raw.heartbeatAt, heartbeatAt: raw.heartbeatAt, dryRun: Boolean(raw.dryRun), logTail: Array.isArray(raw.logTail) ? raw.logTail.slice(-DAEMON_LOG_TAIL_LINES).map((line) => String(line)) : [] },
 			ageMs,
 		};
