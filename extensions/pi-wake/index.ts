@@ -3,16 +3,21 @@ import path from "node:path";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { OutboxEntry } from "./core.ts";
+import { spawn } from "node:child_process";
+import { access } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import {
 	PRESENCE_DIR_NAME,
 	leaderInstanceId,
 	listLivePresences,
+	readDaemonLiveness,
 	registerPresence,
 	releasePresence,
 } from "./presence.ts";
 import {
 	ACTION_ENUM,
 	WakeAlarmRuntime,
+	readOnlySnapshot,
 	type ToolParams,
 } from "./runtime.ts";
 
@@ -39,6 +44,7 @@ const TOOL_PARAMETERS = Type.Object({
 	path: Type.Optional(Type.String({ description: "Absolute remote file path for watch_condition (must be under allowedRemoteLogRoots)" })),
 	value: Type.Optional(Type.String({ description: "Literal substring for the contains condition" })),
 	minSize: Type.Optional(Type.Integer({ description: "Byte threshold for the min_size condition" })),
+	ignoreBefore: Type.Optional(Type.String({ description: "watch_condition only: ignore files last modified before this time (absolute ISO timestamp with timezone, or relative like '5m'); guards against stale markers from previous runs" })),
 	purgePendingEvents: Type.Optional(Type.Boolean({ description: "remove also clears this alarm's undelivered wakes" })),
 });
 
@@ -53,6 +59,7 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	let presenceFailures = 0;
 	let presenceWarned = false;
 	let uiNotify: ((message: string) => void) | undefined;
+	let cwd = "";
 
 	async function refreshPresence(): Promise<void> {
 		if (!presenceDir) return;
@@ -97,20 +104,97 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	}
 
 	async function runAction(params: ToolParams): Promise<string> {
-		if (!runtime) throw new Error("wake alarm has not received session_start");
+		if (!runtime) {
+			// Diagnostic entry points stay usable even when the runtime is dead (failed
+			// session_start, foreign project): list/list_wakes/check degrade to a
+			// read-only disk snapshot instead of a hard refusal.
+			if (params.action === "list" || params.action === "check") return readOnlySnapshot({ cwd, filterId: params.id });
+			if (params.action === "list_wakes") return readOnlySnapshot({ cwd });
+			throw new Error("wake alarm has not received session_start; list/list_wakes/check work read-only");
+		}
 		return runtime.runAction(params, { ownerSessionFile });
+	}
+
+	// ---- daemon liveness + auto-spawn -------------------------------------
+	// Wakes that fire while ALL sessions are closed are delivered by the daemon.
+	// Sessions therefore (a) surface a missing daemon and (b) start one, so the
+	// "set a watch, close the laptop, never get woken" failure mode cannot happen
+	// silently. spawnDaemon:false (or WAKE_ALARM_NO_AUTOSPAWN=1) keeps manual control.
+	let daemonSpawnedAt = 0;
+	let daemonWarned = false;
+
+	function daemonAutoSpawnAllowed(): boolean {
+		if (passive || process.env.WAKE_ALARM_NO_AUTOSPAWN === "1") return false;
+		const config = runtime?.runtimeConfig;
+		return config ? config.spawnDaemon : true;
+	}
+
+	/** Prefer the built daemon when the package ships dist/ (published install);
+	 * fall back to the TS source (repo checkout, Node >= 22.19 type stripping). */
+	let daemonEntryCache: string | undefined;
+
+	async function resolveDaemonEntry(): Promise<string | undefined> {
+		if (daemonEntryCache) return daemonEntryCache;
+		// jiti may load this extension as CJS where import.meta.url is unavailable;
+		// fall back to __filename before giving up (the note path still degrades safely).
+		let base: string | undefined;
+		try { base = fileURLToPath(new URL(".", import.meta.url)); } catch { /* CJS host */ }
+		if (!base) { try { const filename = (globalThis as Record<string, unknown>).__filename; if (typeof filename === "string") base = path.dirname(filename); } catch { /* no CJS handle either */ } }
+		if (!base) return undefined;
+		for (const candidate of [path.resolve(base, "..", "..", "dist", "daemon.js"), path.resolve(base, "daemon.ts")]) {
+			try { await access(candidate); daemonEntryCache = candidate; return candidate; } catch { /* try next */ }
+		}
+		return undefined;
+	}
+
+	async function ensureDaemon(): Promise<string> {
+		if (!daemonAutoSpawnAllowed()) return daemonWarned ? "" : "daemon auto-start disabled";
+		const liveness = await readDaemonLiveness(cwd);
+		if (liveness.live) return "";
+		if (Date.now() - daemonSpawnedAt < 60_000) return "";
+		const entry = await resolveDaemonEntry();
+		if (!entry) return "no pi-wake daemon entry found (package incomplete?)";
+		try {
+			const child = spawn(process.execPath, [entry], { cwd, detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env, WAKE_ALARM_CWD: cwd } });
+			child.unref();
+			daemonSpawnedAt = Date.now();
+			return `started pi-wake daemon (pid ${child.pid ?? "?"})`;
+		} catch (error) {
+			return `cannot start the pi-wake daemon: ${(error as Error).message}`;
+		}
+	}
+
+	async function daemonNote(action: string): Promise<string> {
+		if (action !== "set_timer" && action !== "watch_container" && action !== "watch_container_group" && action !== "watch_condition") return "";
+		const outcome = await ensureDaemon();
+		if (!outcome) return "";
+		if (outcome.startsWith("started")) return ` (${outcome}; it delivers wakes while all sessions are closed)`;
+		if (!daemonWarned) {
+			daemonWarned = true;
+			uiNotify?.(`Wake alarm: ${outcome}; wakes that fire while all sessions are closed stay in the outbox until the next session`);
+		}
+		return ` (note: ${outcome})`;
 	}
 
 	pi.registerTool({
 		name: "wake_alarm",
 		label: "Wake Alarm",
-		description: "Set and manage persistent alarms: one-shot timers, remote Docker container watches, batch barriers over many containers (watch_container_group — ONE summary wake when any/all/required members are terminal), completion-file conditions (watch_condition — a remote result file exists/contains a marker/reaches a size), bounded container log tails in exit wakes (logTailLines), and an explicit outbox (list_wakes, drop_wake, purge_wakes, ack). Deterministic polling never wakes the model unless a configured event occurs.",
+		description: "Set and manage persistent alarms: one-shot timers, REMOTE Docker container watches over SSH (watch_container probes Docker on the configured remote host, not locally), batch barriers over many containers (watch_container_group — ONE summary wake when any/all/required members are terminal), completion-file conditions (watch_condition — a remote result file exists/contains a marker/reaches a size), bounded container log tails in exit wakes (logTailLines), and an explicit outbox (list_wakes, drop_wake, purge_wakes, ack). Wakes that fire while ALL sessions are closed are delivered by the pi-wake daemon (auto-started; heartbeat in .pi/wake-alarm.daemon.json). Deterministic polling never wakes the model unless a configured event occurs.",
 		promptSnippet: "Set named timers, container/group barriers, and completion-file conditions; manage wakes with ack/drop_wake",
-		promptGuidelines: ["Use wake_alarm as a scheduling/event primitive. Prefer one watch_container_group for multi-container batches instead of many individual alarms: it emits a single summary wake. Alarm names are short labels, not plans or continuation instructions. Use ack/drop_wake to clear undelivered wakes you have already acted on."],
+		promptGuidelines: [
+			"Use wake_alarm as a scheduling/event primitive. Prefer one watch_container_group for multi-container batches instead of many individual alarms: it emits a single summary wake. Alarm names are short labels, not plans or continuation instructions. Use ack/drop_wake to clear undelivered wakes you have already acted on.",
+			"Wake delivery when all sessions are closed depends on the pi-wake daemon; if the tool result notes no live daemon, start one or expect wakes to wait in the outbox until the next session (list_wakes shows them).",
+			"Reuse one alarm id for retries of the same watch (reset) instead of remove+recreate — ids are cheap identities, not one-shot handles. Keep logTailLines small (5-20); evidence is capped at 2000 chars on disk.",
+			"watch_condition 'exists' cannot tell a stale marker from a fresh one: have drivers write run-specific markers inside the run directory that gets cleaned, prefer contains with a run-specific value, or set ignoreBefore so files older than the watch are ignored.",
+		],
 		parameters: TOOL_PARAMETERS,
 		async execute(_toolCallId, params) {
 			const details: { action: string; error?: boolean } = { action: params.action as string };
-			try { const text = await runAction(params as ToolParams); return { content: [{ type: "text" as const, text }], details }; }
+			try {
+				const text = await runAction(params as ToolParams);
+				const note = await daemonNote(params.action as string).catch(() => "");
+				return { content: [{ type: "text" as const, text: note ? `${text}${note}` : text }], details };
+			}
 			catch (error) { return { content: [{ type: "text" as const, text: `Wake alarm error: ${(error as Error).message}` }], details: { ...details, error: true } }; }
 		},
 	});
@@ -133,6 +217,7 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+		cwd = ctx.cwd;
 		passive = process.env.WAKE_ALARM_PASSIVE === "1";
 		ownerSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 		isLeader = false;
@@ -178,6 +263,9 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		const current = runtime;
 		runtime = undefined;
 		if (current) await current.stop();
+		// Closing the (possibly last) session: leave a live daemon behind so
+		// pending wakes still fire. Best effort — spawnDaemon:false users manage it.
+		await ensureDaemon().catch(() => "");
 		if (presenceDir) { await releasePresence(presenceDir, instanceId); presenceDir = undefined; }
 	});
 }

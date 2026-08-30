@@ -27,7 +27,7 @@ import { promises as fs, realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { buildResumeArgs, type AlarmState, type OutboxEntry } from "./core.ts";
-import { PRESENCE_DIR_NAME, isSessionFileLive, listLivePresences, type PresenceRecord } from "./presence.ts";
+import { PRESENCE_DIR_NAME, clearDaemonHeartbeat, isSessionFileLive, listLivePresences, writeDaemonHeartbeat, type PresenceRecord } from "./presence.ts";
 import { WakeAlarmRuntime, type EmitFn, type ExecFn } from "./runtime.ts";
 
 const PRESENCE_POLL_MS = 5_000;
@@ -49,8 +49,20 @@ let active: WakeAlarmRuntime | undefined;
 let currentChild: ChildProcess | undefined;
 let livePresences: PresenceRecord[] = [];
 
+const LOG_RING: string[] = [];
+
 function log(message: string): void {
-	process.stdout.write(`[${new Date().toISOString()}] [pi-wake-daemon] ${message}\n`);
+	const line = `[${new Date().toISOString()}] [pi-wake-daemon] ${message}`;
+	process.stdout.write(line + "\n");
+	LOG_RING.push(line);
+	if (LOG_RING.length > 30) LOG_RING.shift();
+}
+
+const startedAt = Date.now();
+
+/** Heartbeat + recent log tail, so a dead daemon leaves its last words on disk. */
+async function heartbeat(): Promise<void> {
+	await writeDaemonHeartbeat(cwd, { version: 1, pid: process.pid, startedAt, heartbeatAt: Date.now(), dryRun, logTail: [...LOG_RING] }).catch((error) => log(`heartbeat write failed: ${(error as Error).message}`));
 }
 
 function sleep(ms: number): Promise<void> {
@@ -274,6 +286,7 @@ async function shutdown(signal: string): Promise<void> {
 	if (stopping) return;
 	stopping = true;
 	log(`received ${signal}; shutting down`);
+	await clearDaemonHeartbeat(cwd, process.pid).catch(() => undefined);
 	if (currentChild) currentChild.kill();
 	const runtime = active;
 	active = undefined;
@@ -311,6 +324,7 @@ async function main(): Promise<void> {
 				await runtime.start({ flushPending: false });
 				active = runtime;
 				log(`daemon active with ${runtime.alarmCount} alarm(s), ${livePresences.length} live session(s)`);
+				await heartbeat();
 			} catch (error) {
 				log(`activation failed: ${(error as Error).message}; retrying in ${ACTIVATION_RETRY_MS / 1000}s`);
 				await sleep(ACTIVATION_RETRY_MS);
@@ -322,6 +336,7 @@ async function main(): Promise<void> {
 			try { await active.resync(); }
 			catch (error) { log(`reconcile failed: ${(error as Error).message}`); }
 		}
+		await heartbeat();
 		await sleep(PRESENCE_POLL_MS);
 	}
 }

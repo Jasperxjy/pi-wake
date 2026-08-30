@@ -577,8 +577,9 @@ test("real Python condition probe handles a file without a container field", { s
 	};
 	const r1 = run(payload());
 	assert.equal(r1.status, 0, r1.stdout);
-	const parsed = JSON.parse(r1.stdout) as { exists?: boolean; size?: number; tailBase64?: string };
+	const parsed = JSON.parse(r1.stdout) as { exists?: boolean; size?: number; mtime?: number; tailBase64?: string };
 	assert.equal(parsed.exists, true);
+	assert.ok(Number.isSafeInteger(parsed.mtime) && Math.abs(Date.now() - (parsed.mtime ?? 0)) < 60_000, "condition probe reports the file mtime (stale-marker guard input)");
 	assert.equal(parsed.size, Buffer.byteLength('{"pass": true}\nline2\n'));
 	const tail = Buffer.from(String(parsed.tailBase64), "base64").toString("utf8");
 	assert.ok(tail.includes('"pass": true'), "contains condition sees the marker");

@@ -120,6 +120,8 @@ When an experiment's true completion is a result file rather than a container st
 
 Conditions: `exists`, `contains` (literal substring in the file tail), `min_size` (byte threshold with `minSize`). Fires once when satisfied, with a bounded tail excerpt as evidence; `reset` re-arms.
 
+**Stale markers**: `exists` cannot tell a fresh marker from one left behind by a previous run. Have drivers write run-specific markers into a directory that gets cleaned, prefer `contains` with a run-specific value, or set `ignoreBefore` (absolute ISO timestamp or relative like `"5m"`) — files last modified before the cutoff never satisfy the condition. Condition evidence carries both clocks: when the probe detected it, and `(file mtime: …)` when it actually happened.
+
 ### Wake result summaries
 
 `logTailLines` (1-200) on `watch_container` / `watch_container_group` attaches the last N container log lines to exit/abnormal wake evidence, so a wake can answer "what did it print at the end" without an extra SSH round-trip. Evidence stays sanitized, length-bounded, and labeled untrusted.
@@ -142,11 +144,13 @@ Every alarm created in a session records that session's file as its owner. Coord
 
 ### Running the daemon
 
+**Auto-start.** Sessions watch the daemon heartbeat (`.pi/wake-alarm.daemon.json`, rewritten every 5 s with pid + the last 30 log lines for post-mortem). When you create an alarm and no live daemon exists, the session starts one automatically (detached, `WAKE_ALARM_CWD` set to the project), and again on the way out when the last session closes. Set `"spawnDaemon": false` in `.pi/wake-alarm.json` (or `WAKE_ALARM_NO_AUTOSPAWN=1`) to manage the daemon yourself. Without a daemon, wakes that fire while all sessions are closed simply wait in the outbox until the next session starts.
+
 ```bash
 pi-wake-daemon            # from the project directory; installed as a bin by the package
 ```
 
-Run it from the project directory (or set `WAKE_ALARM_CWD`). Keep it alive with your service manager, e.g.:
+Or keep it alive with your service manager, e.g.:
 
 ```powershell
 # Windows
@@ -197,13 +201,14 @@ On Windows the daemon unwraps the npm `pi.cmd` shim and runs the CLI script with
   "maxOutboxEntriesPerAlarm": 100,
   "piCommand": null,
   "spawnOnWake": true,
+  "spawnDaemon": true,
   "runTimeout": "30m",
   "headlessTrust": "saved",
   "includeWakeEvidence": true
 }
 ```
 
-- `identityFile` is resolved relative to the config file; private key **paths only** — `password`/`passphrase`/`privateKey` fields are rejected.
+- `identityFile` is resolved relative to the `.pi/` directory that holds the config (write `"../keys/id_ed25519"` for a key stored outside `.pi/`); private key **paths only** — `password`/`passphrase`/`privateKey` fields are rejected. The tool error for a missing `remote` section embeds this minimal shape, so the schema is discoverable without the README.
 - `allowedRemoteLogRoots` constrains which remote log files may be read (realpath-checked remotely).
 - A headless wake run that exceeds `runTimeout` is terminated in two phases: a graceful termination request, a grace period, then a force-kill (process tree on Windows via `taskkill /T /F`). The delivery slot is only released after the woken Pi has actually exited (or the force-kill fallback deadline fires), so a retry cannot start a second Pi on the same session file while the old one still lives.
 - `headlessTrust` controls project trust for headless wake runs: `"saved"` (default) passes no approval flag, so a woken run only loads project resources when a saved Pi trust decision or `defaultProjectTrust` allows it; `"always"` adds `--approve`, trusting project resources on every wake — convenient for full automation, weaker for unattended security.
@@ -231,7 +236,7 @@ Layout: `core.ts` (pure alarm/event logic) · `runtime.ts` (config, SSH probe, s
 
 ## Honest limitations
 
-- The daemon is only as reliable as whatever keeps it alive; use a service manager.
+- The daemon is auto-started by sessions but not supervised: an OS reboot still needs a service manager (schtasks/systemd) to bring it back before the next session opens. Roadmap: one global daemon serving multiple projects.
 - The daemon delivers one wake at a time (deliberate, to keep state writes single-writer during a wake run); multiple alarms firing together are delivered sequentially.
 - A crashed session's presence record takes up to 60 s to expire, so daemon takeover for its alarms lags by at most that window; clean exits are immediate.
 - Alarms are project-global objects: **delivery** is owner-scoped, but **management** (`list`/`pause`/`reset`/`remove`) is available from any session — treat them like cron entries, not private session data. Alarm state is operational project state, not session-history state: rewinding or forking a Pi conversation does not roll back alarms that were already created.

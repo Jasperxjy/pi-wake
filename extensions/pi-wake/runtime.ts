@@ -72,6 +72,8 @@ export interface RuntimeConfig {
 	remote?: RemoteConfig;
 	piCommand?: string;
 	spawnOnWake: boolean;
+	/** Sessions auto-start the project daemon when no live daemon heartbeat exists (set false to manage the daemon yourself). */
+	spawnDaemon: boolean;
 	runTimeoutMs: number;
 	headlessTrust: "saved" | "always";
 	includeWakeEvidence: boolean;
@@ -115,6 +117,8 @@ export interface ToolParams {
 	path?: string;
 	value?: string;
 	minSize?: number;
+	/** Absolute ISO timestamp or relative duration; condition files older than this never satisfy. */
+	ignoreBefore?: string;
 	purgePendingEvents?: boolean;
 }
 
@@ -198,7 +202,7 @@ try:
             with open(cpath,"rb",buffering=0) as handle:
                 handle.seek(max(0,csize-int(req["tailBytes"])))
                 ctail=handle.read(int(req["tailBytes"]))
-            out({"exists":True,"size":csize,"tailBase64":base64.b64encode(ctail).decode("ascii")})
+            out({"exists":True,"size":csize,"mtime":int(cstat.st_mtime*1000),"tailBase64":base64.b64encode(ctail).decode("ascii")})
         except OSError:
             out({"exists":False,"size":0,"tailBase64":""})
         sys.exit(0)
@@ -346,7 +350,7 @@ const ACTION_FIELDS: Record<ToolParams["action"], readonly (keyof ToolParams)[]>
 	set_timer: ["action", "id", "name", "after", "at"],
 	watch_container: ["action", "id", "name", "container", "events", "policy", "logPath", "logPattern", "deadline", "statusPoll", "logTailLines"],
 	watch_container_group: ["action", "id", "name", "containers", "condition", "required", "coalesceWindow", "statusPoll", "logTailLines"],
-	watch_condition: ["action", "id", "name", "path", "condition", "value", "minSize", "statusPoll"],
+	watch_condition: ["action", "id", "name", "path", "condition", "value", "minSize", "ignoreBefore", "statusPoll"],
 	list: ["action"],
 	check: ["action", "id"],
 	pause: ["action", "id"],
@@ -367,6 +371,17 @@ function shellSingleQuote(value: string): string {
 function asInt(value: unknown, name: string, min: number, max: number): number {
 	if (!Number.isSafeInteger(value) || (value as number) < min || (value as number) > max) throw new Error(`${name} must be an integer from ${min} to ${max}`);
 	return value as number;
+}
+
+/** ignoreBefore accepts an absolute ISO timestamp ("2026-08-27T00:00:00Z") or a
+ * relative duration ("5m" = files older than 5 minutes ago). Both bound the
+ * same hazard: a stale marker from a previous run must not satisfy the watch. */
+function parseIgnoreBefore(value: string): number {
+	const trimmed = value.trim();
+	if (/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(trimmed)) return parseAbsoluteTime(trimmed, "ignoreBefore");
+	const cutoff = Date.now() - parseDuration(trimmed, "ignoreBefore");
+	if (!Number.isSafeInteger(cutoff) || cutoff < 0) throw new Error("ignoreBefore must resolve to a non-negative epoch-ms timestamp");
+	return cutoff;
 }
 
 async function parseRemoteConfig(value: unknown, configDir: string): Promise<RemoteConfig | undefined> {
@@ -396,10 +411,44 @@ async function parseRemoteConfig(value: unknown, configDir: string): Promise<Rem
 	};
 }
 
+/**
+ * Remote-section guard with a coach-style error: instead of only stating that
+ * the config is missing, the message carries the minimal working shape and the
+ * one non-obvious semantic (identityFile resolves relative to the .pi/ dir).
+ */
+function requireRemote(action: string, config: RuntimeConfig): RemoteConfig {
+	if (config.remote) return config.remote;
+	throw new Error(`${action} probes Docker/files on a REMOTE host over SSH, which needs a "remote" section in .pi/${CONFIG_NAME}, e.g. {"remote":{"host":"gpu.example.com","user":"me","identityFile":"id_rsa","allowedRemoteLogRoots":["/data/results/"]}} — identityFile resolves RELATIVE to the .pi/ directory (use "../keys/id_rsa" for a key stored elsewhere); key auth only, no passwords`);
+}
+
 function validateActionParams(params: ToolParams): void {
 	const allowed = new Set<string>(ACTION_FIELDS[params.action]);
 	const irrelevant = Object.entries(params).filter(([key, value]) => !allowed.has(key) && value !== undefined).map(([key]) => key);
-	if (irrelevant.length) throw new Error(`${params.action} does not accept: ${irrelevant.join(", ")}`);
+	if (irrelevant.length) {
+		const accepted = ACTION_FIELDS[params.action].filter((field) => field !== "action").join(", ");
+		throw new Error(`${params.action} does not accept: ${irrelevant.join(", ")} (accepted: ${accepted})`);
+	}
+}
+
+/**
+ * Read-only snapshot for diagnosis when no runtime is alive (e.g. the extension
+ * failed its session_start, or the agent is inspecting a foreign project).
+ * Best effort: an unreadable state yields an explicit error text, never a throw,
+ * and never schedules or delivers anything.
+ */
+export async function readOnlySnapshot(options: { cwd: string; statePath?: string; filterId?: string }): Promise<string> {
+	const statePath = options.statePath ?? path.join(options.cwd, ".pi", STATE_NAME);
+	const header = (body: string): string => `[read-only, no live session] ${body}`;
+	let saved: StoredState | undefined;
+	try { saved = await readStoredState(statePath); }
+	catch (error) { return header(`cannot read ${path.basename(statePath)}: ${(error as Error).message}; the state file must be repaired before alarms can be restored`); }
+	if (!saved) return header("no state file yet — nothing is on disk");
+	const alarms = options.filterId ? saved.alarms.filter((alarm) => alarm.id === options.filterId || alarm.id.startsWith(`${options.filterId}-`)) : saved.alarms;
+	if (!alarms.length) return header(options.filterId ? `unknown alarm: ${options.filterId}` : "0 alarms");
+	const lines = alarms.map((alarm) => { try { return alarmSummary(alarm); } catch { return `${alarm.id ?? "?"}: (summary unavailable) ${JSON.stringify(alarm).slice(0, 300)}`; } });
+	if (!options.filterId && saved.alarms.length > alarms.length) lines.push(`(plus ${saved.alarms.length - alarms.length} filtered alarm(s))`);
+	if (saved.outbox.length) lines.push(`${saved.outbox.length} undelivered wake(s) in the outbox — see list_wakes in a live session`);
+	return header(lines.join("\n"));
 }
 
 /** Read the stored alarm list and outbox without validation; undefined when the state file is absent. One retry tolerates a rename race. */
@@ -493,12 +542,13 @@ export class WakeAlarmRuntime {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`Cannot read ${CONFIG_NAME}: ${(error as Error).message}`);
 		}
-		const KNOWN_KEYS = ["remote", "statusPoll", "maxLogBytes", "maxEvidenceChars", "maxOutboxEntries", "maxOutboxEntriesPerAlarm", "piCommand", "spawnOnWake", "runTimeout", "headlessTrust", "includeWakeEvidence"];
+		const KNOWN_KEYS = ["remote", "statusPoll", "maxLogBytes", "maxEvidenceChars", "maxOutboxEntries", "maxOutboxEntriesPerAlarm", "piCommand", "spawnOnWake", "spawnDaemon", "runTimeout", "headlessTrust", "includeWakeEvidence"];
 		const unknownKeys = Object.keys(parsed).filter((key) => !KNOWN_KEYS.includes(key));
 		if (unknownKeys.length) throw new Error(`${CONFIG_NAME} contains unknown field(s): ${unknownKeys.join(", ")}`);
 		for (const retired of ["semanticReview", "maximumRuntime"]) if (retired in parsed) throw new Error(`${retired} is retired; wake alarms fire only for explicitly configured timers or conditions`);
 		if (parsed.piCommand !== undefined && (typeof parsed.piCommand !== "string" || !parsed.piCommand || parsed.piCommand.length > 512 || parsed.piCommand.includes("\0"))) throw new Error("piCommand must be a non-empty command path no longer than 512 characters");
 		if (parsed.spawnOnWake !== undefined && typeof parsed.spawnOnWake !== "boolean") throw new Error("spawnOnWake must be boolean");
+		if (parsed.spawnDaemon !== undefined && typeof parsed.spawnDaemon !== "boolean") throw new Error("spawnDaemon must be boolean");
 		if (parsed.includeWakeEvidence !== undefined && typeof parsed.includeWakeEvidence !== "boolean") throw new Error("includeWakeEvidence must be boolean");
 		if (parsed.headlessTrust !== undefined && parsed.headlessTrust !== "saved" && parsed.headlessTrust !== "always") throw new Error("headlessTrust must be \"saved\" or \"always\"");
 		const maxOutboxEntries = asInt(parsed.maxOutboxEntries ?? 1000, "maxOutboxEntries", 1, 100_000);
@@ -516,6 +566,7 @@ export class WakeAlarmRuntime {
 			remote: await parseRemoteConfig(parsed.remote, path.dirname(configPath)),
 			piCommand: parsed.piCommand as string | undefined,
 			spawnOnWake: parsed.spawnOnWake === undefined ? true : (parsed.spawnOnWake as boolean),
+			spawnDaemon: parsed.spawnDaemon === undefined ? true : (parsed.spawnDaemon as boolean),
 			runTimeoutMs: parseDuration((parsed.runTimeout ?? "30m") as string | number, "runTimeout"),
 			headlessTrust: parsed.headlessTrust === undefined ? "saved" : (parsed.headlessTrust as "saved" | "always"),
 			includeWakeEvidence: parsed.includeWakeEvidence === undefined ? true : (parsed.includeWakeEvidence as boolean),
@@ -885,8 +936,7 @@ export class WakeAlarmRuntime {
 
 	private async probe(alarm: ContainerAlarmState, baseline = false, rebind = false): Promise<ProbeResult> {
 		const config = this.runtimeConfig;
-		const remote = config.remote;
-		if (!remote) throw new Error(`watch_container requires a remote SSH section in .pi/${CONFIG_NAME}`);
+		const remote = requireRemote("watch_container", config);
 		const payload = Buffer.from(JSON.stringify({
 			container: alarm.container,
 			expectedId: rebind ? undefined : alarm.containerId,
@@ -947,10 +997,9 @@ export class WakeAlarmRuntime {
 	}
 
 	/** Poll a remote completion-condition file (exists / contains / min_size). Runs outside the state lock. */
-	private async probeCondition(alarm: ConditionAlarmState): Promise<{ exists: boolean; size: number; tail: string }> {
+	private async probeCondition(alarm: ConditionAlarmState): Promise<{ exists: boolean; size: number; tail: string; mtime?: number }> {
 		const config = this.runtimeConfig;
-		const remote = config.remote;
-		if (!remote) throw new Error(`watch_condition requires a remote SSH section in .pi/${CONFIG_NAME}`);
+		const remote = requireRemote("watch_condition", config);
 		const payload = Buffer.from(JSON.stringify({
 			conditionPath: alarm.path,
 			allowedRemoteLogRoots: remote.allowedRemoteLogRoots,
@@ -969,9 +1018,12 @@ export class WakeAlarmRuntime {
 				if (raw.probeError) throw new Error(String(raw.probeError));
 				const size = Number(raw.size ?? 0);
 				if (!Number.isSafeInteger(size) || size < 0) throw new Error("remote probe returned an invalid size");
+				const mtime = raw.mtime === undefined || raw.mtime === null ? undefined : Number(raw.mtime);
+				if (mtime !== undefined && (!Number.isSafeInteger(mtime) || mtime < 0)) throw new Error("remote probe returned an invalid mtime");
 				return {
 					exists: Boolean(raw.exists),
 					size,
+					mtime,
 					tail: decodeNewLog(Buffer.from(String(raw.tailBase64 ?? ""), "base64")),
 				};
 			} catch (error) {
@@ -1255,7 +1307,7 @@ export class WakeAlarmRuntime {
 		});
 		if (phaseA.handled) return { alarm: phaseA.alarm, events: phaseA.events };
 		// SSH probe outside the lock.
-		let result: { exists: boolean; size: number; tail: string };
+		let result: { exists: boolean; size: number; tail: string; mtime?: number };
 		try { result = await this.probeCondition(current); }
 		catch (error) {
 			if (this.stopped) return { alarm: current, events: [] };
@@ -1284,10 +1336,17 @@ export class WakeAlarmRuntime {
 			const pending = this.pendingConditionOutcome(disk, diskAlarm, shouldEmit);
 			if (pending) return pending;
 			const now = Date.now();
-			const satisfied = diskAlarm.condition === "exists" ? result.exists
+			// Stale-marker guard: with ignoreBefore set, a file that existed BEFORE the
+			// cutoff (a marker from a previous run) never satisfies the condition.
+			const stale = result.exists && diskAlarm.ignoreBefore !== undefined && result.mtime !== undefined && result.mtime < diskAlarm.ignoreBefore;
+			const satisfied = !stale && (diskAlarm.condition === "exists" ? result.exists
 				: diskAlarm.condition === "contains" ? result.exists && result.tail.includes(diskAlarm.value ?? "")
-				: result.exists && result.size >= (diskAlarm.minSize ?? 0);
-			const tailEvidence = result.exists ? persistedEvidence(tailLines(result.tail, 10)) : undefined;
+				: result.exists && result.size >= (diskAlarm.minSize ?? 0));
+			// The evidence records BOTH clocks: when the probe detected it (detection)
+			// and the file mtime (occurrence), so a backfilled satisfiedAt cannot be
+			// mistaken for the moment the event happened.
+			const occurredNote = result.mtime !== undefined ? `\n(file mtime: ${new Date(result.mtime).toISOString()})` : "";
+			const tailEvidence = result.exists ? persistedEvidence(tailLines(result.tail, 10) + occurredNote) : undefined;
 			if (!satisfied) {
 				const next = this.bump(diskAlarm, { lastSatisfied: false, lastSize: result.size, lastEvidence: tailEvidence, nextCheckAt: now + diskAlarm.statusPollMs });
 				const alarms = disk.alarms.map((candidate) => (candidate.id === id ? next : candidate));
@@ -1621,11 +1680,11 @@ export class WakeAlarmRuntime {
 
 	private async watchContainer(params: ToolParams, context?: ActionContext): Promise<AlarmState> {
 		const config = this.runtimeConfig;
-		if (!config.remote) throw new Error(`watch_container requires a remote SSH section in .pi/${CONFIG_NAME}`);
+		const remote = requireRemote("watch_container", config);
 		if (!params.id || !params.name || !params.container || !params.events) throw new Error("id, name, container, and events are required for watch_container");
 		const id = validateAlarmId(params.id);
 		if (this.alarms.has(id)) throw new Error(`alarm already exists: ${id}`);
-		let alarm = createContainerAlarm({ id, name: params.name, container: params.container, events: params.events, policy: params.policy, logPath: params.logPath ? validateRemoteLogPath(params.logPath, config.remote.allowedRemoteLogRoots) : undefined, logPattern: params.logPattern, allowedRemoteLogRoots: config.remote.allowedRemoteLogRoots, now: Date.now(), statusPollMs: params.statusPoll ? parseDuration(params.statusPoll, "statusPoll") : config.statusPollMs, deadlineMs: params.deadline ? parseDuration(params.deadline, "deadline") : undefined, ownerSessionFile: context?.ownerSessionFile, logTailLines: params.logTailLines });
+		let alarm = createContainerAlarm({ id, name: params.name, container: params.container, events: params.events, policy: params.policy, logPath: params.logPath ? validateRemoteLogPath(params.logPath, remote.allowedRemoteLogRoots) : undefined, logPattern: params.logPattern, allowedRemoteLogRoots: remote.allowedRemoteLogRoots, now: Date.now(), statusPollMs: params.statusPoll ? parseDuration(params.statusPoll, "statusPoll") : config.statusPollMs, deadlineMs: params.deadline ? parseDuration(params.deadline, "deadline") : undefined, ownerSessionFile: context?.ownerSessionFile, logTailLines: params.logTailLines });
 		const baseline = await this.probe(alarm, true, true);
 		if (!baseline.exists) throw new Error(`container does not exist: ${alarm.container}`);
 		alarm = applyBaseline(alarm, baseline, Date.now());
@@ -1634,7 +1693,7 @@ export class WakeAlarmRuntime {
 
 	private async watchContainerGroup(params: ToolParams, context?: ActionContext): Promise<AlarmState> {
 		const config = this.runtimeConfig;
-		if (!config.remote) throw new Error(`watch_container_group requires a remote SSH section in .pi/${CONFIG_NAME}`);
+		const remote = requireRemote("watch_container_group", config);
 		if (!params.id || !params.name || !params.containers?.length) throw new Error("id, name, and containers are required for watch_container_group");
 		if (params.containers.length < 2 || params.containers.length > 64) throw new Error("a group needs 2-64 containers");
 		if (new Set(params.containers).size !== params.containers.length) throw new Error("containers must be unique");
@@ -1649,7 +1708,7 @@ export class WakeAlarmRuntime {
 		const memberAlarms: ContainerAlarmState[] = [];
 		for (const [index, container] of params.containers.entries()) {
 			const memberId = `${id}-${index + 1}`;
-			let member = createContainerAlarm({ id: memberId, name: `${params.name} #${index + 1}`, container, events: ["exit", "abnormal", "missing", "replaced"], policy: "keep", allowedRemoteLogRoots: config.remote.allowedRemoteLogRoots, now: Date.now(), statusPollMs, ownerSessionFile: context?.ownerSessionFile, groupId: id, logTailLines: params.logTailLines });
+			let member = createContainerAlarm({ id: memberId, name: `${params.name} #${index + 1}`, container, events: ["exit", "abnormal", "missing", "replaced"], policy: "keep", allowedRemoteLogRoots: remote.allowedRemoteLogRoots, now: Date.now(), statusPollMs, ownerSessionFile: context?.ownerSessionFile, groupId: id, logTailLines: params.logTailLines });
 			const baseline = await this.probe(member, true, true);
 			if (!baseline.exists) throw new Error(`container does not exist: ${container}`);
 			memberAlarms.push(applyBaseline(member, baseline, Date.now()));
@@ -1673,11 +1732,11 @@ export class WakeAlarmRuntime {
 
 	private async watchCondition(params: ToolParams, context?: ActionContext): Promise<AlarmState> {
 		const config = this.runtimeConfig;
-		if (!config.remote) throw new Error(`watch_condition requires a remote SSH section in .pi/${CONFIG_NAME}`);
+		const remote = requireRemote("watch_condition", config);
 		if (!params.id || !params.name || !params.path || !params.condition) throw new Error("id, name, path, and condition are required for watch_condition");
 		const id = validateAlarmId(params.id);
 		if (this.alarms.has(id)) throw new Error(`alarm already exists: ${id}`);
-		const alarm = createConditionAlarm({ id, name: params.name, path: params.path, condition: params.condition as ConditionKind, value: params.value, minSize: params.minSize, allowedRemoteLogRoots: config.remote.allowedRemoteLogRoots, now: Date.now(), statusPollMs: params.statusPoll ? parseDuration(params.statusPoll, "statusPoll") : config.statusPollMs, ownerSessionFile: context?.ownerSessionFile });
+		const alarm = createConditionAlarm({ id, name: params.name, path: params.path, condition: params.condition as ConditionKind, value: params.value, minSize: params.minSize, ignoreBefore: params.ignoreBefore === undefined ? undefined : parseIgnoreBefore(params.ignoreBefore), allowedRemoteLogRoots: remote.allowedRemoteLogRoots, now: Date.now(), statusPollMs: params.statusPoll ? parseDuration(params.statusPoll, "statusPoll") : config.statusPollMs, ownerSessionFile: context?.ownerSessionFile });
 		await this.replaceAlarm(id, alarm);
 		this.schedule();
 		return alarm;

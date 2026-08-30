@@ -107,7 +107,8 @@ jobs:
           # MIGRATE it (clamp + rewrite) and still restore all four alarms.
           grep -q "daemon active with 4 alarm(s)" fixture.log || { echo "::error::installed daemon cannot restore group/condition state: $(cat fixture.log)"; exit 1; }
           grep -q "migrated.*overlong evidence" fixture.log || { echo "::error::expected evidence migration log line: $(cat fixture.log)"; exit 1; }
-          echo "group/condition state + overlong evidence migration exercised by the installed daemon"
+          test -s "$TMP/.pi/wake-alarm.daemon.json" || { echo "::error::daemon heartbeat file missing"; exit 1; }
+          echo "group/condition state + overlong evidence migration + daemon heartbeat exercised by the installed daemon"
           echo "::endgroup::"
       - name: extension load smoke (real Pi, RPC mode)
         shell: bash

@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { createDaemonEmit, daemonOwns } from "./daemon.ts";
 import { leaderInstanceId, listLivePresences, registerPresence, releasePresence } from "./presence.ts";
 import { StateLock } from "./lock.ts";
-import { WakeAlarmRuntime, type EmitFn, type ExecFn, type StoredState } from "./runtime.ts";
+import { WakeAlarmRuntime, readOnlySnapshot, type EmitFn, type ExecFn, type StoredState } from "./runtime.ts";
 import { applyBaseline, createContainerAlarm, type AlarmState, type FiredEvent, type OutboxEntry, type ProbeResult, type TimerAlarmState } from "./core.ts";
 
 const runtimeUrl = pathToFileURL(path.resolve("extensions/pi-wake/runtime.ts")).href;
@@ -1692,4 +1692,89 @@ test("legacy state with overlong evidence is clamped on load instead of failing 
 	} finally {
 		await runtime.stop();
 	}
+});
+
+test("missing remote config errors coach the schema instead of just rejecting", async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	const runtime = makeRuntime(dir, statePath, () => true, { schedulingEnabled: false });
+	try {
+		await runtime.start({ flushPending: false });
+		for (const action of ["watch_container", "watch_condition"] as const) {
+			await assert.rejects(
+				runtime.runAction({ action, id: "w", name: "W", ...(action === "watch_container" ? { container: "job", events: ["exit"] } : { path: "/data/results/a.json", condition: "exists" }) }),
+				(error: Error) => {
+					assert.match(error.message, /"remote".*identityFile/s, "carries a minimal config example");
+					assert.match(error.message, /relative to the \.pi\/ directory/i, "documents the identityFile path semantics");
+					assert.match(error.message, /\.\.\/keys\/id_rsa/, "shows the escape hatch for keys outside .pi/");
+					return true;
+				},
+			);
+		}
+		// Parameter rejections list the accepted fields for the action.
+		await assert.rejects(
+			runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["a", "b"], deadline: "10m" } as never),
+			(error: Error) => {
+					assert.match(error.message, /does not accept: deadline \(accepted: /);
+					for (const field of ["containers", "condition", "required", "coalesceWindow", "statusPoll", "logTailLines", "id", "name"]) assert.ok(error.message.includes(field), `accepted list mentions ${field}`);
+					return true;
+				},
+		);
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("ignoreBefore guards watch_condition against stale markers from previous runs", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	await fs.writeFile(path.join(dir, "id_rsa"), "fake-key");
+	const configPath = path.join(dir, "wake-alarm.json");
+	await fs.writeFile(configPath, JSON.stringify({ remote: { host: "example.com", user: "u", identityFile: "id_rsa", allowedRemoteLogRoots: ["/data/results/"] } }));
+	const calls: OutboxEntry[] = [];
+	let probes = 0;
+	const staleMtime = Date.now() - 3_600_000;
+	const runtime = new WakeAlarmRuntime({
+		cwd: dir,
+		configPath,
+		statePath,
+		emit: (entry) => { calls.push(entry); return true; },
+		execFn: async () => {
+			probes++;
+			// The marker FILE already existed before the watch (mtime 1h old): without
+			// ignoreBefore this would satisfy "exists" immediately — the classic
+			// stale-marker false wake. With ignoreBefore the first fresh write only.
+			const mtime = probes <= 2 ? staleMtime : Date.now();
+			return { stdout: JSON.stringify({ exists: true, size: 64, mtime, tailBase64: Buffer.from('{"finished_at": "later"}').toString("base64") }), stderr: "", code: 0 };
+		},
+	});
+	try {
+		await runtime.start({ flushPending: false });
+		const created = await runtime.runAction({ action: "watch_condition", id: "done", name: "Done", path: "/data/results/analysis.json", condition: "exists", ignoreBefore: "1m", statusPoll: "1s" });
+		assert.match(created, /condition active/);
+		const diskAlarm = () => readState(statePath).then((state) => state.alarms.find((candidate) => candidate.id === "done"));
+		assert.ok((await diskAlarm())?.kind === "condition" && (await diskAlarm() as { ignoreBefore?: number }).ignoreBefore !== undefined, "ignoreBefore persisted");
+		// Stale-mtime probes must NOT fire; only the fresh write does.
+		await waitFor(() => calls.length === 1, "the fresh-marker wake to fire (stale ones skipped)", 15_000);
+		assert.match(calls[0].events[0].evidence ?? "", /file mtime:/, "evidence records the occurrence clock next to the detection clock");
+		const after = await diskAlarm();
+		assert.ok(after?.kind === "condition" && after.satisfiedAt !== undefined);
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("readOnlySnapshot diagnoses state without a live runtime", async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	// Empty project: no state file yet.
+	assert.match(await readOnlySnapshot({ cwd: dir }), /no state file yet/);
+	// Normal state: summaries from disk.
+	await writeState(statePath, [{ id: "t1", name: "Timer 1", kind: "timer", active: true, createdAt: 500, dueAt: 9000, revision: 1 }]);
+	const snapshot = await readOnlySnapshot({ cwd: dir, statePath });
+	assert.match(snapshot, /read-only/);
+	assert.match(snapshot, /t1: Timer 1 — timer active/);
+	// Corrupt state: an explicit repair hint instead of a throw.
+	await fs.writeFile(statePath, "{broken");
+	assert.match(await readOnlySnapshot({ cwd: dir, statePath }), /cannot read state\.json/);
 });

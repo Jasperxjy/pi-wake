@@ -9,3 +9,4 @@ node_modules/
 dist/
 .build-staging/
 *.tgz
+.pi/wake-alarm.daemon.json*

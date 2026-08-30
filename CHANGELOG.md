@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0 (2026-08-30)
+
+Usability release driven by real-world usage feedback (30-min-late wake + duplicate delivery incident debrief).
+
+- **Coach-style errors**: a missing `remote` section now embeds the minimal working config example AND the non-obvious semantic (`identityFile` resolves relative to the `.pi/` directory, `../keys/…` escape hatch); parameter rejections list the accepted fields per action instead of only the rejected ones.
+- **Read-only degradation**: `list` / `list_wakes` / `check` work even before `session_start` (or after a failed one) via a read-only disk snapshot — the diagnostic entry points can no longer be locked out while the state file is on disk.
+- **Daemon heartbeat**: the daemon rewrites `.pi/wake-alarm.daemon.json` every 5 s (pid, startedAt, heartbeatAt, last 30 log lines) and removes it on clean shutdown; `readDaemonLiveness` exposes freshness for any process.
+- **Daemon auto-start**: creating an alarm with no live daemon starts one automatically (detached, `WAKE_ALARM_CWD` pinned); the last session leaving also leaves a daemon behind. Opt out with `"spawnDaemon": false` or `WAKE_ALARM_NO_AUTOSPAWN=1`. Tool results note the daemon state on create actions; the tool description now states that closed-session wake delivery depends on the daemon, and that `watch_container` probes a REMOTE host over SSH.
+- **`ignoreBefore` for `watch_condition`** (absolute ISO or relative like `"5m"`): files last modified before the cutoff never satisfy the condition — stale markers from previous runs cannot fire false wakes. The remote probe now reports file mtime, and condition evidence carries both clocks (`(file mtime: …)` occurrence vs detection time).
+- **promptGuidelines**: marker hygiene (run-specific values in cleaned run directories, `contains` over `exists`, `ignoreBefore`), alarm-id reuse via `reset`, small `logTailLines`.
+
 ## 0.1.2 (2026-08-27)
 
 - **FIX: persistent evidence is now hard-capped at 2000 chars on every write path** — `applyProbe` tail evidence, `applyCheckFailure` reason, condition probe tails, group summaries, and outbox event evidence all clamp through `persistedEvidence()`; a serialization boundary guard (`clampPersistedState`) plus the `bump()` entry point guarantee nothing overlong ever reaches disk again (previously `maxEvidenceChars` only bounded the delivered message, so a single 3KB log line could make `lastEvidence` exceed the 2000-char restore cap and fail startup with `Cannot restore`).

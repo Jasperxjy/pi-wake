@@ -92,3 +92,68 @@ export function leaderInstanceId(live: readonly PresenceRecord[]): string | unde
 export function isSessionFileLive(live: readonly PresenceRecord[], sessionFile: string): boolean {
 	return live.some((record) => record.sessionFile === sessionFile);
 }
+
+/**
+ * Daemon heartbeat file (.pi/wake-alarm.daemon.json). The daemon rewrites it on
+ * every poll tick (5s) so any process — live session or a freshly started one —
+ * can answer "is a daemon watching this project?" with one stat+read. The ring
+ * of recent log lines travels with the heartbeat, so a dead daemon leaves its
+ * last words on disk for post-mortem diagnosis.
+ */
+export const DAEMON_HEARTBEAT_NAME = "wake-alarm.daemon.json";
+/** A heartbeat older than this is considered dead (3 poll ticks). */
+export const DAEMON_HEARTBEAT_FRESH_MS = 15_000;
+const DAEMON_LOG_TAIL_LINES = 30;
+
+export interface DaemonHeartbeat {
+	version: 1;
+	pid: number;
+	startedAt: number;
+	heartbeatAt: number;
+	dryRun: boolean;
+	logTail: string[];
+}
+
+export function daemonHeartbeatPath(cwd: string): string {
+	return path.join(cwd, ".pi", DAEMON_HEARTBEAT_NAME);
+}
+
+export async function writeDaemonHeartbeat(cwd: string, record: DaemonHeartbeat): Promise<void> {
+	const target = daemonHeartbeatPath(cwd);
+	const tmp = `${target}.tmp-${process.pid}`;
+	await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 }).catch(() => undefined);
+	await fs.writeFile(tmp, `${JSON.stringify(record)}
+`, { mode: 0o600 });
+	await renameWithRetry(tmp, target);
+}
+
+export async function clearDaemonHeartbeat(cwd: string, pid: number): Promise<void> {
+	const target = daemonHeartbeatPath(cwd);
+	try {
+		const raw = JSON.parse((await fs.readFile(target, "utf8")).trim()) as Partial<DaemonHeartbeat>;
+		// Only remove our own file: a newer daemon may have taken over the path.
+		if (raw.pid === pid) await fs.rm(target, { force: true });
+	} catch { /* absent or unreadable: nothing to clear */ }
+}
+
+export interface DaemonLiveness {
+	live: boolean;
+	heartbeat?: DaemonHeartbeat;
+	/** Age of the newest heartbeat in ms (undefined when the file is absent/unreadable). */
+	ageMs?: number;
+}
+
+export async function readDaemonLiveness(cwd: string): Promise<DaemonLiveness> {
+	try {
+		const raw = JSON.parse((await fs.readFile(daemonHeartbeatPath(cwd), "utf8")).trim()) as Partial<DaemonHeartbeat>;
+		if (typeof raw.heartbeatAt !== "number" || typeof raw.pid !== "number") return { live: false };
+		const ageMs = Date.now() - raw.heartbeatAt;
+		return {
+			live: ageMs >= 0 && ageMs <= DAEMON_HEARTBEAT_FRESH_MS,
+			heartbeat: { version: 1, pid: raw.pid, startedAt: raw.startedAt ?? raw.heartbeatAt, heartbeatAt: raw.heartbeatAt, dryRun: Boolean(raw.dryRun), logTail: Array.isArray(raw.logTail) ? raw.logTail.slice(-DAEMON_LOG_TAIL_LINES).map((line) => String(line)) : [] },
+			ageMs,
+		};
+	} catch {
+		return { live: false };
+	}
+}
