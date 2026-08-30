@@ -95,6 +95,17 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		if (typeof presenceHeartbeat.unref === "function") presenceHeartbeat.unref();
 	}
 
+	// Deferred delivery confirmation: sessionEmit only hands the wake to pi. The
+	// outbox entry is completed when the message is ECHOED into the conversation
+	// (message_end with our eventId); an agent run that settles without echoing
+	// means the host dropped it (abort clears queued messages) — release + retry.
+	pi.on("message_end", (event) => {
+		const message = (event as { message?: { customType?: string; details?: { eventId?: string } } }).message;
+		const eventId = message?.customType === "wake-alarm" ? message.details?.eventId : undefined;
+		if (eventId) void runtime?.confirmDelivery(eventId);
+	});
+	pi.on("agent_settled", () => { runtime?.onDeliveryCycleSettled(); });
+
 	function sessionEmit(entry: OutboxEntry): boolean {
 		// The outbox entry carries a bounded message snapshot built at fire time with
 		// the configured evidence policy; delivery never recomputes it from the
@@ -239,6 +250,7 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		runtime = new WakeAlarmRuntime({
 			cwd: ctx.cwd,
 			emit: sessionEmit,
+			deferDeliveryCompletion: true,
 			execFn: (file, args, options) => pi.exec(file, args, options),
 			schedulingEnabled: !passive,
 			owns: (alarm) => alarm.ownerSessionFile === undefined ? isLeader : alarm.ownerSessionFile === ownerSessionFile,

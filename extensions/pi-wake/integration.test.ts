@@ -1807,3 +1807,57 @@ test("a second daemon on the same project steps down (single-instance guard)", {
 		await new Promise((resolve) => first.on("close", () => resolve(undefined)));
 	}
 });
+
+test("deferred delivery completion: the wake stays durable until the host echoes it", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	const eventId = "t1:1:defer";
+	const entry: OutboxEntry = { eventId, alarmId: "t1", alarmName: "T1", triggeredAt: 1000, events: [{ kind: "timer", fingerprint: "timer:t1:1" }], message: "[Wake alarm] T1 (t1)" };
+	const emitted: string[] = [];
+	const runtime = makeRuntime(dir, statePath, (candidate) => { emitted.push(candidate.eventId); return true; }, { deferDeliveryCompletion: true });
+	try {
+		await writeState(statePath, [{ id: "t1", name: "T1", kind: "timer", active: false, createdAt: 500, dueAt: 900, triggeredAt: 1000, revision: 1 }], [entry]);
+		await runtime.start({ flushPending: true });
+		await waitFor(() => emitted.length === 1, "the wake to be handed to the host", 5_000);
+		// HANDED OFF but NOT delivered: the entry must still be on disk (claim held).
+		let disk = await readState(statePath);
+		assert.equal(disk.outbox.length, 1, "unconfirmed wake stays in the outbox");
+		assert.ok(disk.outbox[0].claim, "the claim is held while awaiting the echo");
+		// The echo completes the delivery: only now does the entry leave the disk.
+		assert.equal(await runtime.confirmDelivery(eventId), true);
+		disk = await readState(statePath);
+		assert.equal(disk.outbox.length, 0, "confirmed wake leaves the outbox");
+		assert.equal(await runtime.confirmDelivery(eventId), false, "confirmation is idempotent");
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("agent run settling without an echo releases the wake for a backoff retry", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const statePath = path.join(dir, "state.json");
+	const eventId = "t2:1:abort";
+	const entry: OutboxEntry = { eventId, alarmId: "t2", alarmName: "T2", triggeredAt: 1000, events: [{ kind: "timer", fingerprint: "timer:t2:1" }], message: "[Wake alarm] T2 (t2)" };
+	const emitted: string[] = [];
+	const runtime = makeRuntime(dir, statePath, (candidate) => { emitted.push(candidate.eventId); return true; }, { deferDeliveryCompletion: true });
+	try {
+		await writeState(statePath, [{ id: "t2", name: "T2", kind: "timer", active: false, createdAt: 500, dueAt: 900, triggeredAt: 1000, revision: 1 }], [entry]);
+		await runtime.start({ flushPending: true });
+		await waitFor(() => emitted.length === 1, "the wake to be handed to the host", 5_000);
+		// The host aborted the run: no echo ever arrives. Settling must release the
+		// claim and retry with backoff — the wake is a durable fact, not a casualty.
+		runtime.onDeliveryCycleSettled();
+		// Phase 1: the claim is released so ANY owner could retry the durable entry.
+		await waitFor(async () => (await readState(statePath)).outbox[0]?.claim === undefined, "the claim to be released", 5_000);
+		// Phase 2: the scheduler's backoff retry re-hands-off (fresh claim, still pending).
+		await waitFor(() => emitted.length === 2, "the redelivery after the backoff", 15_000);
+		const disk = await readState(statePath);
+		assert.equal(disk.outbox.length, 1, "still undelivered, still durable");
+		assert.ok(disk.outbox[0].claim, "the retry handoff holds a fresh claim");
+		// The retried handoff IS echoed this time: entry completes.
+		assert.equal(await runtime.confirmDelivery(eventId), true);
+		assert.equal((await readState(statePath)).outbox.length, 0);
+	} finally {
+		await runtime.stop();
+	}
+});

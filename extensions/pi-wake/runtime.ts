@@ -159,6 +159,17 @@ export interface RuntimeOptions {
 	deliveryTtlMs?: number | (() => number);
 	/** Backoff applied to undeliverable wakes (linear, capped). Default: 5s delay, 30m cap. */
 	wakeRetry?: WakeRetryPolicy;
+	/**
+	 * Deferred delivery completion: emit() returning true only means "handed to
+	 * the host" — the outbox entry is kept (claim held) until confirmDelivery()
+	 * is called with proof the message entered the conversation. Host-side loss
+	 * (abort clears queued messages; crash evaporates them) therefore falls back
+	 * to redelivery instead of losing the wake. onDeliveryCycleSettled() releases
+	 * unconfirmed pendings for a backoff retry when the agent run ends without
+	 * having echoed them. The daemon does not use this: its emit resolves only
+	 * after the woken process exited 0, which already proves persistence.
+	 */
+	deferDeliveryCompletion?: boolean;
 	/** Test hooks for the state-lock stale takeover. */
 	lockHooks?: LockTestingHooks;
 }
@@ -493,6 +504,8 @@ export class WakeAlarmRuntime {
 	private retiredLegacyState = false;
 	private readonly controllers = new Set<AbortController>();
 	private readonly wakeRetry = new Map<string, { attempts: number; nextAt: number }>();
+	/** Entries handed to the host but not yet confirmed as part of the conversation. */
+	private readonly pendingConfirmations = new Map<string, { token: string; sentAt: number }>();
 	private readonly dirtyIds = new Set<string>();
 	private readonly deletedIds = new Set<string>();
 	private readonly createIds = new Set<string>();
@@ -1513,14 +1526,45 @@ export class WakeAlarmRuntime {
 		const entry = this.outbox.get(eventId);
 		if (!entry) return;
 		const delivered = await this.tryEmit(entry);
-		if (delivered) await this.completeOutboxEntry(eventId, token);
+		if (delivered && this.options.deferDeliveryCompletion) {
+			// Handed to the host, NOT yet delivered: the entry stays durable on disk
+			// (claim held) until the host echoes the message into the conversation.
+			this.pendingConfirmations.set(eventId, { token, sentAt: Date.now() });
+		} else if (delivered) await this.completeOutboxEntry(eventId, token);
 		else { await this.releaseOutboxEntryClaim(eventId, token); this.noteWakeRetry(eventId); }
+	}
+
+	/** Proof from the host that a handed-off wake entered the conversation: complete it. Idempotent. */
+	async confirmDelivery(eventId: string): Promise<boolean> {
+		const pending = this.pendingConfirmations.get(eventId);
+		if (!pending) return false;
+		this.pendingConfirmations.delete(eventId);
+		try { return await this.completeOutboxEntry(eventId, pending.token); }
+		catch { return false; }
+	}
+
+	/**
+	 * The host's agent run settled: every steer message queued before the run had
+	 * its echo by now (in-order events), so anything still pending was lost host-side
+	 * (abort clears the queue; consumption never happened). Release the claims and
+	 * retry with backoff — the wake is a durable fact and must still be delivered.
+	 */
+	onDeliveryCycleSettled(): void {
+		for (const [eventId, pending] of [...this.pendingConfirmations]) {
+			this.pendingConfirmations.delete(eventId);
+			void this.releaseOutboxEntryClaim(eventId, pending.token).catch(() => undefined);
+			this.noteWakeRetry(eventId);
+		}
+		// The scheduler may have gone dormant (a fully-pending outbox arms no
+		// timer); re-arm it so the backoff retry actually fires.
+		this.schedule();
 	}
 
 	private async flushPendingWakes(): Promise<void> {
 		for (const entry of [...this.outbox.values()].sort((a, b) => a.triggeredAt - b.triggeredAt)) {
 			if (this.stopped) return;
 			if (!this.ownsEntry(entry)) continue;
+			if (this.pendingConfirmations.has(entry.eventId)) continue; // already handed to the host, awaiting its echo
 			try { await this.deliverOutboxEntry(entry.eventId); }
 			catch { /* The scheduler retries pending outbox delivery with backoff. */ }
 		}
@@ -1615,6 +1659,7 @@ export class WakeAlarmRuntime {
 	}
 
 	private effectiveEntryDue(entry: OutboxEntry): number | undefined {
+		if (this.pendingConfirmations.has(entry.eventId)) return undefined;
 		const retry = this.wakeRetry.get(entry.eventId);
 		return retry && retry.nextAt > Date.now() ? retry.nextAt : entry.triggeredAt;
 	}
@@ -2030,6 +2075,13 @@ export class WakeAlarmRuntime {
 		this.scheduler = undefined;
 		for (const controller of this.controllers) controller.abort();
 		this.controllers.clear();
+		// Unconfirmed handoffs die with this process: release their claims (the
+		// entries stay durable) so the next session or the daemon retries without
+		// waiting for claim TTL expiry.
+		for (const [eventId, pending] of [...this.pendingConfirmations]) {
+			this.pendingConfirmations.delete(eventId);
+			void this.releaseOutboxEntryClaim(eventId, pending.token).catch(() => undefined);
+		}
 		await this.operation;
 	}
 }

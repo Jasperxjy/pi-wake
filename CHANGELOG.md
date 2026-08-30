@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2 (2026-08-30)
+
+- **Echo-confirmed in-session delivery closes the at-least-once window.** Previously the outbox entry was deleted the moment `pi.sendMessage` returned — but mid-turn that only queues the message into pi's in-memory steering queue, so a host-side loss between queueing and consumption (user abort clears the queue; crash/kill evaporates it) silently dropped the wake. Now `deferDeliveryCompletion` keeps the entry durable (claim held) until the message is echoed into the conversation (`message_end` with the wake's `eventId`); an agent run that settles without echoing releases the claim for a backoff redelivery, and runtime shutdown releases unconfirmed handoffs. Daemon delivery is unchanged (woken-process exit 0 already proves persistence). Rare duplicates replace silent loss — at-least-once as documented.
+
 ## 0.2.1 (2026-08-30)
 
 - **In-session wakes now steer into the running turn** (`deliverAs: "steer"` instead of `"followUp"`): a wake that fires mid-turn is injected at the next model step — the agent loop drains the steering queue before every LLM request — so wakes interleave between tool calls like tool results instead of piling up at the turn boundary. Idle sessions still get an immediate new turn (triggerTurn). New extension-shell test pins the delivery contract; no state or protocol change.
