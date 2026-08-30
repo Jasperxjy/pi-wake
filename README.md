@@ -16,6 +16,7 @@ Polling and timing are deterministic and model-free — no tokens are spent unti
 ## Features
 
 - One-shot timers (`after` / `at`), fired once, then paused.
+- **Arbitrary event sources** — run your own detector (crawler, sentinel, anything that can print a line) in a container and subscribe to its marker lines with `log-match`; see [Bring your own detector](#bring-your-own-detector-arbitrary-event-subscriptions) below.
 - Remote Docker container watches over SSH: `exit`, `abnormal`, `missing`, `replaced`, `log-error`, `log-match`, `deadline`, `connection-failure` (OR-combined, fingerprint-deduped).
 - Same-session delivery in both process states (live loop insertion / headless resume).
 - Durable at-least-once outbox: a fired event is persisted before delivery, so a crash cannot lose it.
@@ -127,6 +128,54 @@ When an experiment's true completion is a result file rather than a container st
 Conditions: `exists`, `contains` (literal substring in the file tail), `min_size` (byte threshold with `minSize`). Fires once when satisfied, with a bounded tail excerpt as evidence; `reset` re-arms.
 
 **Stale markers**: `exists` cannot tell a fresh marker from one left behind by a previous run. Have drivers write run-specific markers into a directory that gets cleaned, prefer `contains` with a run-specific value, or set `ignoreBefore` (absolute ISO timestamp or relative like `"5m"`) — files last modified before the cutoff never satisfy the condition. Condition evidence carries both clocks: when the probe detected it, and `(file mtime: …)` when it actually happened.
+
+### Bring your own detector: arbitrary event subscriptions
+
+The four alarm kinds are prepackaged sensors — but the sensor slot is open. `watch_container` never cared what the container *does*: any process that can print a line becomes an event source. **stdout is the interface.**
+
+```bash
+# detector: any loop you like, on the probe host
+while true; do
+  curl -s https://api.example.com/stock | grep -q '"price":49\.'     && echo "WAKE: price dropped below 50 at $(date -u +%FT%TZ)"
+  sleep 60
+done
+```
+
+```json
+{
+  "action": "watch_container",
+  "id": "price-drop",
+  "name": "Price drop below 50",
+  "container": "price-watcher",
+  "events": ["log-match"],
+  "logPattern": "WAKE:",
+  "policy": "keep",
+  "statusPoll": "30s",
+  "logTailLines": 5
+}
+```
+
+Every new `WAKE:` line fires a wake with the surrounding log lines as evidence (`keep` policy re-fires; fingerprint dedupe means the same line never fires twice). Pause/resume mutes and unmutes the subscription.
+
+The same trick composes with everything else:
+
+| Goal | Idiom |
+|---|---|
+| One-shot: "wake me once when X happens" | detector exits `0` only on the real trigger → `events: ["exit"]` (default pause-on-fire; `reset` rearms) |
+| Repeating: "wake me every time X happens" | long-running detector prints `WAKE: …` markers → `log-match` + `policy: "keep"` |
+| Barrier: "wake me when ANY of these detectors fires" (or ALL / N of M) | detectors exit on their trigger → `watch_container_group` with `any_terminal` / `all_terminal` / `n_of_m_terminal` |
+| Structured result: "wake me with the payload" | detector writes a result file → `watch_condition` with `contains` + a run-specific value |
+
+**What this unlocks** (all real, all today, zero plugin code):
+
+- *Price / stock / deal watcher* — crawl a page or API on a loop, wake on threshold, the agent checks out or drafts the buy note.
+- *Publication tracker* — poll arXiv/search APIs for a keyword or an author, wake on a new hit; the agent reads, triages, files it into the research wiki.
+- *Competitor changelog & docs watcher* — diff a changelog or release feed on a schedule, wake on change; the agent summarizes what moved.
+- *GPU / disk / service sentinel* — a sidecar container checks `nvidia-smi`, `df`, or health endpoints, wakes when a GPU goes idle (grab it) or disk crosses 90% (clean it).
+- *Data-feed staleness watchdog* — assert the feed's newest timestamp stays fresh; wake when it doesn't, the agent escalates.
+- *Experiment anomaly tripwire* — a tailer greps training logs for `NaN`/divergence markers and wakes long before the cron-based post-mortem would.
+
+**Honest edges**: `logPattern` is a literal, not a regex — design distinctive markers (`WAKE:` prefix) so ordinary output can't false-fire. Detection latency is bounded by `statusPoll` (1s floor) — right for the internet and infrastructure, wrong for control loops. The detector's bugs are your bugs: keep detection logic dead simple. Wake evidence is untrusted remote text (see `includeWakeEvidence`) — a compromised detector is a prompt-injection surface. And the detector's egress is the probe host's — one IP doing the crawling.
 
 ### Wake result summaries
 
