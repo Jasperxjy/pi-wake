@@ -144,6 +144,8 @@ Every alarm created in a session records that session's file as its owner. Coord
 
 ### Running the daemon
 
+**Single instance.** Daemons guard against duplicates at startup: a daemon that finds a fresh foreign heartbeat steps down immediately; on a cold-start race, each claims the heartbeat file with its pid and re-verifies after a 1–2.5 s stagger, so at most one survives.
+
 **Auto-start.** Sessions watch the daemon heartbeat (`.pi/wake-alarm.daemon.json`, rewritten every 5 s with pid + the last 30 log lines for post-mortem). When you create an alarm and no live daemon exists, the session starts one automatically (detached, `WAKE_ALARM_CWD` set to the project), and again on the way out when the last session closes. Set `"spawnDaemon": false` in `.pi/wake-alarm.json` (or `WAKE_ALARM_NO_AUTOSPAWN=1`) to manage the daemon yourself. Without a daemon, wakes that fire while all sessions are closed simply wait in the outbox until the next session starts.
 
 ```bash
@@ -237,6 +239,8 @@ Layout: `core.ts` (pure alarm/event logic) · `runtime.ts` (config, SSH probe, s
 ## Honest limitations
 
 - The daemon is auto-started by sessions but not supervised: an OS reboot still needs a service manager (schtasks/systemd) to bring it back before the next session opens. Roadmap: one global daemon serving multiple projects.
+- **Fired alarms are never garbage-collected.** A triggered one-shot timer or satisfied condition stays in the state file until `remove`d — deliberate while the project is young (post-mortem inspection beats auto-deletion during debugging). Planned: opt-in GC for "fired + all wakes delivered + older than N days" once usage stabilizes.
+- Wake evidence is remote-produced text and is included in wake messages by default (bounded, labeled untrusted). This is fine for experiment environments you control; point `includeWakeEvidence: false` at it before pointing pi-wake at hosts you do not trust.
 - The daemon delivers one wake at a time (deliberate, to keep state writes single-writer during a wake run); multiple alarms firing together are delivered sequentially.
 - A crashed session's presence record takes up to 60 s to expire, so daemon takeover for its alarms lags by at most that window; clean exits are immediate.
 - Alarms are project-global objects: **delivery** is owner-scoped, but **management** (`list`/`pause`/`reset`/`remove`) is available from any session — treat them like cron entries, not private session data. Alarm state is operational project state, not session-history state: rewinding or forking a Pi conversation does not roll back alarms that were already created.

@@ -100,7 +100,7 @@ jobs:
           node -e "const fs=require('fs');const now=Date.now();const overlong='y'.repeat(3000);const c=(i)=>({id:'g-'+i,name:'G #'+i,kind:'container',active:true,createdAt:now,container:'job-'+['a','b'][i-1],events:['exit'],policy:'keep',statusPollMs:60000,nextCheckAt:now,logOffset:0,scanCarry:'',eventFingerprints:{},consecutiveFailures:0,failureNotified:false,groupId:'g',revision:1,lastEvidence:overlong});fs.writeFileSync(process.argv[1],JSON.stringify({version:3,alarms:[{id:'g',name:'G',kind:'group',active:true,createdAt:now,memberIds:['g-1','g-2'],condition:'all_terminal',required:2,statusPollMs:60000,nextCheckAt:now,revision:1},c(1),c(2),{id:'done',name:'Done',kind:'condition',active:true,createdAt:now,path:'/data/results/analysis.json',condition:'exists',statusPollMs:60000,nextCheckAt:now,revision:1,lastEvidence:overlong}],outbox:[]}))" "$TMP/.pi/wake-alarm.state.json"
           WAKE_ALARM_CWD="$TMP" WAKE_ALARM_STATE_PATH="$TMP/.pi/wake-alarm.state.json" WAKE_ALARM_SPAWN_DRY_RUN=1 node node_modules/pi-wake/dist/daemon.js >fixture.log 2>&1 &
           FPID=$!
-          sleep 3
+          sleep 6
           kill "$FPID" 2>/dev/null || true
           wait "$FPID" 2>/dev/null || true
           # The fixture carries overlong 3KB evidence: the installed daemon must

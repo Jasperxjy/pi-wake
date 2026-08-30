@@ -4,8 +4,9 @@ import { spawn } from "node:child_process";
 import { promises as fs, readFileSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createDaemonEmit, daemonOwns } from "./daemon.ts";
+import { readDaemonLiveness } from "./presence.ts";
 import { leaderInstanceId, listLivePresences, registerPresence, releasePresence } from "./presence.ts";
 import { StateLock } from "./lock.ts";
 import { WakeAlarmRuntime, readOnlySnapshot, type EmitFn, type ExecFn, type StoredState } from "./runtime.ts";
@@ -828,9 +829,9 @@ function readStateSync(statePath: string): StoredState {
 	return JSON.parse(readFileSync(statePath, "utf8")) as StoredState;
 }
 
-async function waitFor(condition: () => boolean, label: string, timeoutMs = 3_000): Promise<void> {
+async function waitFor(condition: () => boolean | Promise<boolean>, label: string, timeoutMs = 3_000): Promise<void> {
 	const start = Date.now();
-	while (!condition()) {
+	while (!(await condition())) {
 		if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${label}`);
 		await new Promise((resolve) => setTimeout(resolve, 20));
 	}
@@ -1777,4 +1778,32 @@ test("readOnlySnapshot diagnoses state without a live runtime", async () => {
 	// Corrupt state: an explicit repair hint instead of a throw.
 	await fs.writeFile(statePath, "{broken");
 	assert.match(await readOnlySnapshot({ cwd: dir, statePath }), /cannot read state\.json/);
+});
+
+test("a second daemon on the same project steps down (single-instance guard)", { timeout: 60_000 }, async () => {
+	const dir = await makeDir();
+	const daemonEntry = fileURLToPath(new URL("./daemon.ts", import.meta.url));
+	const childEnv = { ...process.env, WAKE_ALARM_CWD: dir, WAKE_ALARM_SPAWN_DRY_RUN: "1" };
+	const first = spawn(process.execPath, [daemonEntry], { env: childEnv, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+	let firstOut = "";
+	first.stdout?.on("data", (chunk) => { firstOut += chunk; });
+	let firstCode: number | null = null;
+	first.on("close", (code) => { firstCode = code; });
+	try {
+		// Daemon A writes its claim heartbeat within ~1s of spawn; live once fresh.
+		await waitFor(async () => (await readDaemonLiveness(dir)).live, "daemon A to claim the heartbeat", 20_000);
+		const second = spawn(process.execPath, [daemonEntry], { env: childEnv, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+		let secondOut = "";
+		second.stdout?.on("data", (chunk) => { secondOut += chunk; });
+		const secondExit = new Promise<number | null>((resolve) => second.on("close", (code) => resolve(code)));
+		const code = await Promise.race([secondExit, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("daemon B did not step down within 15s")), 15_000))]);
+		assert.equal(code, 0, `stepping down must be a clean exit, output: ${secondOut}`);
+		assert.match(secondOut, /already live.*stepping down/s, "B explains why it exits");
+		// A must be unaffected and still heartbeating.
+		assert.equal(firstCode, null, "daemon A must survive B stepping down");
+		await waitFor(async () => (await readDaemonLiveness(dir)).heartbeat?.pid === first.pid, "the surviving heartbeat to belong to daemon A", 10_000);
+	} finally {
+		first.kill();
+		await new Promise((resolve) => first.on("close", () => resolve(undefined)));
+	}
 });

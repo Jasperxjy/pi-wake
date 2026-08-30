@@ -27,7 +27,7 @@ import { promises as fs, realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { buildResumeArgs, type AlarmState, type OutboxEntry } from "./core.ts";
-import { PRESENCE_DIR_NAME, clearDaemonHeartbeat, isSessionFileLive, listLivePresences, writeDaemonHeartbeat, type PresenceRecord } from "./presence.ts";
+import { PRESENCE_DIR_NAME, clearDaemonHeartbeat, isSessionFileLive, listLivePresences, readDaemonLiveness, writeDaemonHeartbeat, type PresenceRecord } from "./presence.ts";
 import { WakeAlarmRuntime, type EmitFn, type ExecFn } from "./runtime.ts";
 
 const PRESENCE_POLL_MS = 5_000;
@@ -294,8 +294,41 @@ async function shutdown(signal: string): Promise<void> {
 	process.exit(0);
 }
 
+/**
+ * Single-instance guard (heartbeat claim + staggered verify). Two daemons on one
+ * project never corrupt state — the transaction lock and delivery claims keep
+ * them correct — but they would double the probe traffic forever, and nothing
+ * else reaps the duplicate. Protocol:
+ *
+ *   1. a fresh foreign heartbeat already on disk -> step down immediately;
+ *   2. write OUR pid as a claim, then wait 1-2.5s (jitter staggers near-
+ *      simultaneous spawns) and re-read: any OTHER pid on the file means we
+ *      lost the race -> step down.
+ *
+ * The >=1s minimum stagger makes double survival impossible: for BOTH daemons
+ * to see their own pid afterwards, each would have to write more than 1s after
+ * the other's write — a contradiction. At most one daemon proceeds.
+ */
+async function singleInstanceGuard(): Promise<void> {
+	const pre = await readDaemonLiveness(cwd);
+	if (pre.live) {
+		log(`another pi-wake daemon (pid ${pre.heartbeat?.pid}) is already live for this project; stepping down`);
+		process.exit(0);
+	}
+	await heartbeat(); // claim the heartbeat path with OUR pid
+	await sleep(1_000 + Math.floor(Math.random() * 1_500));
+	const verify = await readDaemonLiveness(cwd);
+	if (verify.live && verify.heartbeat?.pid !== process.pid) {
+		log(`lost the single-instance race to daemon pid ${verify.heartbeat?.pid}; stepping down`);
+		await clearDaemonHeartbeat(cwd, process.pid).catch(() => undefined); // no-op when the winner's pid is on the file
+		process.exit(0);
+	}
+	if (verify.heartbeat?.pid === process.pid) await heartbeat(); // refresh so the winner never looks stale after the stagger
+}
+
 async function main(): Promise<void> {
 	log(`watching project ${cwd}${dryRun ? " (dry-run)" : ""}${spawnDisabled ? " (spawning disabled)" : ""}`);
+	await singleInstanceGuard();
 	const emit = createDaemonEmit({
 		getRuntime: () => active,
 		presenceDir,
