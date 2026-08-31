@@ -1,6 +1,6 @@
 {
  "package": "pi-wake",
- "generatedAt": "2026-08-30T10:50:00.853Z",
+ "generatedAt": "2026-08-31T09:56:20.841Z",
  "days": [
   {
    "downloads": 234,
@@ -19,8 +19,12 @@
    "day": "2026-08-29"
   },
   {
-   "downloads": 0,
+   "downloads": 321,
    "day": "2026-08-30"
+  },
+  {
+   "downloads": 0,
+   "day": "2026-08-31"
   }
  ]
 }
