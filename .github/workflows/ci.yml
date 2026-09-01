@@ -61,7 +61,7 @@ jobs:
           fi
           echo "::endgroup::"
           echo "::group::layout checks"
-          for f in dist/daemon.js dist/runtime.js dist/core.js extensions/pi-wake/index.ts; do
+          for f in dist/daemon.js dist/runtime.js dist/core.js extensions/pi-wake/index.ts extensions/pi-wake/runtime.ts extensions/pi-wake/core.ts extensions/pi-wake/presence.ts extensions/pi-wake/lock.ts extensions/pi-wake/ui-text.ts extensions/pi-wake/prompts.ts; do
             if [ -f "node_modules/pi-wake/$f" ]; then echo "$f present"; else echo "::error::$f MISSING from installed package"; exit 1; fi
           done
           if ! node -e "const p=require('pi-wake/package.json'); if(!p.bin||p.bin['pi-wake-daemon']!=='dist/daemon.js') process.exit(1)"; then

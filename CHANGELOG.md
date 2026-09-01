@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.2.3 (2026-09-01)
+## 0.2.4 (2026-09-01)
 
-UI and developer-experience release (git only; not yet published to npm).
+UI, i18n, and agent-prompt release. (0.2.3 was an unpublished git-only snapshot of the same content minus the prompt overhaul; this version ships everything to npm.)
 
 - **Status bar + alarm widget** in both the native TUI and pi-web: a footer segment (`wake: 3 · next X in 4m · daemon live`) plus a table above the editor (type word / name / status columns, width-aware alignment, `… +N more` folding). Renders only when alarms are active; refreshed on session start, every tool action, wake echoes, and the 15s presence tick.
 - **zh/en i18n**: system-locale auto-detection (Intl), `uiLanguage` in wake-alarm.json, and a model-switchable `set_language` action persisting a per-project preference; CJK display-width-aware padding keeps the table aligned with Chinese alarm names; group summaries translate via our fixed format.
