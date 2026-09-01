@@ -225,7 +225,10 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	// padding aligns. "docker" = remote container watch, "file" = condition.
 		const TYPE_WORD: Record<string, string> = { timer: "timer", container: "docker", group: "group", condition: "file" };
 		const visible = digest.entries.slice(0, WIDGET_MAX_ENTRIES);
-		const nameWidth = Math.min(16, Math.max(6, ...visible.map((entry) => entry.name.length)));
+		// Name column: clamp at 48 (3x the previous 16) — effectively "no truncation"
+// for realistic names; the column still pads only to the longest VISIBLE name,
+// so short rosters stay narrow.
+		const nameWidth = Math.min(48, Math.max(6, ...visible.map((entry) => entry.name.length)));
 		const lines = [`wake: ${digest.active} active${paused} · daemon ${daemonWord}${pending}`];
 		for (const entry of visible) {
 			const type = TYPE_WORD[entry.kind].padEnd(6);
