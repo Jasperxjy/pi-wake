@@ -480,6 +480,34 @@ export async function readStoredState(statePath: string): Promise<StoredState | 
 	return saved as unknown as StoredState;
 }
 
+export interface AlarmDigestEntry {
+	id: string;
+	name: string;
+	kind: AlarmState["kind"];
+	active: boolean;
+	/** Plain-text status line, no symbols/colors (must render in TUI and web). */
+	detail: string;
+}
+
+export interface AlarmDigest {
+	active: number;
+	paused: number;
+	pendingWakes: number;
+	nextDue?: { id: string; name: string; inMs: number };
+	entries: AlarmDigestEntry[];
+}
+
+/** Compact human delay for display: "40s", "4m", "1h 5m", "3d 4h". */
+export function formatDelay(ms: number): string {
+	const abs = Math.max(0, Math.round(ms / 1000));
+	if (abs < 60) return `${abs}s`;
+	const minutes = Math.floor(abs / 60);
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `${hours}h ${minutes % 60}m`;
+	return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+
 export function alarmSummary(alarm: AlarmState): string {
 	const lifecycle = alarm.active ? "active" : `paused${alarm.pauseReason ? ` (${alarm.pauseReason})` : ""}`;
 	if (alarm.kind === "timer") return `${alarm.id}: ${alarm.name} — timer ${lifecycle}; due=${formatLocalTime(alarm.dueAt)}${alarm.triggeredAt === undefined ? "" : `; fired=${formatLocalTime(alarm.triggeredAt)}`}`;
@@ -532,6 +560,42 @@ export class WakeAlarmRuntime {
 
 	get retiredLegacy(): boolean {
 		return this.retiredLegacyState;
+	}
+
+	/**
+	 * Read-only display snapshot for UI surfaces (status bar / widget): counts,
+	 * the next deterministic deadline, and one line per active alarm. Pure
+	 * in-memory — no locks, no disk, safe to call at UI refresh cadence.
+	 */
+	alarmDigest(): AlarmDigest {
+		const entries: AlarmDigestEntry[] = [];
+		let nextDue: AlarmDigest["nextDue"];
+		for (const alarm of this.alarms.values()) {
+			if (!alarm.active) continue;
+			let detail = "";
+			let inMs: number | undefined;
+			if (alarm.kind === "timer") {
+				inMs = alarm.dueAt - Date.now();
+				detail = inMs >= 0 ? `due in ${formatDelay(inMs)}` : `overdue ${formatDelay(-inMs)}`;
+				if (nextDue === undefined || inMs < nextDue.inMs) nextDue = { id: alarm.id, name: alarm.name, inMs };
+			} else if (alarm.kind === "container") {
+				const fails = alarm.consecutiveFailures > 0 ? ` · fail ${alarm.consecutiveFailures}` : "";
+				detail = `${alarm.lastContainerStatus ?? "unchecked"}${fails}`;
+			} else if (alarm.kind === "group") {
+				detail = alarm.summary ?? `${alarm.memberIds.length} members`;
+			} else {
+				detail = alarm.satisfiedAt !== undefined ? "satisfied" : `waiting · size ${alarm.lastSize ?? "?"}`;
+			}
+			entries.push({ id: alarm.id, name: alarm.name, kind: alarm.kind, active: true, detail });
+		}
+		entries.sort((a, b) => (a.kind === "timer" ? 0 : 1) - (b.kind === "timer" ? 0 : 1) || a.id.localeCompare(b.id));
+		return {
+			active: entries.length,
+			paused: [...this.alarms.values()].filter((alarm) => !alarm.active).length,
+			pendingWakes: this.outbox.size,
+			nextDue,
+			entries,
+		};
 	}
 
 	get runtimeConfig(): RuntimeConfig {

@@ -110,3 +110,58 @@ test("a wake lost host-side (abort clears the queue) is redelivered, not dropped
 		if (prevNoSpawn === undefined) delete process.env.WAKE_ALARM_NO_AUTOSPAWN; else process.env.WAKE_ALARM_NO_AUTOSPAWN = prevNoSpawn;
 	}
 });
+
+test("status bar + widget render active alarms (plain text, TUI and pi-web compatible)", { timeout: 30_000 }, async () => {
+	const prevNoSpawn = process.env.WAKE_ALARM_NO_AUTOSPAWN;
+	process.env.WAKE_ALARM_NO_AUTOSPAWN = "1";
+	const dir = await fs.mkdtemp(path.join(tmpdir(), "wake-index-test-"));
+	const statePath = path.join(dir, ".pi", "wake-alarm.state.json");
+	const sessionFile = path.join(dir, "session.jsonl");
+	await fs.mkdir(path.dirname(statePath), { recursive: true });
+	// One live far-future timer: the widget must appear and show a countdown.
+	await fs.writeFile(statePath, `${JSON.stringify({
+		version: 3,
+		alarms: [{ id: "t1", name: "Nightly eval", kind: "timer", active: true, createdAt: Date.now() - 1000, dueAt: Date.now() + 90_000, revision: 1 }],
+		outbox: [],
+	}, null, 2)}
+`);
+	const statuses: Array<[string, string | undefined]> = [];
+	const widgets: Array<[string, string[] | undefined]> = [];
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<void>>();
+	let toolExecute: ((id: string, params: unknown) => Promise<{ content: Array<{ type: string; text: string }> }>) | undefined;
+	const fakePi = {
+		registerTool: (definition: { execute: (id: string, params: unknown) => Promise<{ content: Array<{ type: string; text: string }> }> }) => { toolExecute = definition.execute; },
+		registerCommand: () => undefined,
+		on: (event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) => handlers.set(event, handler),
+		sendMessage: () => undefined,
+		exec: async () => ({ stdout: "", stderr: "", code: 0 }),
+	};
+	const fakeCtx = {
+		cwd: dir,
+		hasUI: true,
+		sessionManager: { getSessionFile: () => sessionFile },
+		ui: {
+			notify: () => undefined,
+			setStatus: (key: string, text: string | undefined) => { statuses.push([key, text]); },
+			setWidget: (key: string, lines: string[] | undefined) => { widgets.push([key, lines]); },
+		},
+	};
+	try {
+		wakeAlarmExtension(fakePi as never);
+		await handlers.get("session_start")!(undefined, fakeCtx);
+		await waitFor(() => widgets.some(([, lines]) => lines !== undefined), "the alarm widget to render", 10_000);
+		const [, lines] = widgets.filter(([, l]) => l !== undefined).pop() as [string, string[]];
+		assert.match(lines[0], /1 active · next Nightly eval in \d+[sm] · daemon offline/);
+		assert.match(lines[1] ?? "", /  - t1 \[timer\] due in \d+[sm]/);
+		assert.ok(lines.every((line) => !/[\u001b-\u001f]/.test(line)), "widget lines are plain text (no ANSI escapes)");
+		const status = statuses.filter(([key, text]) => key === "wake" && text !== undefined).pop();
+		assert.match(status?.[1] ?? "", /^wake: 1 · next Nightly eval in \d+[sm] · daemon offline$/);
+		// A create action refreshes the widget: add a second alarm via the tool path.
+		assert.ok(toolExecute, "tool execute captured at registration");
+		await toolExecute!("x", { action: "set_timer", id: "t2", name: "Second", after: "10m" });
+		await waitFor(() => widgets.some(([, lines]) => lines?.some((line) => line.includes("t2"))), "the widget to show the new alarm", 10_000);
+	} finally {
+		await handlers.get("session_shutdown")!(undefined, undefined).catch(() => undefined);
+		if (prevNoSpawn === undefined) delete process.env.WAKE_ALARM_NO_AUTOSPAWN; else process.env.WAKE_ALARM_NO_AUTOSPAWN = prevNoSpawn;
+	}
+});

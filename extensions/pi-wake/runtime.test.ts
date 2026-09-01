@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { WakeAlarmRuntime, type EmitFn, type ExecFn, type StoredState } from "./runtime.ts";
+import { WakeAlarmRuntime, formatDelay, type EmitFn, type ExecFn, type StoredState } from "./runtime.ts";
+import { createContainerAlarm, createTimerAlarm } from "./core.ts";
 import type { AlarmState, OutboxEntry, TimerAlarmState } from "./core.ts";
 
 const SESSION_X = "C:\\sessions\\x.jsonl";
@@ -286,6 +287,35 @@ test("reconcile adopts alarms created on disk after startup and drops removed on
 		await writeState(statePath, []);
 		await runtime.reconcileFromDisk();
 		assert.equal(runtime.alarmCount, 0);
+	} finally {
+		await runtime.stop();
+	}
+});
+
+test("alarmDigest: read-only display snapshot (counts, next deadline, one line per alarm)", async () => {
+	const { dir, statePath, configPath } = await makeFixture([]);
+	const now = Date.now();
+	const timer = createTimerAlarm({ id: "t1", name: "Train done", now, afterMs: 40_000 });
+	const fired = createTimerAlarm({ id: "t0", name: "Old", now: now - 60_000, afterMs: 10_000 });
+	const container = { ...createContainerAlarm({ id: "gpu", name: "GPU watch", container: "train", events: ["exit"], now, statusPollMs: 60_000 }), lastContainerStatus: "running", consecutiveFailures: 2 };
+	const paused = { ...fired, active: false, pauseReason: "timer fired" };
+	await writeState(statePath, [timer, container, paused], [{ eventId: "w1", alarmId: "t1", alarmName: "Train done", triggeredAt: now, events: [{ kind: "timer", fingerprint: "timer:t1:1" }], message: "[Wake alarm] Train done (t1)" }]);
+	const runtime = new WakeAlarmRuntime({ cwd: dir, configPath, statePath, emit: () => true, execFn: noopExec });
+	try {
+		await runtime.start({ flushPending: false });
+		const digest = runtime.alarmDigest();
+		assert.equal(digest.active, 2, "timer + container active");
+		assert.equal(digest.paused, 1);
+		assert.equal(digest.pendingWakes, 1);
+		assert.equal(digest.nextDue?.id, "t1");
+		assert.ok(digest.nextDue && digest.nextDue.inMs > 30_000 && digest.nextDue.inMs <= 40_000, "next deadline is the live timer");
+		const timerEntry = digest.entries.find((entry) => entry.id === "t1");
+		const containerEntry = digest.entries.find((entry) => entry.id === "gpu");
+		assert.match(timerEntry?.detail ?? "", /due in \d+s/, "timer detail is a countdown");
+		assert.match(containerEntry?.detail ?? "", /running · fail 2/);
+		assert.equal(digest.entries[0].id, "t1", "timers sort first (deterministic deadlines)");
+		assert.equal(formatDelay(40_000), "40s");
+		assert.equal(formatDelay(3_900_000), "1h 5m");
 	} finally {
 		await runtime.stop();
 	}

@@ -17,7 +17,9 @@ import {
 import {
 	ACTION_ENUM,
 	WakeAlarmRuntime,
+	formatDelay,
 	readOnlySnapshot,
+	type AlarmDigest,
 	type ToolParams,
 } from "./runtime.ts";
 
@@ -71,6 +73,7 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 			isLeader = leaderInstanceId(live) === instanceId;
 			presenceFailures = 0;
 			presenceWarned = false;
+			void refreshAlarmWidget();
 		} catch {
 			// Presence is the daemon's only signal that this session has a real Pi
 			// process. A silent failure here would let the daemon treat the session as
@@ -102,7 +105,7 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	pi.on("message_end", (event) => {
 		const message = (event as { message?: { customType?: string; details?: { eventId?: string } } }).message;
 		const eventId = message?.customType === "wake-alarm" ? message.details?.eventId : undefined;
-		if (eventId) void runtime?.confirmDelivery(eventId);
+		if (eventId) { void runtime?.confirmDelivery(eventId); void refreshAlarmWidget(); }
 	});
 	pi.on("agent_settled", () => { runtime?.onDeliveryCycleSettled(); });
 
@@ -192,6 +195,35 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		return ` (note: ${outcome})`;
 	}
 
+	// ---- status bar + widget (works in the TUI and in pi-web via RPC) --------
+	// Plain text only: RPC widgets accept string arrays (component factories are
+	// ignored over RPC), and ANSI colors would render as garbage on the web side.
+	const STATUS_KEY = "wake";
+	const WIDGET_KEY = "wake-alarms";
+	const WIDGET_MAX_ENTRIES = 5;
+	let uiSet: { setStatus: (key: string, text: string | undefined) => void; setWidget: (key: string, lines: string[] | undefined) => void } | undefined;
+
+	async function refreshAlarmWidget(): Promise<void> {
+		if (!uiSet) return;
+		let daemonWord = "offline";
+		try { daemonWord = (await readDaemonLiveness(cwd)).live ? "live" : "offline"; }
+		catch { /* display only */ }
+		const digest: AlarmDigest | undefined = runtime?.alarmDigest();
+		if (!digest || digest.active === 0) {
+			uiSet.setStatus(STATUS_KEY, undefined);
+			uiSet.setWidget(WIDGET_KEY, undefined);
+			return;
+		}
+		const next = digest.nextDue ? `next ${digest.nextDue.name} ${digest.nextDue.inMs >= 0 ? "in " : "overdue "}${formatDelay(Math.abs(digest.nextDue.inMs))}` : undefined;
+		const paused = digest.paused > 0 ? `, ${digest.paused} paused` : "";
+		const pending = digest.pendingWakes > 0 ? ` · ${digest.pendingWakes} wake pending` : "";
+		uiSet.setStatus(STATUS_KEY, `wake: ${digest.active} · ${next ?? "watching"} · daemon ${daemonWord}${pending}`);
+		const lines = [`wake alarms: ${digest.active} active${paused} · ${next ?? "watching"} · daemon ${daemonWord}${pending}`];
+		for (const entry of digest.entries.slice(0, WIDGET_MAX_ENTRIES)) lines.push(`  - ${entry.id} [${entry.kind}] ${entry.detail}`);
+		if (digest.entries.length > WIDGET_MAX_ENTRIES) lines.push(`  · ${digest.entries.length - WIDGET_MAX_ENTRIES} more`);
+		uiSet.setWidget(WIDGET_KEY, lines);
+	}
+
 	pi.registerTool({
 		name: "wake_alarm",
 		label: "Wake Alarm",
@@ -209,6 +241,7 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 			try {
 				const text = await runAction(params as ToolParams);
 				const note = await daemonNote(params.action as string).catch(() => "");
+				void refreshAlarmWidget();
 				return { content: [{ type: "text" as const, text: note ? `${text}${note}` : text }], details };
 			}
 			catch (error) { return { content: [{ type: "text" as const, text: `Wake alarm error: ${(error as Error).message}` }], details: { ...details, error: true } }; }
@@ -241,6 +274,8 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		presenceFailures = 0;
 		presenceWarned = false;
 		uiNotify = ctx.hasUI ? (message) => ctx.ui.notify(message, "warning") : undefined;
+		// hasUI covers TUI and RPC (pi-web); print mode (daemon-woken runs) has none.
+		uiSet = ctx.hasUI ? { setStatus: (key, text) => ctx.ui.setStatus(key, text), setWidget: (key, lines) => ctx.ui.setWidget(key, lines) } : undefined;
 		// Presence is established BEFORE any scheduling or wake flushing: each live
 		// session owns one registry file, so this never contends with other sessions.
 		if (!passive) {
@@ -260,6 +295,7 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 			await runtime.start({ flushPending: !passive });
 			if (passive) return;
 			startHeartbeat();
+			void refreshAlarmWidget();
 			if (ctx.hasUI && !isLeader) ctx.ui.notify("Wake alarm: another live session leads legacy alarms; this session schedules its own.", "info");
 			if (ctx.hasUI && runtime.retiredLegacy) ctx.ui.notify("Wake alarm retired the incompatible v1 periodic watcher state; no alarm was migrated.", "info");
 			if (ctx.hasUI && runtime.alarmCount) ctx.ui.notify(`Wake alarm restored ${runtime.alarmCount} alarm(s).`, "info");
@@ -276,6 +312,9 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		// Stop accepting and finish in-flight scheduler work first; only then
 		// withdraw live presence, so the daemon cannot interleave mid-shutdown.
 		stopHeartbeat();
+		uiSet?.setStatus(STATUS_KEY, undefined);
+		uiSet?.setWidget(WIDGET_KEY, undefined);
+		uiSet = undefined;
 		uiNotify = undefined;
 		const current = runtime;
 		runtime = undefined;
