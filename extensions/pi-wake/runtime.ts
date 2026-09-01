@@ -576,7 +576,7 @@ export class WakeAlarmRuntime {
 			let inMs: number | undefined;
 			if (alarm.kind === "timer") {
 				inMs = alarm.dueAt - Date.now();
-				detail = inMs >= 0 ? `due in ${formatDelay(inMs)}` : `overdue ${formatDelay(-inMs)}`;
+				detail = inMs >= 0 ? `in ${formatDelay(inMs)}` : `overdue ${formatDelay(-inMs)}`;
 				if (nextDue === undefined || inMs < nextDue.inMs) nextDue = { id: alarm.id, name: alarm.name, inMs };
 			} else if (alarm.kind === "container") {
 				const fails = alarm.consecutiveFailures > 0 ? ` · fail ${alarm.consecutiveFailures}` : "";
@@ -584,7 +584,7 @@ export class WakeAlarmRuntime {
 			} else if (alarm.kind === "group") {
 				detail = alarm.summary ?? `${alarm.memberIds.length} members`;
 			} else {
-				detail = alarm.satisfiedAt !== undefined ? "satisfied" : `waiting · size ${alarm.lastSize ?? "?"}`;
+				detail = alarm.satisfiedAt !== undefined ? "satisfied" : `waiting · ${alarm.lastSize ?? "?"}B`;
 			}
 			entries.push({ id: alarm.id, name: alarm.name, kind: alarm.kind, active: true, detail });
 		}

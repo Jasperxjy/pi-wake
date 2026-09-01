@@ -80,8 +80,8 @@ const child = spawn(process.execPath, [piCli, "--mode", "rpc", "--offline", "--a
 		assert.ok(widget, `no setWidget request; stdout tail: ${stdout.slice(-800)}; stderr tail: ${stderr.slice(-400)}`);
 		assert.ok(status, `no setStatus request; stdout tail: ${stdout.slice(-800)}`);
 		assert.match(widget.widgetLines![0], /^wake: 1 active · daemon offline$/, `widget header: ${widget.widgetLines![0]}`);
-		assert.ok(widget.widgetLines!.some((line) => /T RPC probe\s+due in \d+[sm]/.test(line)), `timer table row present: ${JSON.stringify(widget.widgetLines)}`);
-		assert.match(widget.widgetLines!.at(-1) ?? "", /^T timer  C container  G group  F condition$/, "legend line explains the symbols");
+		assert.ok(widget.widgetLines!.some((line) => /timer\s+RPC probe\s+in \d+[sm]/.test(line)), `timer table row present: ${JSON.stringify(widget.widgetLines)}`);
+		assert.ok(!widget.widgetLines!.some((line) => /^T timer/.test(line)), "no separate legend line: the type words are self-explanatory");
 		assert.ok(widget.widgetLines!.every((line) => !/[\u001b-\u001f]/.test(line)), "widget lines are plain text over RPC");
 		assert.match(status.statusText!, /^wake: 1 · next RPC probe in \d+[sm] · daemon offline$/, `footer status: ${status.statusText}`);
 	} finally {

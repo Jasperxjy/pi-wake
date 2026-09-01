@@ -218,20 +218,21 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		const paused = digest.paused > 0 ? `, ${digest.paused} paused` : "";
 		const pending = digest.pendingWakes > 0 ? ` · !${digest.pendingWakes} pending` : "";
 		uiSet.setStatus(STATUS_KEY, `wake: ${digest.active} · ${next ?? "watching"} · daemon ${daemonWord}`);
-		// Table layout: type symbol flush left, name column padded to align, status
-		// column. Both clients render widget lines in a monospace <pre>/TUI cell, so
-		// space padding aligns. Symbols stay single-width (emoji are double-width in
-		// terminals and would break the grid).
+		// Table layout: the type column uses WORDS padded to a fixed width (clearer
+		// than single letters and self-explanatory, so no legend line is needed), the
+	// name column is clamped tight to keep the horizontal footprint small, and
+	// both clients render widget lines in a monospace <pre>/TUI cell so space
+	// padding aligns. "docker" = remote container watch, "file" = condition.
+		const TYPE_WORD: Record<string, string> = { timer: "timer", container: "docker", group: "group", condition: "file" };
 		const visible = digest.entries.slice(0, WIDGET_MAX_ENTRIES);
-		const nameWidth = Math.min(20, Math.max(8, ...visible.map((entry) => entry.name.length)));
+		const nameWidth = Math.min(16, Math.max(6, ...visible.map((entry) => entry.name.length)));
 		const lines = [`wake: ${digest.active} active${paused} · daemon ${daemonWord}${pending}`];
 		for (const entry of visible) {
-			const symbol = entry.kind === "timer" ? "T" : entry.kind === "container" ? "C" : entry.kind === "group" ? "G" : "F";
+			const type = TYPE_WORD[entry.kind].padEnd(6);
 			const name = entry.name.length > nameWidth ? `${entry.name.slice(0, nameWidth - 1)}…` : entry.name.padEnd(nameWidth);
-			lines.push(`${symbol} ${name}  ${entry.detail}`);
+			lines.push(`${type} ${name}  ${entry.detail}`);
 		}
-		if (digest.entries.length > WIDGET_MAX_ENTRIES) lines.push(`  +${digest.entries.length - WIDGET_MAX_ENTRIES} more`);
-		lines.push(`T timer  C container  G group  F condition`);
+		if (digest.entries.length > WIDGET_MAX_ENTRIES) lines.push(`  … +${digest.entries.length - WIDGET_MAX_ENTRIES} more`);
 		uiSet.setWidget(WIDGET_KEY, lines);
 	}
 

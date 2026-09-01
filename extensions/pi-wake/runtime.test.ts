@@ -311,7 +311,7 @@ test("alarmDigest: read-only display snapshot (counts, next deadline, one line p
 		assert.ok(digest.nextDue && digest.nextDue.inMs > 30_000 && digest.nextDue.inMs <= 40_000, "next deadline is the live timer");
 		const timerEntry = digest.entries.find((entry) => entry.id === "t1");
 		const containerEntry = digest.entries.find((entry) => entry.id === "gpu");
-		assert.match(timerEntry?.detail ?? "", /due in \d+s/, "timer detail is a countdown");
+		assert.match(timerEntry?.detail ?? "", /in \d+s/, "timer detail is a countdown");
 		assert.match(containerEntry?.detail ?? "", /running · fail 2/);
 		assert.equal(digest.entries[0].id, "t1", "timers sort first (deterministic deadlines)");
 		assert.equal(formatDelay(40_000), "40s");
