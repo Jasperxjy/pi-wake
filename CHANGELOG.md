@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.3 (2026-09-01)
+
+UI and developer-experience release (git only; not yet published to npm).
+
+- **Status bar + alarm widget** in both the native TUI and pi-web: a footer segment (`wake: 3 · next X in 4m · daemon live`) plus a table above the editor (type word / name / status columns, width-aware alignment, `… +N more` folding). Renders only when alarms are active; refreshed on session start, every tool action, wake echoes, and the 15s presence tick.
+- **zh/en i18n**: system-locale auto-detection (Intl), `uiLanguage` in wake-alarm.json, and a model-switchable `set_language` action persisting a per-project preference; CJK display-width-aware padding keeps the table aligned with Chinese alarm names; group summaries translate via our fixed format.
+- **Display modes**: `/wake-alarm show | short | close` folds the two visuals away (footer-only, or fully hidden) without touching the alarms; persists next to the language preference; bilingual confirmations.
+- **Test automation**: real-pi RPC end-to-end test (spawns the peer-dependency pi, asserts the widget/status `extension_ui_request`s on stdout) — the whole UI surface now runs in `npm test`; hardened with `--no-extensions` after a real double-load conflict (a locally installed user-level pi-wake collides with the source under test).
+- **Dev workflows**: `npm run dev:link` project shim (with double-load conflict guard) and the recommended global live install `pi install <repo path>` — pi adds local paths to settings WITHOUT copying, so every project on the dev machine runs the repo source; verified in-repo and in foreign projects.
+- Fixed a shutdown race: an in-flight widget refresh could resume after session_shutdown nulled the UI handle; the handle is captured at entry.
+
+Tests: 104 (101 pass + 3 POSIX skips on Windows; 104/104 on WSL).
+
 ## 0.2.2 (2026-08-30)
 
 - **Echo-confirmed in-session delivery closes the at-least-once window.** Previously the outbox entry was deleted the moment `pi.sendMessage` returned — but mid-turn that only queues the message into pi's in-memory steering queue, so a host-side loss between queueing and consumption (user abort clears the queue; crash/kill evaporates it) silently dropped the wake. Now `deferDeliveryCompletion` keeps the entry durable (claim held) until the message is echoed into the conversation (`message_end` with the wake's `eventId`); an agent run that settles without echoing releases the claim for a backoff redelivery, and runtime shutdown releases unconfirmed handoffs. Daemon delivery is unchanged (woken-process exit 0 already proves persistence). Rare duplicates replace silent loss — at-least-once as documented.
