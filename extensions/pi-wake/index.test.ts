@@ -151,15 +151,15 @@ test("status bar + widget render active alarms (plain text, TUI and pi-web compa
 		await handlers.get("session_start")!(undefined, fakeCtx);
 		await waitFor(() => widgets.some(([, lines]) => lines !== undefined), "the alarm widget to render", 10_000);
 		const [, lines] = widgets.filter(([, l]) => l !== undefined).pop() as [string, string[]];
-		assert.match(lines[0], /1 active · next Nightly eval in \d+[sm] · daemon offline/);
-		assert.match(lines[1] ?? "", /  - t1 \[timer\] due in \d+[sm]/);
+		assert.match(lines[0], /^wake: 1 active · daemon offline$/);
+		assert.match(lines[1] ?? "", /T Nightly eval\s+due in \d+[sm]/);
 		assert.ok(lines.every((line) => !/[\u001b-\u001f]/.test(line)), "widget lines are plain text (no ANSI escapes)");
 		const status = statuses.filter(([key, text]) => key === "wake" && text !== undefined).pop();
 		assert.match(status?.[1] ?? "", /^wake: 1 · next Nightly eval in \d+[sm] · daemon offline$/);
 		// A create action refreshes the widget: add a second alarm via the tool path.
 		assert.ok(toolExecute, "tool execute captured at registration");
 		await toolExecute!("x", { action: "set_timer", id: "t2", name: "Second", after: "10m" });
-		await waitFor(() => widgets.some(([, lines]) => lines?.some((line) => line.includes("t2"))), "the widget to show the new alarm", 10_000);
+		await waitFor(() => widgets.some(([, lines]) => lines?.some((line) => /T Second\s+due in/.test(line))), "the widget to show the new alarm (by name, per the table layout)", 10_000);
 	} finally {
 		await handlers.get("session_shutdown")!(undefined, undefined).catch(() => undefined);
 		if (prevNoSpawn === undefined) delete process.env.WAKE_ALARM_NO_AUTOSPAWN; else process.env.WAKE_ALARM_NO_AUTOSPAWN = prevNoSpawn;

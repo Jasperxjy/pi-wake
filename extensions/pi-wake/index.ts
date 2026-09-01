@@ -216,11 +216,22 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		}
 		const next = digest.nextDue ? `next ${digest.nextDue.name} ${digest.nextDue.inMs >= 0 ? "in " : "overdue "}${formatDelay(Math.abs(digest.nextDue.inMs))}` : undefined;
 		const paused = digest.paused > 0 ? `, ${digest.paused} paused` : "";
-		const pending = digest.pendingWakes > 0 ? ` · ${digest.pendingWakes} wake pending` : "";
-		uiSet.setStatus(STATUS_KEY, `wake: ${digest.active} · ${next ?? "watching"} · daemon ${daemonWord}${pending}`);
-		const lines = [`wake alarms: ${digest.active} active${paused} · ${next ?? "watching"} · daemon ${daemonWord}${pending}`];
-		for (const entry of digest.entries.slice(0, WIDGET_MAX_ENTRIES)) lines.push(`  - ${entry.id} [${entry.kind}] ${entry.detail}`);
-		if (digest.entries.length > WIDGET_MAX_ENTRIES) lines.push(`  · ${digest.entries.length - WIDGET_MAX_ENTRIES} more`);
+		const pending = digest.pendingWakes > 0 ? ` · !${digest.pendingWakes} pending` : "";
+		uiSet.setStatus(STATUS_KEY, `wake: ${digest.active} · ${next ?? "watching"} · daemon ${daemonWord}`);
+		// Table layout: type symbol flush left, name column padded to align, status
+		// column. Both clients render widget lines in a monospace <pre>/TUI cell, so
+		// space padding aligns. Symbols stay single-width (emoji are double-width in
+		// terminals and would break the grid).
+		const visible = digest.entries.slice(0, WIDGET_MAX_ENTRIES);
+		const nameWidth = Math.min(20, Math.max(8, ...visible.map((entry) => entry.name.length)));
+		const lines = [`wake: ${digest.active} active${paused} · daemon ${daemonWord}${pending}`];
+		for (const entry of visible) {
+			const symbol = entry.kind === "timer" ? "T" : entry.kind === "container" ? "C" : entry.kind === "group" ? "G" : "F";
+			const name = entry.name.length > nameWidth ? `${entry.name.slice(0, nameWidth - 1)}…` : entry.name.padEnd(nameWidth);
+			lines.push(`${symbol} ${name}  ${entry.detail}`);
+		}
+		if (digest.entries.length > WIDGET_MAX_ENTRIES) lines.push(`  +${digest.entries.length - WIDGET_MAX_ENTRIES} more`);
+		lines.push(`T timer  C container  G group  F condition`);
 		uiSet.setWidget(WIDGET_KEY, lines);
 	}
 
