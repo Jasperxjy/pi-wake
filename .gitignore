@@ -10,3 +10,4 @@ dist/
 .build-staging/
 *.tgz
 .pi/wake-alarm.daemon.json*
+.pi/extensions/
