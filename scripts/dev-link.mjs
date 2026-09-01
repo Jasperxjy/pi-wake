@@ -49,4 +49,6 @@ export default piWake;
 `);
 console.log(`dev shim written: ${path.relative(repoRoot, shimPath)}`);
 console.log("open pi in this repo, then /reload after edits; remove with npm run dev:unlink");
+console.log("NOTE: a GLOBAL live install of the dev source supersedes the shim entirely:");
+console.log('  pi install D:/path/to/pi-wake   (no copy; every project loads the source)');
 
