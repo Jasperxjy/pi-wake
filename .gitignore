@@ -12,3 +12,4 @@ dist/
 .pi/wake-alarm.daemon.json*
 .pi/extensions/
 .pi/wake-alarm.json
+.pi/wake-alarm.prefs.json

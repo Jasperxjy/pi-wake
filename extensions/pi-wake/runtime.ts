@@ -74,6 +74,8 @@ export interface RuntimeConfig {
 	spawnOnWake: boolean;
 	/** Sessions auto-start the project daemon when no live daemon heartbeat exists (set false to manage the daemon yourself). */
 	spawnDaemon: boolean;
+	/** Status bar / widget display language: "auto" (system locale), "en", or "zh". Default "auto". */
+	uiLanguage: "auto" | "en" | "zh";
 	runTimeoutMs: number;
 	headlessTrust: "saved" | "always";
 	includeWakeEvidence: boolean;
@@ -96,7 +98,7 @@ export interface StoredState {
 }
 
 export interface ToolParams {
-	action: "set_timer" | "watch_container" | "watch_container_group" | "watch_condition" | "list" | "check" | "pause" | "resume" | "reset" | "remove" | "evidence" | "list_wakes" | "drop_wake" | "purge_wakes" | "ack";
+	action: "set_timer" | "watch_container" | "watch_container_group" | "watch_condition" | "list" | "check" | "pause" | "resume" | "reset" | "remove" | "evidence" | "list_wakes" | "drop_wake" | "purge_wakes" | "ack" | "set_language";
 	id?: string;
 	name?: string;
 	after?: string;
@@ -117,6 +119,8 @@ export interface ToolParams {
 	path?: string;
 	value?: string;
 	minSize?: number;
+	/** set_language only: display language for the status bar and widget ("auto" follows the system locale). */
+	language?: "auto" | "en" | "zh";
 	/** Absolute ISO timestamp or relative duration; condition files older than this never satisfy. */
 	ignoreBefore?: string;
 	purgePendingEvents?: boolean;
@@ -356,7 +360,7 @@ except Exception as exc:
 `;
 
 const PROBE_LOADER = `import base64,zlib;exec(zlib.decompress(base64.b64decode("${deflateSync(Buffer.from(PROBE_SCRIPT)).toString("base64")}")))`;
-export const ACTION_ENUM = ["set_timer", "watch_container", "watch_container_group", "watch_condition", "list", "check", "pause", "resume", "reset", "remove", "evidence", "list_wakes", "drop_wake", "purge_wakes", "ack"] as const;
+export const ACTION_ENUM = ["set_timer", "watch_container", "watch_container_group", "watch_condition", "list", "check", "pause", "resume", "reset", "remove", "evidence", "list_wakes", "drop_wake", "purge_wakes", "ack", "set_language"] as const;
 const ACTION_FIELDS: Record<ToolParams["action"], readonly (keyof ToolParams)[]> = {
 	set_timer: ["action", "id", "name", "after", "at"],
 	watch_container: ["action", "id", "name", "container", "events", "policy", "logPath", "logPattern", "deadline", "statusPoll", "logTailLines"],
@@ -373,6 +377,7 @@ const ACTION_FIELDS: Record<ToolParams["action"], readonly (keyof ToolParams)[]>
 	drop_wake: ["action", "eventId"],
 	purge_wakes: ["action", "id"],
 	ack: ["action", "id"],
+	set_language: ["action", "language"],
 };
 
 function shellSingleQuote(value: string): string {
@@ -485,8 +490,14 @@ export interface AlarmDigestEntry {
 	name: string;
 	kind: AlarmState["kind"];
 	active: boolean;
-	/** Plain-text status line, no symbols/colors (must render in TUI and web). */
+	/** Canonical English status line (logs, tests, and a display fallback). */
 	detail: string;
+	/** Language-neutral facts so the display layer can render any locale. */
+	dueInMs?: number;
+	containerStatus?: string;
+	failures?: number;
+	conditionSize?: number;
+	conditionSatisfied?: boolean;
 }
 
 export interface AlarmDigest {
@@ -573,20 +584,26 @@ export class WakeAlarmRuntime {
 		for (const alarm of this.alarms.values()) {
 			if (!alarm.active) continue;
 			let detail = "";
+			const facts: Partial<AlarmDigestEntry> = {};
 			let inMs: number | undefined;
 			if (alarm.kind === "timer") {
 				inMs = alarm.dueAt - Date.now();
 				detail = inMs >= 0 ? `in ${formatDelay(inMs)}` : `overdue ${formatDelay(-inMs)}`;
+				facts.dueInMs = inMs;
 				if (nextDue === undefined || inMs < nextDue.inMs) nextDue = { id: alarm.id, name: alarm.name, inMs };
 			} else if (alarm.kind === "container") {
 				const fails = alarm.consecutiveFailures > 0 ? ` · fail ${alarm.consecutiveFailures}` : "";
 				detail = `${alarm.lastContainerStatus ?? "unchecked"}${fails}`;
+				facts.containerStatus = alarm.lastContainerStatus ?? "unchecked";
+				facts.failures = alarm.consecutiveFailures;
 			} else if (alarm.kind === "group") {
 				detail = alarm.summary ?? `${alarm.memberIds.length} members`;
 			} else {
 				detail = alarm.satisfiedAt !== undefined ? "satisfied" : `waiting · ${alarm.lastSize ?? "?"}B`;
+				facts.conditionSatisfied = alarm.satisfiedAt !== undefined;
+				facts.conditionSize = alarm.lastSize;
 			}
-			entries.push({ id: alarm.id, name: alarm.name, kind: alarm.kind, active: true, detail });
+			entries.push({ id: alarm.id, name: alarm.name, kind: alarm.kind, active: true, detail, ...facts });
 		}
 		entries.sort((a, b) => (a.kind === "timer" ? 0 : 1) - (b.kind === "timer" ? 0 : 1) || a.id.localeCompare(b.id));
 		return {
@@ -619,13 +636,14 @@ export class WakeAlarmRuntime {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`Cannot read ${CONFIG_NAME}: ${(error as Error).message}`);
 		}
-		const KNOWN_KEYS = ["remote", "statusPoll", "maxLogBytes", "maxEvidenceChars", "maxOutboxEntries", "maxOutboxEntriesPerAlarm", "piCommand", "spawnOnWake", "spawnDaemon", "runTimeout", "headlessTrust", "includeWakeEvidence"];
+		const KNOWN_KEYS = ["remote", "statusPoll", "maxLogBytes", "maxEvidenceChars", "maxOutboxEntries", "maxOutboxEntriesPerAlarm", "piCommand", "spawnOnWake", "spawnDaemon", "runTimeout", "headlessTrust", "includeWakeEvidence", "uiLanguage"];
 		const unknownKeys = Object.keys(parsed).filter((key) => !KNOWN_KEYS.includes(key));
 		if (unknownKeys.length) throw new Error(`${CONFIG_NAME} contains unknown field(s): ${unknownKeys.join(", ")}`);
 		for (const retired of ["semanticReview", "maximumRuntime"]) if (retired in parsed) throw new Error(`${retired} is retired; wake alarms fire only for explicitly configured timers or conditions`);
 		if (parsed.piCommand !== undefined && (typeof parsed.piCommand !== "string" || !parsed.piCommand || parsed.piCommand.length > 512 || parsed.piCommand.includes("\0"))) throw new Error("piCommand must be a non-empty command path no longer than 512 characters");
 		if (parsed.spawnOnWake !== undefined && typeof parsed.spawnOnWake !== "boolean") throw new Error("spawnOnWake must be boolean");
 		if (parsed.spawnDaemon !== undefined && typeof parsed.spawnDaemon !== "boolean") throw new Error("spawnDaemon must be boolean");
+		if (parsed.uiLanguage !== undefined && parsed.uiLanguage !== "auto" && parsed.uiLanguage !== "en" && parsed.uiLanguage !== "zh") throw new Error("uiLanguage must be \"auto\", \"en\", or \"zh\"");
 		if (parsed.includeWakeEvidence !== undefined && typeof parsed.includeWakeEvidence !== "boolean") throw new Error("includeWakeEvidence must be boolean");
 		if (parsed.headlessTrust !== undefined && parsed.headlessTrust !== "saved" && parsed.headlessTrust !== "always") throw new Error("headlessTrust must be \"saved\" or \"always\"");
 		const maxOutboxEntries = asInt(parsed.maxOutboxEntries ?? 1000, "maxOutboxEntries", 1, 100_000);
@@ -644,6 +662,7 @@ export class WakeAlarmRuntime {
 			piCommand: parsed.piCommand as string | undefined,
 			spawnOnWake: parsed.spawnOnWake === undefined ? true : (parsed.spawnOnWake as boolean),
 			spawnDaemon: parsed.spawnDaemon === undefined ? true : (parsed.spawnDaemon as boolean),
+			uiLanguage: parsed.uiLanguage === undefined ? "auto" : (parsed.uiLanguage as "auto" | "en" | "zh"),
 			runTimeoutMs: parseDuration((parsed.runTimeout ?? "30m") as string | number, "runTimeout"),
 			headlessTrust: parsed.headlessTrust === undefined ? "saved" : (parsed.headlessTrust as "saved" | "always"),
 			includeWakeEvidence: parsed.includeWakeEvidence === undefined ? true : (parsed.includeWakeEvidence as boolean),
@@ -1936,6 +1955,7 @@ export class WakeAlarmRuntime {
 				case "watch_container_group": return `Set ${alarmSummary(await this.watchContainerGroup(params, context))}`;
 				case "watch_condition": return `Set ${alarmSummary(await this.watchCondition(params, context))}`;
 				case "list": return this.alarms.size ? [...this.alarms.values()].map(alarmSummary).join("\n") : "No wake alarms.";
+				case "set_language": throw new Error("set_language is handled by the session shell (it owns the UI preference); call it from a live session");
 				case "check": {
 					const ids = params.id ? [validateAlarmId(params.id)] : [...this.alarms.keys()];
 					if (!ids.length) return "No wake alarms.";

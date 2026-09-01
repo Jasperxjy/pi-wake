@@ -46,6 +46,8 @@ test("the extension surfaces its status bar + widget through a real pi RPC sessi
 	const dir = await fs.mkdtemp(path.join(tmpdir(), "wake-rpc-"));
 	const statePath = path.join(dir, ".pi", "wake-alarm.state.json");
 	await fs.mkdir(path.dirname(statePath), { recursive: true });
+	await fs.writeFile(path.join(dir, ".pi", "wake-alarm.prefs.json"), `${JSON.stringify({ version: 1, language: "en" })}
+`);
 	await fs.writeFile(statePath, `${JSON.stringify({
 		version: 3,
 		alarms: [{ id: "t1", name: "RPC probe", kind: "timer", active: true, createdAt: Date.now() - 1000, dueAt: Date.now() + 90_000, revision: 1 }],

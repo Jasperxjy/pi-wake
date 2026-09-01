@@ -118,6 +118,10 @@ test("status bar + widget render active alarms (plain text, TUI and pi-web compa
 	const statePath = path.join(dir, ".pi", "wake-alarm.state.json");
 	const sessionFile = path.join(dir, "session.jsonl");
 	await fs.mkdir(path.dirname(statePath), { recursive: true });
+	// Pin the display language so the assertions hold on any host locale
+	// (auto-detection is covered by the set_language test).
+	await fs.writeFile(path.join(dir, ".pi", "wake-alarm.prefs.json"), `${JSON.stringify({ version: 1, language: "en" })}
+`);
 	// One live far-future timer: the widget must appear and show a countdown.
 	await fs.writeFile(statePath, `${JSON.stringify({
 		version: 3,
@@ -160,6 +164,57 @@ test("status bar + widget render active alarms (plain text, TUI and pi-web compa
 		assert.ok(toolExecute, "tool execute captured at registration");
 		await toolExecute!("x", { action: "set_timer", id: "t2", name: "Second", after: "10m" });
 		await waitFor(() => widgets.some(([, lines]) => lines?.some((line) => /timer\s+Second\s+in/.test(line))), "the widget to show the new alarm (by name, per the table layout)", 10_000);
+	} finally {
+		await handlers.get("session_shutdown")!(undefined, undefined).catch(() => undefined);
+		if (prevNoSpawn === undefined) delete process.env.WAKE_ALARM_NO_AUTOSPAWN; else process.env.WAKE_ALARM_NO_AUTOSPAWN = prevNoSpawn;
+	}
+});
+
+test("set_language switches the widget to Chinese and persists the preference", { timeout: 30_000 }, async () => {
+	const prevNoSpawn = process.env.WAKE_ALARM_NO_AUTOSPAWN;
+	process.env.WAKE_ALARM_NO_AUTOSPAWN = "1";
+	const dir = await fs.mkdtemp(path.join(tmpdir(), "wake-index-test-"));
+	const statePath = path.join(dir, ".pi", "wake-alarm.state.json");
+	const sessionFile = path.join(dir, "session.jsonl");
+	await fs.mkdir(path.dirname(statePath), { recursive: true });
+	await fs.writeFile(statePath, `${JSON.stringify({
+		version: 3,
+		alarms: [{ id: "t1", name: "Eval gate", kind: "timer", active: true, createdAt: Date.now() - 1000, dueAt: Date.now() + 90_000, revision: 1 }],
+		outbox: [],
+	}, null, 2)}
+`);
+	const widgets: Array<[string, string[] | undefined]> = [];
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<void>>();
+	let toolExecute: ((id: string, params: unknown) => Promise<{ content: Array<{ type: string; text: string }> }>) | undefined;
+	const fakePi = {
+		registerTool: (definition: { execute: (id: string, params: unknown) => Promise<{ content: Array<{ type: string; text: string }> }> }) => { toolExecute = definition.execute; },
+		registerCommand: () => undefined,
+		on: (event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) => handlers.set(event, handler),
+		sendMessage: () => undefined,
+		exec: async () => ({ stdout: "", stderr: "", code: 0 }),
+	};
+	const fakeCtx = {
+		cwd: dir,
+		hasUI: true,
+		sessionManager: { getSessionFile: () => sessionFile },
+		ui: {
+			notify: () => undefined,
+			setStatus: () => undefined,
+			setWidget: (key: string, lines: string[] | undefined) => { widgets.push([key, lines]); },
+		},
+	};
+	try {
+		wakeAlarmExtension(fakePi as never);
+		await handlers.get("session_start")!(undefined, fakeCtx);
+		assert.ok(toolExecute, "tool execute captured");
+		const result = await toolExecute!("x", { action: "set_language", language: "zh" });
+		assert.match(result.content[0].text, /显示语言已切换为中文/);
+		// The preference is persisted for future sessions.
+		assert.equal(JSON.parse(await fs.readFile(path.join(dir, ".pi", "wake-alarm.prefs.json"), "utf8")).language, "zh");
+		// The widget re-renders in Chinese immediately.
+		await waitFor(() => widgets.some(([, lines]) => lines?.some((line) => line.includes("定时") && line.includes("Eval gate"))), "the Chinese widget to render", 10_000);
+		const zhLines = widgets.filter(([, lines]) => lines?.some((l) => l.includes("定时"))).pop()?.[1] ?? [];
+		assert.match(zhLines[0] ?? "", /^唤醒: 1 活跃 · 守护(在线|离线)$/);
 	} finally {
 		await handlers.get("session_shutdown")!(undefined, undefined).catch(() => undefined);
 		if (prevNoSpawn === undefined) delete process.env.WAKE_ALARM_NO_AUTOSPAWN; else process.env.WAKE_ALARM_NO_AUTOSPAWN = prevNoSpawn;

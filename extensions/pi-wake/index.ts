@@ -7,6 +7,14 @@ import { spawn } from "node:child_process";
 import { access } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
+	detectSystemLanguage,
+	formatFooterStatus,
+	formatWidgetLines,
+	readPrefs,
+	resolveLanguage,
+	writePrefs,
+} from "./ui-text.ts";
+import {
 	PRESENCE_DIR_NAME,
 	leaderInstanceId,
 	listLivePresences,
@@ -17,7 +25,6 @@ import {
 import {
 	ACTION_ENUM,
 	WakeAlarmRuntime,
-	formatDelay,
 	readOnlySnapshot,
 	type AlarmDigest,
 	type ToolParams,
@@ -48,6 +55,7 @@ const TOOL_PARAMETERS = Type.Object({
 	minSize: Type.Optional(Type.Integer({ description: "Byte threshold for the min_size condition" })),
 	ignoreBefore: Type.Optional(Type.String({ description: "watch_condition only: ignore files last modified before this time (absolute ISO timestamp with timezone, or relative like '5m'); guards against stale markers from previous runs" })),
 	purgePendingEvents: Type.Optional(Type.Boolean({ description: "remove also clears this alarm's undelivered wakes" })),
+	language: Type.Optional(StringEnum(["auto", "en", "zh"] as const, { description: "set_language only: status bar / widget display language ('auto' follows the system locale)" })),
 });
 
 export default function wakeAlarmExtension(pi: ExtensionAPI) {
@@ -123,6 +131,17 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	}
 
 	async function runAction(params: ToolParams): Promise<string> {
+		if (params.action === "set_language") {
+			// Display preference is owned by the shell (it renders the widget), not the runtime.
+			const value = params.language ?? "auto";
+			if (value !== "auto" && value !== "en" && value !== "zh") throw new Error("language must be auto, en, or zh");
+			await writePrefs(cwd, { version: 1, language: value });
+			await refreshAlarmWidget();
+			const effective = value === "auto" ? detectSystemLanguage() : value;
+			return effective === "zh"
+				? `显示语言已切换为中文（${value === "auto" ? "自动跟随系统" : "手动设置"}）。`
+				: `Display language set to English (${value === "auto" ? "auto, follows the system locale" : "manual"}).`;
+		}
 		if (!runtime) {
 			// Diagnostic entry points stay usable even when the runtime is dead (failed
 			// session_start, foreign project): list/list_wakes/check degrade to a
@@ -204,45 +223,32 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	let uiSet: { setStatus: (key: string, text: string | undefined) => void; setWidget: (key: string, lines: string[] | undefined) => void } | undefined;
 
 	async function refreshAlarmWidget(): Promise<void> {
-		if (!uiSet) return;
-		let daemonWord = "offline";
-		try { daemonWord = (await readDaemonLiveness(cwd)).live ? "live" : "offline"; }
+		// Capture the UI handle up front: an in-flight refresh must survive a
+		// session_shutdown that nulls uiSet while our awaits are suspended.
+		const ui = uiSet;
+		if (!ui) return;
+		let daemonLive = false;
+		try { daemonLive = (await readDaemonLiveness(cwd)).live; }
 		catch { /* display only */ }
-		const digest: AlarmDigest | undefined = runtime?.alarmDigest();
+		const runtimeNow = runtime;
+		const digest: AlarmDigest | undefined = runtimeNow?.alarmDigest();
 		if (!digest || digest.active === 0) {
-			uiSet.setStatus(STATUS_KEY, undefined);
-			uiSet.setWidget(WIDGET_KEY, undefined);
+			ui.setStatus(STATUS_KEY, undefined);
+			ui.setWidget(WIDGET_KEY, undefined);
 			return;
 		}
-		const next = digest.nextDue ? `next ${digest.nextDue.name} ${digest.nextDue.inMs >= 0 ? "in " : "overdue "}${formatDelay(Math.abs(digest.nextDue.inMs))}` : undefined;
-		const paused = digest.paused > 0 ? `, ${digest.paused} paused` : "";
-		const pending = digest.pendingWakes > 0 ? ` · !${digest.pendingWakes} pending` : "";
-		uiSet.setStatus(STATUS_KEY, `wake: ${digest.active} · ${next ?? "watching"} · daemon ${daemonWord}`);
-		// Table layout: the type column uses WORDS padded to a fixed width (clearer
-		// than single letters and self-explanatory, so no legend line is needed), the
-	// name column is clamped tight to keep the horizontal footprint small, and
-	// both clients render widget lines in a monospace <pre>/TUI cell so space
-	// padding aligns. "docker" = remote container watch, "file" = condition.
-		const TYPE_WORD: Record<string, string> = { timer: "timer", container: "docker", group: "group", condition: "file" };
-		const visible = digest.entries.slice(0, WIDGET_MAX_ENTRIES);
-		// Name column: clamp at 48 (3x the previous 16) — effectively "no truncation"
-// for realistic names; the column still pads only to the longest VISIBLE name,
-// so short rosters stay narrow.
-		const nameWidth = Math.min(48, Math.max(6, ...visible.map((entry) => entry.name.length)));
-		const lines = [`wake: ${digest.active} active${paused} · daemon ${daemonWord}${pending}`];
-		for (const entry of visible) {
-			const type = TYPE_WORD[entry.kind].padEnd(6);
-			const name = entry.name.length > nameWidth ? `${entry.name.slice(0, nameWidth - 1)}…` : entry.name.padEnd(nameWidth);
-			lines.push(`${type} ${name}  ${entry.detail}`);
-		}
-		if (digest.entries.length > WIDGET_MAX_ENTRIES) lines.push(`  … +${digest.entries.length - WIDGET_MAX_ENTRIES} more`);
-		uiSet.setWidget(WIDGET_KEY, lines);
+		// Language: tool preference (set_language) > config uiLanguage > system locale.
+		const prefs = await readPrefs(cwd).catch(() => undefined);
+		const language = resolveLanguage(prefs?.language, runtimeNow?.runtimeConfig.uiLanguage, detectSystemLanguage());
+		const render = { language, daemonLive };
+		ui.setStatus(STATUS_KEY, formatFooterStatus(digest, render));
+		ui.setWidget(WIDGET_KEY, formatWidgetLines(digest, { ...render, maxEntries: WIDGET_MAX_ENTRIES }));
 	}
 
 	pi.registerTool({
 		name: "wake_alarm",
 		label: "Wake Alarm",
-		description: "Set and manage persistent alarms: one-shot timers, REMOTE Docker container watches over SSH (watch_container probes Docker on the configured remote host, not locally), batch barriers over many containers (watch_container_group — ONE summary wake when any/all/required members are terminal), completion-file conditions (watch_condition — a remote result file exists/contains a marker/reaches a size), bounded container log tails in exit wakes (logTailLines), and an explicit outbox (list_wakes, drop_wake, purge_wakes, ack). Wakes that fire while ALL sessions are closed are delivered by the pi-wake daemon (auto-started; heartbeat in .pi/wake-alarm.daemon.json). Deterministic polling never wakes the model unless a configured event occurs.",
+		description: "Set and manage persistent alarms: one-shot timers, REMOTE Docker container watches over SSH (watch_container probes Docker on the configured remote host, not locally), batch barriers over many containers (watch_container_group — ONE summary wake when any/all/required members are terminal), completion-file conditions (watch_condition — a remote result file exists/contains a marker/reaches a size), bounded container log tails in exit wakes (logTailLines), an explicit outbox (list_wakes, drop_wake, purge_wakes, ack), and a display-language switch for the status bar / widget (set_language: auto/en/zh). Wakes that fire while ALL sessions are closed are delivered by the pi-wake daemon (auto-started; heartbeat in .pi/wake-alarm.daemon.json). Deterministic polling never wakes the model unless a configured event occurs.",
 		promptSnippet: "Set named timers, container/group barriers, and completion-file conditions; manage wakes with ack/drop_wake",
 		promptGuidelines: [
 			"Use wake_alarm as a scheduling/event primitive. Prefer one watch_container_group for multi-container batches instead of many individual alarms: it emits a single summary wake. Alarm names are short labels, not plans or continuation instructions. Use ack/drop_wake to clear undelivered wakes you have already acted on.",
