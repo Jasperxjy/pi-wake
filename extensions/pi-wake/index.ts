@@ -12,7 +12,9 @@ import {
 	formatWidgetLines,
 	readPrefs,
 	resolveLanguage,
+	updatePrefs,
 	writePrefs,
+	type UiDisplay,
 } from "./ui-text.ts";
 import {
 	PRESENCE_DIR_NAME,
@@ -135,7 +137,7 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 			// Display preference is owned by the shell (it renders the widget), not the runtime.
 			const value = params.language ?? "auto";
 			if (value !== "auto" && value !== "en" && value !== "zh") throw new Error("language must be auto, en, or zh");
-			await writePrefs(cwd, { version: 1, language: value });
+			await updatePrefs(cwd, { language: value });
 			await refreshAlarmWidget();
 			const effective = value === "auto" ? detectSystemLanguage() : value;
 			return effective === "zh"
@@ -241,8 +243,15 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		const prefs = await readPrefs(cwd).catch(() => undefined);
 		const language = resolveLanguage(prefs?.language, runtimeNow?.runtimeConfig.uiLanguage, detectSystemLanguage());
 		const render = { language, daemonLive };
+		const display: UiDisplay = prefs?.display ?? "full";
+		if (display === "off") {
+			ui.setStatus(STATUS_KEY, undefined);
+			ui.setWidget(WIDGET_KEY, undefined);
+			return;
+		}
 		ui.setStatus(STATUS_KEY, formatFooterStatus(digest, render));
-		ui.setWidget(WIDGET_KEY, formatWidgetLines(digest, { ...render, maxEntries: WIDGET_MAX_ENTRIES }));
+		// short = footer only; full = footer + the detail table.
+		ui.setWidget(WIDGET_KEY, display === "full" ? formatWidgetLines(digest, { ...render, maxEntries: WIDGET_MAX_ENTRIES }) : undefined);
 	}
 
 	pi.registerTool({
@@ -270,15 +279,32 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("wake-alarm", {
-		description: "Manage wake alarms with lifecycle arguments or a JSON wake_alarm request",
+		description: "Manage wake alarms; also show/short/close to control the status bar + widget",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			try {
+				// Display-mode controls: the widget and footer are shared screen real
+				// estate, so users can fold them away without touching the alarms.
+				const DISPLAY_WORDS: Record<string, UiDisplay> = { show: "full", detail: "full", short: "short", close: "off", hide: "off" };
+				const word = trimmed.toLowerCase();
+				const display = DISPLAY_WORDS[word];
+				if (display) {
+					await updatePrefs(cwd, { display });
+					await refreshAlarmWidget();
+					const zh = resolveLanguage((await readPrefs(cwd).catch(() => undefined))?.language, runtime?.runtimeConfig.uiLanguage, detectSystemLanguage()) === "zh";
+					const confirmations: Record<UiDisplay, [string, string]> = {
+						full: ["Widget + status bar shown.", "已恢复完整显示（状态栏 + 表格）。"],
+						short: ["Compact mode: status bar only.", "已切换为简洁显示（仅状态栏）。"],
+						off: ["Display off: no status bar, no widget (alarms keep running).", "已关闭显示（闹钟照常运行，可用 /wake-alarm show 恢复）。"],
+					};
+					ctx.ui.notify(zh ? confirmations[display][1] : confirmations[display][0], "info");
+					return;
+				}
 				let params: ToolParams;
 				if (trimmed.startsWith("{")) params = JSON.parse(trimmed) as ToolParams;
 				else {
 					const [action, id] = trimmed.split(/\s+/);
-					if (!(action === "list" || action === "check" || action === "pause" || action === "resume" || action === "remove")) throw new Error("usage: /wake-alarm <JSON request> | list | check [id] | pause|resume|remove <id>");
+					if (!(action === "list" || action === "check" || action === "pause" || action === "resume" || action === "remove")) throw new Error("usage: /wake-alarm <JSON request> | list | check [id] | pause|resume|remove <id> | show|short|close (display)");
 					params = { action, id: id || undefined } as ToolParams;
 				}
 				ctx.ui.notify(await runAction(params), "info");

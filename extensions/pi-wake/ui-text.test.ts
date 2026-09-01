@@ -11,6 +11,7 @@ import {
 	padDisplay,
 	readPrefs,
 	resolveLanguage,
+	updatePrefs,
 	translateGroupSummary,
 	truncateDisplay,
 	writePrefs,
@@ -82,6 +83,17 @@ test("prefs round-trip to .pi/wake-alarm.prefs.json", async () => {
 	assert.equal(await readPrefs(dir), undefined, "absent prefs read as undefined");
 	await writePrefs(dir, { version: 1, language: "zh" });
 	assert.deepEqual(await readPrefs(dir), { version: 1, language: "zh" });
+});
+
+test("updatePrefs merges: setting the display keeps the language and vice versa", async () => {
+	const dir = await fs.mkdtemp(path.join(tmpdir(), "wake-prefs-"));
+	await writePrefs(dir, { version: 1, language: "zh" });
+	const updated = await updatePrefs(dir, { display: "short" });
+	assert.deepEqual(updated, { version: 1, language: "zh", display: "short" });
+	assert.deepEqual(await readPrefs(dir), { version: 1, language: "zh", display: "short" });
+	// Invalid display values are ignored on read (corrupt file -> defaults).
+	await writePrefs(dir, { version: 1, language: "en", display: "bogus" as never });
+	assert.deepEqual(await readPrefs(dir), { version: 1, language: "en" });
 });
 
 test("system detection: zh locale prefix maps to zh, anything else to en", () => {

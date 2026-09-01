@@ -15,9 +15,13 @@ export type LanguagePreference = "auto" | UiLanguage;
 
 const PREFS_NAME = "wake-alarm.prefs.json";
 
+/** Widget/footer display mode: full = footer + table, short = footer only, off = neither. */
+export type UiDisplay = "full" | "short" | "off";
+
 export interface UiPrefs {
 	version: 1;
-	language: LanguagePreference;
+	language?: LanguagePreference;
+	display?: UiDisplay;
 }
 
 export function prefsPath(cwd: string): string {
@@ -27,9 +31,24 @@ export function prefsPath(cwd: string): string {
 export async function readPrefs(cwd: string): Promise<UiPrefs | undefined> {
 	try {
 		const raw = JSON.parse((await fs.readFile(prefsPath(cwd), "utf8")).trim()) as Partial<UiPrefs>;
-		if (raw.language === "auto" || raw.language === "en" || raw.language === "zh") return { version: 1, language: raw.language };
+		const language = raw.language === "auto" || raw.language === "en" || raw.language === "zh" ? raw.language : undefined;
+		const display = raw.display === "full" || raw.display === "short" || raw.display === "off" ? raw.display : undefined;
+		if (language === undefined && display === undefined) return undefined;
+		// Conditionally-built so deep-equal sees no undefined-valued keys.
+		const prefs: UiPrefs = { version: 1 };
+		if (language !== undefined) prefs.language = language;
+		if (display !== undefined) prefs.display = display;
+		return prefs;
 	} catch { /* absent or unreadable: fall through */ }
 	return undefined;
+}
+
+/** Read-merge-write, so setting the language keeps the display mode and vice versa. */
+export async function updatePrefs(cwd: string, patch: Partial<UiPrefs>): Promise<UiPrefs> {
+	const current = (await readPrefs(cwd).catch(() => undefined)) ?? { version: 1 };
+	const next: UiPrefs = { version: 1, language: patch.language ?? current.language, display: patch.display ?? current.display };
+	await writePrefs(cwd, next);
+	return next;
 }
 
 export async function writePrefs(cwd: string, prefs: UiPrefs): Promise<void> {

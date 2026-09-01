@@ -170,6 +170,69 @@ test("status bar + widget render active alarms (plain text, TUI and pi-web compa
 	}
 });
 
+test("/wake-alarm show|short|close controls the two visuals independently of the alarms", { timeout: 30_000 }, async () => {
+	const prevNoSpawn = process.env.WAKE_ALARM_NO_AUTOSPAWN;
+	process.env.WAKE_ALARM_NO_AUTOSPAWN = "1";
+	const dir = await fs.mkdtemp(path.join(tmpdir(), "wake-index-test-"));
+	const statePath = path.join(dir, ".pi", "wake-alarm.state.json");
+	const sessionFile = path.join(dir, "session.jsonl");
+	await fs.mkdir(path.dirname(statePath), { recursive: true });
+	await fs.writeFile(path.join(dir, ".pi", "wake-alarm.prefs.json"), `${JSON.stringify({ version: 1, language: "en" })}
+`);
+	await fs.writeFile(statePath, `${JSON.stringify({
+		version: 3,
+		alarms: [{ id: "t1", name: "Visible", kind: "timer", active: true, createdAt: Date.now() - 1000, dueAt: Date.now() + 90_000, revision: 1 }],
+		outbox: [],
+	}, null, 2)}
+`);
+	const statuses: Array<string | undefined> = [];
+	const widgets: Array<string[] | undefined> = [];
+	const notifications: string[] = [];
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<void>>();
+	let commandHandler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+	const fakePi = {
+		registerTool: () => undefined,
+		registerCommand: (_name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => { commandHandler = def.handler; },
+		on: (event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) => handlers.set(event, handler),
+		sendMessage: () => undefined,
+		exec: async () => ({ stdout: "", stderr: "", code: 0 }),
+	};
+	const fakeCtx = {
+		cwd: dir,
+		hasUI: true,
+		sessionManager: { getSessionFile: () => sessionFile },
+		ui: {
+			notify: (message: string) => { notifications.push(message); },
+			setStatus: (_key: string, text: string | undefined) => { statuses.push(text); },
+			setWidget: (_key: string, lines: string[] | undefined) => { widgets.push(lines); },
+		},
+	};
+	const prefs = async () => JSON.parse(await fs.readFile(path.join(dir, ".pi", "wake-alarm.prefs.json"), "utf8"));
+	try {
+		wakeAlarmExtension(fakePi as never);
+		await handlers.get("session_start")!(undefined, fakeCtx);
+		assert.ok(commandHandler, "command handler captured");
+		await waitFor(() => widgets.some((lines) => lines !== undefined), "the widget to render in full mode", 10_000);
+		// short: footer only — the widget must be CLEARED while the status keeps updating.
+		await commandHandler!("short", fakeCtx);
+		await waitFor(() => widgets.length > 0 && widgets[widgets.length - 1] === undefined, "the widget to be cleared in short mode", 10_000);
+		assert.match(statuses[statuses.length - 1] ?? "", /^wake: 1 · next Visible in \d+[sm] · daemon offline$/, "footer keeps rendering in short mode");
+		assert.equal((await prefs()).display, "short", "display mode persisted");
+		// off: both cleared.
+		await commandHandler!("close", fakeCtx);
+		await waitFor(() => statuses[statuses.length - 1] === undefined && widgets[widgets.length - 1] === undefined, "both visuals cleared in off mode", 10_000);
+		assert.equal((await prefs()).display, "off");
+		// show: everything back.
+		await commandHandler!("show", fakeCtx);
+		await waitFor(() => widgets.some((lines) => lines !== undefined) && statuses[statuses.length - 1] !== undefined, "full mode restored", 10_000);
+		assert.equal((await prefs()).display, "full");
+		assert.ok(notifications.some((message) => message.includes("Widget + status bar shown")), `confirmation: ${JSON.stringify(notifications)}`);
+	} finally {
+		await handlers.get("session_shutdown")!(undefined, undefined).catch(() => undefined);
+		if (prevNoSpawn === undefined) delete process.env.WAKE_ALARM_NO_AUTOSPAWN; else process.env.WAKE_ALARM_NO_AUTOSPAWN = prevNoSpawn;
+	}
+});
+
 test("set_language switches the widget to Chinese and persists the preference", { timeout: 30_000 }, async () => {
 	const prevNoSpawn = process.env.WAKE_ALARM_NO_AUTOSPAWN;
 	process.env.WAKE_ALARM_NO_AUTOSPAWN = "1";
