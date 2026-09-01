@@ -117,6 +117,10 @@ export interface ConditionAlarmState extends AlarmBase {
 	/** Files whose mtime is strictly OLDER than this epoch-ms cutoff never satisfy
 	 * the condition: a stale marker from a previous run cannot fire a false wake. */
 	ignoreBefore?: number;
+	/** The ORIGINAL user-supplied ignoreBefore spec ("5m" or an absolute ISO
+	 * timestamp): reset recomputes RELATIVE specs against the new arming time, so
+	 * "5 minutes before this watch" stays true across re-arms. */
+	ignoreBeforeSpec?: string;
 	statusPollMs: number;
 	nextCheckAt: number;
 	satisfiedAt?: number;
@@ -476,6 +480,7 @@ export function createConditionAlarm(input: {
 	value?: string;
 	minSize?: number;
 	ignoreBefore?: number;
+	ignoreBeforeSpec?: string;
 	allowedRemoteLogRoots?: readonly string[];
 	now: number;
 	statusPollMs?: number;
@@ -487,6 +492,7 @@ export function createConditionAlarm(input: {
 	if (condition === "contains" && (!input.value || input.value.length > 256 || input.value.includes("\0"))) throw new Error("contains requires a literal value no longer than 256 characters");
 	if (condition === "min_size" && (!Number.isSafeInteger(input.minSize) || (input.minSize as number) < 1)) throw new Error("min_size requires a positive integer minSize");
 	if (input.ignoreBefore !== undefined && (!Number.isSafeInteger(input.ignoreBefore) || input.ignoreBefore < 0)) throw new Error("ignoreBefore must be a non-negative epoch-ms timestamp");
+	if (input.ignoreBeforeSpec !== undefined && (typeof input.ignoreBeforeSpec !== "string" || !input.ignoreBeforeSpec || input.ignoreBeforeSpec.length > 64 || input.ignoreBeforeSpec.includes("\0"))) throw new Error("ignoreBeforeSpec must be a string no longer than 64 characters");
 	return {
 		id: validateAlarmId(input.id),
 		name: validateAlarmName(input.name),
@@ -499,6 +505,7 @@ export function createConditionAlarm(input: {
 		value: condition === "contains" ? input.value : undefined,
 		minSize: condition === "min_size" ? input.minSize : undefined,
 		ignoreBefore: input.ignoreBefore,
+		ignoreBeforeSpec: input.ignoreBeforeSpec,
 		statusPollMs: validatePollingDuration(input.statusPollMs ?? DEFAULT_STATUS_POLL_MS),
 		nextCheckAt: input.now,
 	};
@@ -790,13 +797,14 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 		};
 	}
 	if (base.kind === "condition") {
-		assertKnown(record, [...baseFields, "path", "condition", "value", "minSize", "ignoreBefore", "statusPollMs", "nextCheckAt", "satisfiedAt", "pendingSatisfiedAt", "lastSatisfied", "lastSize", "lastEvidence"]);
+		assertKnown(record, [...baseFields, "path", "condition", "value", "minSize", "ignoreBefore", "ignoreBeforeSpec", "statusPollMs", "nextCheckAt", "satisfiedAt", "pendingSatisfiedAt", "lastSatisfied", "lastSize", "lastEvidence"]);
 		const condition = requiredString(record, "condition", 16);
 		if (!["exists", "contains", "min_size"].includes(condition)) throw new Error("condition is invalid");
 		const value = condition === "contains" ? validateLogPattern(requiredString(record, "value", 256)) : undefined;
 		const minSize = condition === "min_size" ? requiredInteger(record, "minSize", 1) : undefined;
 		const ignoreBefore = optionalInteger(record, "ignoreBefore");
 		if (ignoreBefore !== undefined && ignoreBefore < 0) throw new Error("ignoreBefore must be non-negative");
+		const ignoreBeforeSpec = "ignoreBeforeSpec" in record && record.ignoreBeforeSpec === undefined ? undefined : optionalString(record, "ignoreBeforeSpec", 64);
 		const satisfiedAt = optionalInteger(record, "satisfiedAt");
 		if (satisfiedAt !== undefined && base.active) throw new Error("a satisfied condition alarm must not be active");
 		if ("lastSatisfied" in record && typeof record.lastSatisfied !== "boolean") throw new Error("lastSatisfied must be boolean");
@@ -808,6 +816,7 @@ export function restoreAlarmState(value: unknown, allowedRemoteLogRoots: readonl
 			value,
 			minSize,
 			ignoreBefore,
+			ignoreBeforeSpec,
 			statusPollMs: validatePollingDuration(requiredInteger(record, "statusPollMs", 1), "statusPollMs"),
 			nextCheckAt: requiredInteger(record, "nextCheckAt"),
 			satisfiedAt,

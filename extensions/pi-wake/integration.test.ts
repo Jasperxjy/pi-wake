@@ -184,7 +184,7 @@ await runtime.stop();
 		await fs.readFile(path.join(dir, "out-a"), "utf8"),
 		await fs.readFile(path.join(dir, "out-b"), "utf8"),
 	];
-	assert.deepEqual(outcomes.sort(), ["CREATED", "EXISTS:alarm already exists: deploy"].sort(), JSON.stringify(outcomes));
+	assert.deepEqual(outcomes.sort(), ["CREATED", "EXISTS:Alarm \"deploy\" already exists. Use list to inspect it. If you want to re-arm the same definition, use reset; if you want a different definition, choose another id or remove+recreate."].sort(), JSON.stringify(outcomes));
 	assert.deepEqual(await readIds(statePath), ["deploy"]);
 });
 
@@ -781,7 +781,7 @@ test("outbox management: list_wakes, drop_wake, purge_wakes are explicit, never 
 		assert.equal((await readState(statePath)).outbox.length, 1);
 		assert.match(await runtime.runAction({ action: "purge_wakes", id: "b" }), /Dropped 1 wake\(s\) for b/);
 		assert.equal((await readState(statePath)).outbox.length, 0);
-		await assert.rejects(runtime.runAction({ action: "drop_wake", eventId: "a:1:x" }), /unknown wake/);
+		await assert.rejects(runtime.runAction({ action: "drop_wake", eventId: "a:1:x" }), /no longer in the outbox.*list_wakes/s);
 	} finally {
 		await runtime.stop();
 	}
@@ -983,7 +983,7 @@ test("group creation is atomic: a member id collision leaves no orphan members",
 		await runtime.runAction({ action: "watch_container", id: "g-2", name: "Pre", container: "job-b", events: ["exit"], statusPoll: "60s" });
 		await assert.rejects(
 			runtime.runAction({ action: "watch_container_group", id: "g", name: "G", containers: ["job-a", "job-b"], statusPoll: "60s" }),
-			/member alarm already exists: g-2/,
+			/Group id "g" would create internal member id "g-2", but that id already exists/,
 		);
 		const disk = await readState(statePath);
 		assert.deepEqual(disk.alarms.map((alarm) => alarm.id).sort(), ["g-2"]);
@@ -1293,7 +1293,7 @@ test("a member replaced by a different alarm kind triggers a group integrity fai
 		await waitFor(() => {
 			const state = readStateSync(statePath);
 			const group = state.alarms.find((alarm) => alarm.id === "g");
-			return group?.kind === "group" && String(group.pauseReason).includes("integrity failure");
+			return group?.kind === "group" && String(group.pauseReason).includes("invalid or missing internal members");
 		}, "the group to report an integrity failure", 15_000);
 		const disk = await readState(statePath);
 		const group = disk.alarms.find((alarm) => alarm.id === "g");
@@ -1462,7 +1462,7 @@ test("group lifecycle never mutates a same-id alarm that is no longer a group me
 		await waitFor(() => {
 			const state = readStateSync(statePath);
 			const group = state.alarms.find((alarm) => alarm.id === "g");
-			return group?.kind === "group" && String(group.pauseReason).includes("integrity failure");
+			return group?.kind === "group" && String(group.pauseReason).includes("invalid or missing internal members");
 		}, "the group to report an integrity failure", 15_000);
 		// The integrity handling must NOT pause the same-id replacement.
 		const mid = readStateSync(statePath);

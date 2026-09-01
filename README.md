@@ -177,6 +177,10 @@ The same trick composes with everything else:
 
 **Honest edges**: `logPattern` is a literal, not a regex — design distinctive markers (`WAKE:` prefix) so ordinary output can't false-fire. Detection latency is bounded by `statusPoll` (1s floor) — right for the internet and infrastructure, wrong for control loops. The detector's bugs are your bugs: keep detection logic dead simple. Wake evidence is untrusted remote text (see `includeWakeEvidence`) — a compromised detector is a prompt-injection surface. And the detector's egress is the probe host's — one IP doing the crawling.
 
+### Status bar and widget
+
+Sessions with a UI (TUI and pi-web alike) render a footer segment (`wake: 3 · next train in 4m · daemon live`) and, above the editor, a table of active alarms (type word / name / status). Both clear themselves when nothing is active. `/wake-alarm show | short | close` folds them away (footer-only, or fully hidden — the alarms keep running); the mode persists with the language preference, and `{"action":"set_language","language":"en|zh|auto"}` switches the display language.
+
 ### Wake result summaries
 
 `logTailLines` (1-200) on `watch_container` / `watch_container_group` attaches the last N container log lines to exit/abnormal wake evidence, so a wake can answer "what did it print at the end" without an extra SSH round-trip. Evidence stays sanitized, length-bounded, and labeled untrusted.
@@ -240,7 +244,7 @@ On Windows the daemon unwraps the npm `pi.cmd` shim and runs the CLI script with
 
 ## Configuration
 
-`.pi/wake-alarm.json` in the project directory — entirely optional unless you use `watch_container`:
+`.pi/wake-alarm.json` in the project directory — entirely optional unless you use a remote watch (`watch_container`, `watch_container_group`, or `watch_condition`); timers and local lifecycle/outbox/UI actions need no remote config:
 
 ```json
 {
@@ -263,12 +267,14 @@ On Windows the daemon unwraps the npm `pi.cmd` shim and runs the CLI script with
   "piCommand": null,
   "spawnOnWake": true,
   "spawnDaemon": true,
+  "uiLanguage": "auto",
   "runTimeout": "30m",
   "headlessTrust": "saved",
   "includeWakeEvidence": true
 }
 ```
 
+- `uiLanguage`: display language for the status bar and widget — `"auto"` (system locale; zh* → Chinese, otherwise English), `"en"`, or `"zh"`. The `set_language` tool action switches it per project and persists the choice; `/wake-alarm show | short | close` controls how much of the UI is visible (footer+table / footer only / hidden) independently of the alarms.
 - `identityFile` is resolved relative to the `.pi/` directory that holds the config (write `"../keys/id_ed25519"` for a key stored outside `.pi/`); private key **paths only** — `password`/`passphrase`/`privateKey` fields are rejected. The tool error for a missing `remote` section embeds this minimal shape, so the schema is discoverable without the README.
 - `allowedRemoteLogRoots` constrains which remote log files may be read (realpath-checked remotely).
 - A headless wake run that exceeds `runTimeout` is terminated in two phases: a graceful termination request, a grace period, then a force-kill (process tree on Windows via `taskkill /T /F`). The delivery slot is only released after the woken Pi has actually exited (or the force-kill fallback deadline fires), so a retry cannot start a second Pi on the same session file while the old one still lives.

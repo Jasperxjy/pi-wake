@@ -24,6 +24,7 @@ import {
 	registerPresence,
 	releasePresence,
 } from "./presence.ts";
+import { ACTION_DESCRIPTION, PROMPT_GUIDELINES, PROMPT_SNIPPET, TOOL_DESCRIPTION } from "./prompts.ts";
 import {
 	ACTION_ENUM,
 	WakeAlarmRuntime,
@@ -34,21 +35,21 @@ import {
 
 const PRESENCE_HEARTBEAT_MS = 15_000;
 const TOOL_PARAMETERS = Type.Object({
-	action: StringEnum(ACTION_ENUM),
-	id: Type.Optional(Type.String({ description: "Alarm ID; required except for list and optional for check" })),
+	action: StringEnum(ACTION_ENUM, { description: ACTION_DESCRIPTION }),
+	id: Type.Optional(Type.String({ description: "Alarm ID. Required for alarm creation and alarm-targeted lifecycle/outbox actions; optional for check. Not used by list, list_wakes, drop_wake, or set_language." })),
 	name: Type.Optional(Type.String({ description: "Short factual alarm name, required when creating an alarm" })),
 	after: Type.Optional(Type.String({ description: "Relative timer delay, e.g. 30m; timer reset also accepts it" })),
-	at: Type.Optional(Type.String({ description: "Absolute timer timestamp; exactly one of after or at for timers" })),
+	at: Type.Optional(Type.String({ description: "Absolute ISO-8601 timer timestamp with an explicit timezone, e.g. 2026-09-01T18:00:00+08:00 or 2026-09-01T10:00:00Z; exactly one of after or at for timers" })),
 	container: Type.Optional(Type.String({ description: "Docker container name or ID for watch_container" })),
 	containers: Type.Optional(Type.Array(Type.String({ description: "Container names for watch_container_group (unique, 2-64)" }), { minItems: 2, maxItems: 64, description: "Batch containers" })),
-	events: Type.Optional(Type.Array(StringEnum(["exit", "abnormal", "missing", "replaced", "log-error", "log-match", "deadline", "connection-failure"] as const), { minItems: 1, maxItems: 8, description: "OR-combined container events" })),
+	events: Type.Optional(Type.Array(StringEnum(["exit", "abnormal", "missing", "replaced", "log-error", "log-match", "deadline", "connection-failure"] as const), { minItems: 1, maxItems: 8, description: "OR-combined container events. exit = clean exit code 0 only; abnormal = nonzero/OOM/dead/restarting. Use both exit+abnormal for 'wake when the container finishes regardless of outcome'" })),
 	policy: Type.Optional(StringEnum(["pause", "keep"] as const, { description: "pause after a trigger (default), or keep monitoring with dedupe" })),
 	logPath: Type.Optional(Type.String({ description: "Authoritative absolute remote application log path" })),
 	logPattern: Type.Optional(Type.String({ description: "Literal (not regex) required with log-match" })),
 	deadline: Type.Optional(Type.String({ description: "Relative container-watch deadline required with the deadline event" })),
-	statusPoll: Type.Optional(Type.String({ description: "Deterministic model-free condition polling interval, e.g. 60s" })),
+	statusPoll: Type.Optional(Type.String({ description: "Deterministic model-free condition polling interval, e.g. 60s; minimum 1s" })),
 	eventId: Type.Optional(Type.String({ description: "Outbox wake eventId; required for drop_wake" })),
-	condition: Type.Optional(StringEnum(["any_terminal", "all_terminal", "any_abnormal", "n_of_m_terminal", "exists", "contains", "min_size"] as const, { description: "Group barrier or remote file condition" })),
+	condition: Type.Optional(StringEnum(["any_terminal", "all_terminal", "any_abnormal", "n_of_m_terminal", "exists", "contains", "min_size"] as const, { description: "watch_container_group: any_terminal | all_terminal | any_abnormal | n_of_m_terminal. watch_condition: exists | contains | min_size" })),
 	required: Type.Optional(Type.Integer({ description: "Members that must be terminal for n_of_m_terminal (default: all)" })),
 	coalesceWindow: Type.Optional(Type.String({ description: "Group wake coalescing window, e.g. 30s; all-terminal fires immediately" })),
 	logTailLines: Type.Optional(Type.Integer({ description: "Attach the last N container log lines to exit/abnormal wake evidence (1-200)" })),
@@ -56,7 +57,7 @@ const TOOL_PARAMETERS = Type.Object({
 	value: Type.Optional(Type.String({ description: "Literal substring for the contains condition" })),
 	minSize: Type.Optional(Type.Integer({ description: "Byte threshold for the min_size condition" })),
 	ignoreBefore: Type.Optional(Type.String({ description: "watch_condition only: ignore files last modified before this time (absolute ISO timestamp with timezone, or relative like '5m'); guards against stale markers from previous runs" })),
-	purgePendingEvents: Type.Optional(Type.Boolean({ description: "remove also clears this alarm's undelivered wakes" })),
+	purgePendingEvents: Type.Optional(Type.Boolean({ description: "For remove only: also discard undelivered wakes of the removed alarm; for a group, also its ownership-valid members" })),
 	language: Type.Optional(StringEnum(["auto", "en", "zh"] as const, { description: "set_language only: status bar / widget display language ('auto' follows the system locale)" })),
 });
 
@@ -257,14 +258,9 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "wake_alarm",
 		label: "Wake Alarm",
-		description: "Set and manage persistent alarms: one-shot timers, REMOTE Docker container watches over SSH (watch_container probes Docker on the configured remote host, not locally), batch barriers over many containers (watch_container_group — ONE summary wake when any/all/required members are terminal), completion-file conditions (watch_condition — a remote result file exists/contains a marker/reaches a size), bounded container log tails in exit wakes (logTailLines), an explicit outbox (list_wakes, drop_wake, purge_wakes, ack), and a display-language switch for the status bar / widget (set_language: auto/en/zh). Wakes that fire while ALL sessions are closed are delivered by the pi-wake daemon (auto-started; heartbeat in .pi/wake-alarm.daemon.json). Deterministic polling never wakes the model unless a configured event occurs.",
-		promptSnippet: "Set named timers, container/group barriers, and completion-file conditions; manage wakes with ack/drop_wake",
-		promptGuidelines: [
-			"Use wake_alarm as a scheduling/event primitive. Prefer one watch_container_group for multi-container batches instead of many individual alarms: it emits a single summary wake. Alarm names are short labels, not plans or continuation instructions. Use ack/drop_wake to clear undelivered wakes you have already acted on.",
-			"Wake delivery when all sessions are closed depends on the pi-wake daemon; if the tool result notes no live daemon, start one or expect wakes to wait in the outbox until the next session (list_wakes shows them).",
-			"Reuse one alarm id for retries of the same watch (reset) instead of remove+recreate — ids are cheap identities, not one-shot handles. Keep logTailLines small (5-20); evidence is capped at 2000 chars on disk.",
-			"watch_condition 'exists' cannot tell a stale marker from a fresh one: have drivers write run-specific markers inside the run directory that gets cleaned, prefer contains with a run-specific value, or set ignoreBefore so files older than the watch are ignored.",
-		],
+		description: TOOL_DESCRIPTION,
+		promptSnippet: PROMPT_SNIPPET,
+		promptGuidelines: [...PROMPT_GUIDELINES],
 		parameters: TOOL_PARAMETERS,
 		async execute(_toolCallId, params) {
 			const details: { action: string; error?: boolean } = { action: params.action as string };

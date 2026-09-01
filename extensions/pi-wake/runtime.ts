@@ -434,7 +434,7 @@ async function parseRemoteConfig(value: unknown, configDir: string): Promise<Rem
  */
 function requireRemote(action: string, config: RuntimeConfig): RemoteConfig {
 	if (config.remote) return config.remote;
-	throw new Error(`${action} probes Docker/files on a REMOTE host over SSH, which needs a "remote" section in .pi/${CONFIG_NAME}, e.g. {"remote":{"host":"gpu.example.com","user":"me","identityFile":"id_rsa","allowedRemoteLogRoots":["/data/results/"]}} — identityFile resolves RELATIVE to the .pi/ directory (use "../keys/id_rsa" for a key stored elsewhere); key auth only, no passwords`);
+	throw new Error(`${action} probes Docker/files on a REMOTE host over SSH, which needs a "remote" section in .pi/${CONFIG_NAME}, e.g. {"remote":{"host":"gpu.example.com","user":"me","identityFile":"id_rsa","allowedRemoteLogRoots":["/data/results/"]}} — identityFile resolves RELATIVE to the .pi/ directory (use "../keys/id_rsa" for a key stored elsewhere); key auth only, no passwords. If host/user/key/paths are not known from project context, ask the user; do not invent credentials or broaden allowedRemoteLogRoots automatically.`);
 }
 
 function validateActionParams(params: ToolParams): void {
@@ -696,7 +696,7 @@ export class WakeAlarmRuntime {
 	}
 
 	private async adoptVersionedState(raw: Record<string, unknown>): Promise<void> {
-		if (raw.version !== 3 || !Array.isArray(raw.alarms) || !Array.isArray(raw.outbox)) throw new Error("unsupported state version");
+		if (raw.version !== 3 || !Array.isArray(raw.alarms) || !Array.isArray(raw.outbox)) throw new Error("This state file uses an unsupported version. The file was left untouched. Do not delete it automatically; check the installed pi-wake version and upgrade/downgrade to a compatible release, or migrate a backup explicitly.");
 		for (const [index, value] of raw.alarms.entries()) {
 			try {
 				const restored = restoreAlarmState(value, this.runtimeConfig.remote?.allowedRemoteLogRoots ?? []);
@@ -704,13 +704,13 @@ export class WakeAlarmRuntime {
 				this.alarms.set(restored.id, restored);
 				this.baseRevisions.set(restored.id, restored.revision ?? 0);
 			} catch (error) {
-				throw new Error(`alarms[${index}] is invalid: ${(error as Error).message}; repair or remove ${path.basename(this.statePath)}`);
+				throw new Error(`alarms[${index}] is invalid: ${(error as Error).message}. The state file was left untouched. Do NOT delete it automatically - it may contain alarms and undelivered wakes. Back it up first, then repair the invalid record or install a compatible pi-wake version.`);
 			}
 		}
 		try {
 			for (const entry of restoreOutbox(raw.outbox)) this.outbox.set(entry.eventId, entry);
 		} catch (error) {
-			throw new Error(`outbox is invalid: ${(error as Error).message}; repair or remove ${path.basename(this.statePath)}`);
+			throw new Error(`outbox is invalid: ${(error as Error).message}. The state file was left untouched. Do NOT delete it automatically - undelivered wakes are durable facts. Back it up first, then repair the invalid record or install a compatible pi-wake version.`);
 		}
 	}
 
@@ -736,7 +736,7 @@ export class WakeAlarmRuntime {
 				this.retiredLegacyState = true;
 				return;
 			}
-			if (raw.version !== 2 || !Array.isArray(raw.alarms)) throw new Error("unsupported state version");
+			if (raw.version !== 2 || !Array.isArray(raw.alarms)) throw new Error("This state file uses an unsupported version. The file was left untouched. Do not delete it automatically; check the installed pi-wake version and upgrade/downgrade to a compatible release, or migrate a backup explicitly.");
 			const migrated = this.migrateV2(raw);
 			await this.writeFullStateLocked(migrated.alarms, migrated.outbox);
 			for (const alarm of migrated.alarms) { this.alarms.set(alarm.id, alarm); this.baseRevisions.set(alarm.id, alarm.revision ?? 0); }
@@ -778,7 +778,7 @@ export class WakeAlarmRuntime {
 			try {
 				restored.push(restoreAlarmState(value, this.runtimeConfig.remote?.allowedRemoteLogRoots ?? []));
 			} catch (error) {
-				throw new Error(`alarms[${index}] is invalid: ${(error as Error).message}; repair or remove ${path.basename(this.statePath)}`);
+				throw new Error(`alarms[${index}] is invalid: ${(error as Error).message}. The state file was left untouched. Do NOT delete it automatically - it may contain alarms and undelivered wakes. Back it up first, then repair the invalid record or install a compatible pi-wake version.`);
 			}
 		}
 		restoreOutbox(migratedOutbox);
@@ -927,7 +927,7 @@ export class WakeAlarmRuntime {
 				const mine = this.alarms.get(id);
 				if (!mine) continue;
 				const disk = byId.get(id);
-				if (this.createIds.has(id) && disk) throw new Error(`alarm already exists: ${id}`);
+				if (this.createIds.has(id) && disk) throw new Error(`Alarm "${id}" already exists. Use list to inspect it. If you want to re-arm the same definition, use reset; if you want a different definition, choose another id or remove+recreate.`);
 				if (!disk) {
 					if (this.createIds.has(id) || this.forceIds.has(id) || (this.baseRevisions.get(id) ?? 0) === 0) {
 						const next = { ...mine, revision: 1 };
@@ -1246,7 +1246,7 @@ export class WakeAlarmRuntime {
 	 */
 	private async evaluateGroup(id: string, shouldEmit = true): Promise<{ alarm: GroupAlarmState; events: FiredEvent[] }> {
 		const current = this.alarms.get(id);
-		if (!current || current.kind !== "group") throw new Error(`unknown group alarm: ${id}`);
+		if (!current || current.kind !== "group") throw new Error(`Alarm "${id}" was not found or is not a group. Use {"action":"list"} to see current alarm ids.`);
 		return this.commitAlarmSet(async (disk) => {
 			const group = disk.alarms.find((candidate) => candidate.id === id);
 			if (!group || group.kind !== "group") return { alarms: disk.alarms, outbox: disk.outbox, adopted: new Map(), result: { alarm: (group as GroupAlarmState | undefined) ?? (current as GroupAlarmState), events: [] } };
@@ -1279,7 +1279,7 @@ export class WakeAlarmRuntime {
 				// Integrity failure: a member that is missing, replaced by another kind,
 				// or no longer attached to this group is NEVER a terminal result. Only
 				// ownership-valid members are paused; a same-id replacement is untouched.
-				const diagnostic = `group integrity failure: invalid member alarm(s) ${badMembers.join(", ")}`;
+				const diagnostic = `Group "${id}" has invalid or missing internal members (${badMembers.join(", ")}). Do not manage member ids individually. Remove and recreate the group if you want to rebuild the batch.`;
 				const next = this.bump(group, { active: false, pauseReason: diagnostic, summary: diagnostic, pendingFire: false });
 				const alarms = disk.alarms.map((candidate) => candidate.id === id ? next : this.ownedGroupMember(candidate, group) ? this.bump(candidate, { active: false, pauseReason: "group integrity failure" }) : candidate);
 				const adopted = new Map(alarms.filter((candidate) => candidate.id === id || this.ownedGroupMember(candidate, group)).map((candidate) => [candidate.id, candidate]));
@@ -1380,7 +1380,7 @@ export class WakeAlarmRuntime {
 	 */
 	private async checkCondition(id: string, shouldEmit: boolean): Promise<{ alarm: ConditionAlarmState; events: FiredEvent[] }> {
 		const current = this.alarms.get(id);
-		if (!current || current.kind !== "condition") throw new Error(`unknown condition alarm: ${id}`);
+		if (!current || current.kind !== "condition") throw new Error(`Alarm "${id}" was not found or is not a condition. Use {"action":"list"} to see current alarm ids.`);
 		if (!current.active) return { alarm: current, events: [] };
 		const phaseA = await this.withStateLock(async (): Promise<{ handled: boolean; alarm: ConditionAlarmState; events: FiredEvent[]; revision: number }> => {
 			const disk = await this.readDiskState();
@@ -1499,7 +1499,7 @@ export class WakeAlarmRuntime {
 		await this.withStateLock(async () => {
 			const diskState = await this.readDiskState();
 			const entry = diskState.outbox.find((candidate) => candidate.eventId === eventId);
-			if (!entry) throw new Error(`unknown wake: ${eventId}`);
+			if (!entry) throw new Error(`Wake "${eventId}" is no longer in the outbox (it may already have been delivered or dropped). Use list_wakes to get current eventIds.`);
 			const outbox = diskState.outbox.filter((candidate) => candidate.eventId !== eventId);
 			await this.writeFullStateLocked(diskState.alarms, outbox);
 			this.outbox.delete(eventId);
@@ -1572,7 +1572,7 @@ export class WakeAlarmRuntime {
 
 	private async removeAlarm(id: string): Promise<number> {
 		const previous = this.alarms.get(id);
-		if (!previous) throw new Error(`unknown alarm: ${id}`);
+		if (!previous) throw new Error(`Alarm "${id}" was not found. Use {"action":"list"} to see current alarm ids.`);
 		// Removing an alarm stops FUTURE events; its undelivered outbox wakes are
 		// historical facts and stay durable for delivery by the daemon or the owner.
 		const pendingBefore = [...this.outbox.values()].filter((entry) => entry.alarmId === id).length;
@@ -1684,7 +1684,7 @@ export class WakeAlarmRuntime {
 	 */
 	private async checkContainer(id: string, shouldEmit: boolean, observePaused = false): Promise<{ alarm: ContainerAlarmState; events: FiredEvent[] }> {
 		const current = this.alarms.get(id);
-		if (!current || current.kind !== "container") throw new Error(`unknown container alarm: ${id}`);
+		if (!current || current.kind !== "container") throw new Error(`Alarm "${id}" was not found or is not a container watch. Use {"action":"list"} to see current alarm ids.`);
 		if (!current.active && !observePaused) return { alarm: current, events: [] };
 		const phaseA = await this.withStateLock(async (): Promise<{ base: ContainerAlarmState | undefined; revision: number; deadline: { state: ContainerAlarmState; events: FiredEvent[] }; committed: { alarm: ContainerAlarmState; events: FiredEvent[] } | undefined }> => {
 			const disk = await this.readLatestAlarm(id);
@@ -1801,7 +1801,7 @@ export class WakeAlarmRuntime {
 	private async setTimer(params: ToolParams, context?: ActionContext): Promise<AlarmState> {
 		if (!params.id || !params.name) throw new Error("id and name are required for set_timer");
 		const id = validateAlarmId(params.id);
-		if (this.alarms.has(id)) throw new Error(`alarm already exists: ${id}`);
+		if (this.alarms.has(id)) throw new Error(`Alarm "${id}" already exists. Use list to inspect it. If you want to re-arm the same definition, use reset; if you want a different definition, choose another id or remove+recreate.`);
 		const alarm = createTimerAlarm({ id, name: params.name, now: Date.now(), afterMs: params.after === undefined ? undefined : parseDuration(params.after, "after"), at: params.at === undefined ? undefined : parseAbsoluteTime(params.at), ownerSessionFile: context?.ownerSessionFile });
 		await this.replaceAlarm(id, alarm); this.schedule(); return alarm;
 	}
@@ -1811,10 +1811,10 @@ export class WakeAlarmRuntime {
 		const remote = requireRemote("watch_container", config);
 		if (!params.id || !params.name || !params.container || !params.events) throw new Error("id, name, container, and events are required for watch_container");
 		const id = validateAlarmId(params.id);
-		if (this.alarms.has(id)) throw new Error(`alarm already exists: ${id}`);
+		if (this.alarms.has(id)) throw new Error(`Alarm "${id}" already exists. Use list to inspect it. If you want to re-arm the same definition, use reset; if you want a different definition, choose another id or remove+recreate.`);
 		let alarm = createContainerAlarm({ id, name: params.name, container: params.container, events: params.events, policy: params.policy, logPath: params.logPath ? validateRemoteLogPath(params.logPath, remote.allowedRemoteLogRoots) : undefined, logPattern: params.logPattern, allowedRemoteLogRoots: remote.allowedRemoteLogRoots, now: Date.now(), statusPollMs: params.statusPoll ? parseDuration(params.statusPoll, "statusPoll") : config.statusPollMs, deadlineMs: params.deadline ? parseDuration(params.deadline, "deadline") : undefined, ownerSessionFile: context?.ownerSessionFile, logTailLines: params.logTailLines });
 		const baseline = await this.probe(alarm, true, true);
-		if (!baseline.exists) throw new Error(`container does not exist: ${alarm.container}`);
+		if (!baseline.exists) throw new Error(`Container "${alarm.container}" does not currently exist on the configured remote host, so a baseline cannot be established. Verify the name or retry after it starts; the "missing" event detects later disappearance.`);
 		alarm = applyBaseline(alarm, baseline, Date.now());
 		await this.replaceAlarm(id, alarm); this.schedule(); return alarm;
 	}
@@ -1826,7 +1826,7 @@ export class WakeAlarmRuntime {
 		if (params.containers.length < 2 || params.containers.length > 64) throw new Error("a group needs 2-64 containers");
 		if (new Set(params.containers).size !== params.containers.length) throw new Error("containers must be unique");
 		const id = validateAlarmId(params.id);
-		if (this.alarms.has(id)) throw new Error(`alarm already exists: ${id}`);
+		if (this.alarms.has(id)) throw new Error(`Alarm "${id}" already exists. Use list to inspect it. If you want to re-arm the same definition, use reset; if you want a different definition, choose another id or remove+recreate.`);
 		const condition = (params.condition ?? "all_terminal") as GroupCondition;
 		if (!["any_terminal", "all_terminal", "any_abnormal", "n_of_m_terminal"].includes(condition)) throw new Error("condition must be any_terminal, all_terminal, any_abnormal, or n_of_m_terminal");
 		const statusPollMs = params.statusPoll ? parseDuration(params.statusPoll, "statusPoll") : config.statusPollMs;
@@ -1838,7 +1838,7 @@ export class WakeAlarmRuntime {
 			const memberId = `${id}-${index + 1}`;
 			let member = createContainerAlarm({ id: memberId, name: `${params.name} #${index + 1}`, container, events: ["exit", "abnormal", "missing", "replaced"], policy: "keep", allowedRemoteLogRoots: remote.allowedRemoteLogRoots, now: Date.now(), statusPollMs, ownerSessionFile: context?.ownerSessionFile, groupId: id, logTailLines: params.logTailLines });
 			const baseline = await this.probe(member, true, true);
-			if (!baseline.exists) throw new Error(`container does not exist: ${container}`);
+			if (!baseline.exists) throw new Error(`Container "${container}" does not currently exist on the configured remote host, so a baseline cannot be established. Verify the name or retry after it starts; the "missing" event detects later disappearance.`);
 			memberAlarms.push(applyBaseline(member, baseline, Date.now()));
 		}
 		const group = createGroupAlarm({ id, name: params.name, memberIds: memberAlarms.map((member) => member.id), condition, required: params.required, now: Date.now(), statusPollMs, coalesceWindowMs, ownerSessionFile: context?.ownerSessionFile });
@@ -1846,9 +1846,9 @@ export class WakeAlarmRuntime {
 		// a partial write must never leave orphan members whose wakes are suppressed
 		// by a group that does not exist.
 		const groupResult = await this.commitAlarmSet(async (disk) => {
-			if (disk.alarms.some((alarm) => alarm.id === id)) throw new Error(`alarm already exists: ${id}`);
+			if (disk.alarms.some((alarm) => alarm.id === id)) throw new Error(`Alarm "${id}" already exists. Use list to inspect it. If you want to re-arm the same definition, use reset; if you want a different definition, choose another id or remove+recreate.`);
 			for (const member of memberAlarms) {
-				if (disk.alarms.some((alarm) => alarm.id === member.id)) throw new Error(`member alarm already exists: ${member.id}`);
+				if (disk.alarms.some((alarm) => alarm.id === member.id)) throw new Error(`Group id "${id}" would create internal member id "${member.id}", but that id already exists. Choose another group id or explicitly resolve the conflicting alarm.`);
 			}
 			const alarms = [...disk.alarms, ...memberAlarms, group];
 			const adopted = new Map<string, AlarmState>([[id, group], ...memberAlarms.map((member) => [member.id, member] as [string, AlarmState])]);
@@ -1863,8 +1863,8 @@ export class WakeAlarmRuntime {
 		const remote = requireRemote("watch_condition", config);
 		if (!params.id || !params.name || !params.path || !params.condition) throw new Error("id, name, path, and condition are required for watch_condition");
 		const id = validateAlarmId(params.id);
-		if (this.alarms.has(id)) throw new Error(`alarm already exists: ${id}`);
-		const alarm = createConditionAlarm({ id, name: params.name, path: params.path, condition: params.condition as ConditionKind, value: params.value, minSize: params.minSize, ignoreBefore: params.ignoreBefore === undefined ? undefined : parseIgnoreBefore(params.ignoreBefore), allowedRemoteLogRoots: remote.allowedRemoteLogRoots, now: Date.now(), statusPollMs: params.statusPoll ? parseDuration(params.statusPoll, "statusPoll") : config.statusPollMs, ownerSessionFile: context?.ownerSessionFile });
+		if (this.alarms.has(id)) throw new Error(`Alarm "${id}" already exists. Use list to inspect it. If you want to re-arm the same definition, use reset; if you want a different definition, choose another id or remove+recreate.`);
+		const alarm = createConditionAlarm({ id, name: params.name, path: params.path, condition: params.condition as ConditionKind, value: params.value, minSize: params.minSize, ignoreBefore: params.ignoreBefore === undefined ? undefined : parseIgnoreBefore(params.ignoreBefore), ignoreBeforeSpec: params.ignoreBefore?.trim(), allowedRemoteLogRoots: remote.allowedRemoteLogRoots, now: Date.now(), statusPollMs: params.statusPoll ? parseDuration(params.statusPoll, "statusPoll") : config.statusPollMs, ownerSessionFile: context?.ownerSessionFile });
 		await this.replaceAlarm(id, alarm);
 		this.schedule();
 		return alarm;
@@ -1873,20 +1873,21 @@ export class WakeAlarmRuntime {
 	private async resetOne(id: string, params: ToolParams): Promise<AlarmState> {
 		const config = this.runtimeConfig;
 		const current = this.alarms.get(id);
-		if (!current) throw new Error(`unknown alarm: ${id}`);
+		if (!current) throw new Error(`Alarm "${id}" was not found. Use {"action":"list"} to see current alarm ids.`);
 		if (current.kind === "timer") {
+			if (params.after === undefined && params.at === undefined) throw new Error(`Resetting timer "${id}" requires exactly one new after or at value.`);
 			const reset = createTimerAlarm({ id: current.id, name: current.name, now: Date.now(), afterMs: params.after === undefined ? undefined : parseDuration(params.after, "after"), at: params.at === undefined ? undefined : parseAbsoluteTime(params.at), ownerSessionFile: current.ownerSessionFile });
 			this.wakeRetry.delete(id);
 			await this.replaceAlarm(id, reset, { force: true, intent: () => reset }); this.schedule(); return reset;
 		}
 		if (current.kind === "group") {
-			if (params.after !== undefined || params.at !== undefined) throw new Error("group reset does not accept after or at");
+			if (params.after !== undefined || params.at !== undefined) throw new Error("after/at apply only to timer reset. Resetting a group rebaselines its existing members; omit after/at.");
 			// Phase A: snapshot the group AND its members (revision/kind/groupId) BEFORE
 			// the (slow) rebaseline probes, so a concurrent remove/recreate cannot be
 			// overwritten by this reset (ABA).
 			const snapshot = await this.readDiskState();
 			const snapGroup = snapshot.alarms.find((candidate) => candidate.id === id);
-			if (!snapGroup || snapGroup.kind !== "group") throw new Error(`unknown group alarm: ${id}`);
+			if (!snapGroup || snapGroup.kind !== "group") throw new Error(`Alarm "${id}" was not found or is not a group. Use {"action":"list"} to see current alarm ids.`);
 			const snapMembers = new Map<string, ContainerAlarmState>();
 			for (const memberId of snapGroup.memberIds) {
 				const member = snapshot.alarms.find((candidate) => candidate.id === memberId);
@@ -1899,7 +1900,7 @@ export class WakeAlarmRuntime {
 				const member = snapMembers.get(memberId)!;
 				let fresh = createContainerAlarm({ id: member.id, name: member.name, container: member.container, events: member.events, policy: member.policy, allowedRemoteLogRoots: config.remote?.allowedRemoteLogRoots ?? [], now: Date.now(), statusPollMs: member.statusPollMs, ownerSessionFile: member.ownerSessionFile, groupId: member.groupId, logTailLines: member.logTailLines });
 				const baseline = await this.probe(fresh, true, true);
-				if (!baseline.exists) throw new Error(`container does not exist: ${member.container}`);
+				if (!baseline.exists) throw new Error(`Container "${member.container}" does not currently exist on the configured remote host, so a baseline cannot be established. Verify the name or retry after it starts; the "missing" event detects later disappearance.`);
 				freshMembers.push(applyBaseline(fresh, baseline, Date.now()));
 			}
 			// Phase B: re-validate under the lock; any change discards the reset. The
@@ -1927,15 +1928,19 @@ export class WakeAlarmRuntime {
 			return reset;
 		}
 		if (current.kind === "condition") {
-			if (params.after !== undefined || params.at !== undefined) throw new Error("condition reset does not accept after or at");
-			const reset: ConditionAlarmState = { ...current, active: true, pauseReason: undefined, satisfiedAt: undefined, pendingSatisfiedAt: undefined, lastSatisfied: false, lastTriggeredAt: undefined, nextCheckAt: Date.now() };
+			if (params.after !== undefined || params.at !== undefined) throw new Error("after/at apply only to timer reset. Resetting a condition re-arms the existing definition; omit after/at.");
+			// A RELATIVE ignoreBefore ("5m") means "before this arming", so reset
+			// recomputes it; an absolute timestamp keeps its fixed cutoff.
+			const spec = current.ignoreBeforeSpec;
+			const recomputedIgnoreBefore = spec !== undefined && !/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(spec.trim()) ? parseIgnoreBefore(spec) : current.ignoreBefore;
+			const reset: ConditionAlarmState = { ...current, active: true, pauseReason: undefined, satisfiedAt: undefined, pendingSatisfiedAt: undefined, lastSatisfied: false, lastTriggeredAt: undefined, nextCheckAt: Date.now(), ignoreBefore: recomputedIgnoreBefore };
 			await this.replaceAlarm(id, reset, { force: true, intent: () => reset }); this.schedule(); return reset;
 		}
-		if (params.after !== undefined || params.at !== undefined) throw new Error("container reset does not accept after or at");
+		if (params.after !== undefined || params.at !== undefined) throw new Error("after/at apply only to timer reset. Resetting a container watch rebaselines the existing container; omit after/at.");
 		const deadlineMs = current.deadlineAt === undefined ? undefined : current.deadlineAt - current.createdAt;
 		let reset = createContainerAlarm({ id: current.id, name: current.name, container: current.container, events: current.events, policy: current.policy, logPath: current.logPath, logPattern: current.logPattern, allowedRemoteLogRoots: config.remote?.allowedRemoteLogRoots ?? [], now: Date.now(), statusPollMs: current.statusPollMs, deadlineMs, ownerSessionFile: current.ownerSessionFile, groupId: current.groupId, logTailLines: current.logTailLines });
 		const baseline = await this.probe(reset, true, true);
-		if (!baseline.exists) throw new Error(`container does not exist: ${reset.container}`);
+		if (!baseline.exists) throw new Error(`Container "${reset.container}" does not currently exist on the configured remote host, so a baseline cannot be established. Verify the name or retry after it starts; the "missing" event detects later disappearance.`);
 		reset = applyBaseline(reset, baseline, Date.now());
 		this.wakeRetry.delete(id);
 		await this.replaceAlarm(id, reset, { force: true, intent: () => reset }); this.schedule(); return reset;
@@ -1962,7 +1967,7 @@ export class WakeAlarmRuntime {
 					const lines: string[] = [];
 					for (const id of ids) {
 						let current = this.alarms.get(id);
-						if (!current) throw new Error(`unknown alarm: ${id}`);
+						if (!current) throw new Error(`Alarm "${id}" was not found. Use {"action":"list"} to see current alarm ids.`);
 						for (const entry of this.ownedEntries(id)) {
 							const retry = this.wakeRetry.get(entry.eventId);
 							if (retry && retry.nextAt > Date.now()) continue;
@@ -1982,16 +1987,16 @@ export class WakeAlarmRuntime {
 				case "pause": {
 					if (!params.id) throw new Error("id is required for pause");
 					const id = validateAlarmId(params.id); const current = this.alarms.get(id);
-					if (!current) throw new Error(`unknown alarm: ${id}`);
+					if (!current) throw new Error(`Alarm "${id}" was not found. Use {"action":"list"} to see current alarm ids.`);
 					if (current.kind === "group") {
 						// Group lifecycle controls members: pausing the barrier stops member polling too.
 						// The affected set is derived from the FRESH disk group inside the lock, and only
 						// ownership-valid members are touched — a same-id replacement is never mutated.
 						const count = await this.commitAlarmSet(async (disk) => {
 							const diskGroup = disk.alarms.find((candidate) => candidate.id === id);
-							if (!diskGroup || diskGroup.kind !== "group") throw new Error(`unknown group alarm: ${id}`);
+							if (!diskGroup || diskGroup.kind !== "group") throw new Error(`Alarm "${id}" was not found or is not a group. Use {"action":"list"} to see current alarm ids.`);
 							const invalid = diskGroup.memberIds.filter((memberId) => !this.ownedGroupMember(disk.alarms.find((candidate) => candidate.id === memberId), diskGroup));
-							if (invalid.length > 0) throw new Error(`group integrity failure: invalid member alarm(s) ${invalid.join(", ")}`);
+							if (invalid.length > 0) throw new Error(`Group "${id}" has invalid or missing internal members (${invalid.join(", ")}). Do not manage member ids individually. Remove and recreate the group if you want to rebuild the batch.`);
 							const memberIds = new Set(diskGroup.memberIds);
 							const alarms = disk.alarms.map((candidate) => (candidate.id === id || memberIds.has(candidate.id)) ? this.bump(candidate, { active: false, pauseReason: "paused explicitly" }) : candidate);
 							const adopted = new Map(alarms.filter((candidate) => candidate.id === id || memberIds.has(candidate.id)).map((candidate) => [candidate.id, candidate]));
@@ -2004,15 +2009,15 @@ export class WakeAlarmRuntime {
 				case "resume": {
 					if (!params.id) throw new Error("id is required for resume");
 					const id = validateAlarmId(params.id); const current = this.alarms.get(id);
-					if (!current) throw new Error(`unknown alarm: ${id}`);
+					if (!current) throw new Error(`Alarm "${id}" was not found. Use {"action":"list"} to see current alarm ids.`);
 					if (current.kind === "group") {
 						if (current.firedAt !== undefined) throw new Error("a completed group must be reset, not resumed");
 						const count = await this.commitAlarmSet(async (disk) => {
 							const diskGroup = disk.alarms.find((candidate) => candidate.id === id);
-							if (!diskGroup || diskGroup.kind !== "group") throw new Error(`unknown group alarm: ${id}`);
+							if (!diskGroup || diskGroup.kind !== "group") throw new Error(`Alarm "${id}" was not found or is not a group. Use {"action":"list"} to see current alarm ids.`);
 							if (diskGroup.firedAt !== undefined) throw new Error("a completed group must be reset, not resumed");
 							const invalid = diskGroup.memberIds.filter((memberId) => !this.ownedGroupMember(disk.alarms.find((candidate) => candidate.id === memberId), diskGroup));
-							if (invalid.length > 0) throw new Error(`group integrity failure: invalid member alarm(s) ${invalid.join(", ")}`);
+							if (invalid.length > 0) throw new Error(`Group "${id}" has invalid or missing internal members (${invalid.join(", ")}). Do not manage member ids individually. Remove and recreate the group if you want to rebuild the batch.`);
 							const memberIds = new Set(diskGroup.memberIds);
 							const alarms = disk.alarms.map((candidate) => {
 								if (candidate.id === id || memberIds.has(candidate.id)) return this.bump(candidate, resumeAlarm(candidate, Date.now()));
@@ -2124,7 +2129,7 @@ export class WakeAlarmRuntime {
 				case "drop_wake": {
 					if (!params.eventId) throw new Error("eventId is required for drop_wake");
 					const eventId = params.eventId.trim();
-					if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(eventId)) throw new Error("eventId is invalid");
+					if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(eventId)) throw new Error("eventId is invalid. Copy an eventId exactly from list_wakes.");
 					await this.dropOutboxEntry(eventId);
 					this.schedule();
 					return `Dropped wake ${eventId}.`;
