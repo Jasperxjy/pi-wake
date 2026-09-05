@@ -12,14 +12,16 @@ gaps are generic (any extension / any external session writer).
 
 **Behavior**: when an idle session is open in pi-web and another pi process
 (headless run, RPC writer, scheduler/wake tool) appends to the session `.jsonl`,
-the open view never updates. The only way to see new content is a full page
-reload. The session *list* does show running/unread badges (SessionSidebar's
-visible-tab polling of `/api/agent/running`, 2.5s), so changes are observable —
-the open view itself just never refetches.
+the open view never updates. The session file is updated correctly and the new
+content becomes visible immediately after a reload — but the reload has to be
+manual.
 
 **What the client does today** (0.8.11): per-session streaming SSE for running
-agents; visible-tab polling for the running-session list; no mtime/size check
-for the open session's file and no server-side watcher for idle sessions.
+agents, plus visible-tab polling of `/api/agent/running` for the running-session
+list (SessionSidebar). Note that `/api/agent/running` reflects only sessions
+pi-web's own rpc-manager knows about — an independent external `pi -p` writer is
+invisible to it — and the open idle conversation itself has no external-file
+change detection at all.
 
 **Ask**: live-update the open idle session view. Minimal version: piggyback the
 open session file's `mtime`/`size` onto an existing cheap endpoint and
@@ -31,57 +33,57 @@ reload — which in turn discards other client state (see issue 2).
 
 ---
 
-## Issue 2 — Extension widget panel does not reappear after page reload; suspect one-shot selected-widget state captured before /state hydration
+## Issue 2 — Extension widget panel does not reappear after page reload even though /state retains it
 
 **Environment**: pi-web 0.8.11; extension using `ui.setWidget`/`ui.setStatus`
-(pi-wake 0.2.4: pushes a footer status + a 2-line widget on `session_start` and
-every 15s afterwards).
+(pi-wake 0.2.4: pushes a footer status + a widget on `session_start` and every
+15s afterwards).
 
 **Behavior**: after any page reload (F5), the extension widget panel is gone for
 the reopened session — including sessions pi-web itself served minutes earlier —
-until the user interacts (first message/command brings it back in ~1s).
-User-verified in the browser.
+until the user interacts again (the first message/command brings it back in
+~1s). User-verified in the browser.
 
-**What we verified is NOT the cause**:
+**Facts established**:
 
-- Server state lifetime: `GET /api/sessions/[id]/state` kept returning correct
-  `extensionWidgets` for 4+ minutes after the session went idle with no SSE
-  connection, and for 30+ seconds after a real SSE connect/disconnect cycle.
-  The reload window is well inside that lifetime (all verified via curl).
-- Mount hydration: the mount effect calls `loadSession(session.id, true, true)`;
-  `includeState=true` fetches `/api/sessions/[id]/state` and writes
-  `extensionStatuses`/`extensionWidgets` into React state. From reading the
-  source, the data reaches state — the loss happens after that.
+1. Server-side data lifetime is NOT the problem. `GET /api/sessions/[id]/state`
+   kept returning correct `extensionWidgets` in all of these states (verified
+   via curl):
+   - idle with no SSE connection ever attached: 4+ minutes;
+   - after a real SSE connect→disconnect cycle: 30+ seconds;
+   - after a completed agent turn followed by SSE disconnect: 2+ minutes.
+   A reload window sits comfortably inside these lifetimes.
+2. The mount path appears to hydrate: the mount effect calls
+   `loadSession(session.id, true, true)`; with `includeState=true` it fetches
+   `/api/sessions/[id]/state` and calls `setExtensionStatuses(...)` /
+   `setExtensionWidgets(...)`.
+3. Sending a message to an existing session reuses `session.id`
+   (`ensureEventsConnected(session.id)` + `sendAgentCommand(session.id,
+   {type:"prompt"})`), so the recovery on first interaction is not explained by
+   a session id change.
 
-**Suspicion (from the minified bundle; please confirm in source)**: the
-component that renders `.extension-widget-panel` captures the *selected widget
-key* once, in a lazy `useState` initializer — roughly:
+So the open question is: why is the panel absent even though the server retains
+the data and the mount path reads it? A single browser DevTools capture of the
+actual `/api/sessions/<id>/state` response during a reload would discriminate
+between: (a) the request never being made on the restore path, (b) a transient
+empty response during initialization (not reproducible via curl before/after),
+(c) hydration landing and then being overwritten by a later client state update,
+or (d) a render-side selection issue. We could not distinguish these from
+outside the browser; happy to provide the exact repro project.
 
-```js
-const [selected, setSelected] = useState(
-  () => widgets.find(w => w.lines.length > 1 && w.lines.length <= 3)?.key ?? null
-);
-const visible = widgets.find(w => w.key === selected && w.lines.length > 0);
-return visible && <section className="extension-widget-panel">…
-```
+**Independent observations** (real per source, but not claimed as this issue's
+cause):
 
-On reload the component mounts while `widgets` is still `[]` (the `/state`
-fetch is async), so `selected` freezes to `null`; when hydration lands nothing
-matches `key === null` and the panel never renders. The first interaction
-creates a new session (ensure_session resume semantics → new session id), which
-remounts the view component with `widgets` already populated in React state, so
-the initializer finally picks a key and the panel appears — consistent with the
-observed "any first message brings it back".
-
-If that reading is right, the fix is to re-derive the selection when widgets
-arrive after mount (e.g. `useEffect` fallback: if `selected == null`, pick the
-default candidate; or initialize from the hydrated value).
-
-**Secondary observation**: the initializer only auto-selects widgets with 2–3
-lines. A widget with 4+ lines (pi-wake shows one header line + one line per
-active alarm, up to 5) is never auto-selected even on a clean mount — it only
-appears behind its trigger chip. Worth considering whether that cutoff is
-intended for all widget shapes.
+- `ExtensionWidgets` captures the expanded widget key once, in a lazy
+  `useState(() => getDefaultExpandedWidgetKey(widgets))`. Later `widgets`
+  updates never re-derive the default selection — e.g. a widget that grows
+  beyond the cutoff while mounted stays expanded (selection persists), while a
+  fresh mount of the same state would not select it.
+- `DEFAULT_EXPANDED_WIDGET_LINES = 3`: only widgets with 2–3 lines are
+  auto-expanded on mount; 4+ line widgets render as a trigger chip only, and
+  1-line widgets are not auto-selected either. Extensions with variable-size
+  widgets (pi-wake: header + one line per active alarm) will silently flip
+  between panel and chip depending on alarm count.
 
 **Additional ask (longer-term)**: persist the last extension UI per session to
 disk so it survives pi-web restarts, and consider a read-only "preview" agent
