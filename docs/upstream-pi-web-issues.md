@@ -73,14 +73,3 @@ written sessions can show extension UI without forking.
 `extensionWidgets: null` (no pi-web agent ever ran) — the disk-persistence or
 preview-agent ideas above are what would cover that case.
 
----
-
-## Interim workaround (until upstream fixes)
-
-`docs/pi-web-auto-refresh.user.js` (Tampermonkey, localhost-only):
-1. polls the open session's context signature and reloads on external change
-   (skips while you are typing);
-2. overlays the wake status + widget from `/api/sessions/[id]/state` after each
-   reload, reusing pi-web's own `extension-widget-panel` CSS, and hides itself
-   when the real widget comes back. Covers sessions pi-web remembers; external
-   headless sessions have no server-side UI state (see issue 2 note).
