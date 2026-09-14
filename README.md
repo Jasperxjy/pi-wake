@@ -181,6 +181,10 @@ The same trick composes with everything else:
 
 Sessions with a UI (TUI and pi-web alike) render a footer segment (`wake: 3 · next train in 4m · daemon live`) and, above the editor, a table of active alarms (type word / name / status). Both clear themselves when nothing is active. `/wake-alarm show | short | close` folds them away (footer-only, or fully hidden — the alarms keep running); the mode persists with the language preference, and `{"action":"set_language","language":"en|zh|auto"}` switches the display language.
 
+### Daemon lifecycle
+
+The daemon is self-managing: it starts on demand (first watch, or the last session closing), a newer pi-wake version takes the role over from a healthy older daemon within one presence tick, an unreadable state file puts it in a `degraded` heartbeat (footer shows `daemon degraded`/`守护降级`, sessions spawn a replacement), and it exits on its own after 6 idle hours with no active alarms or when its project directory disappears. You should never need to hunt daemon processes by hand.
+
 ### Wake result summaries
 
 `logTailLines` (1-200) on `watch_container` / `watch_container_group` attaches the last N container log lines to exit/abnormal wake evidence, so a wake can answer "what did it print at the end" without an extra SSH round-trip. Evidence stays sanitized, length-bounded, and labeled untrusted.

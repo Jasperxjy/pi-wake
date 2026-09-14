@@ -58,3 +58,18 @@ test("clearDaemonHeartbeat removes only its own file", async () => {
 	await clearDaemonHeartbeat(dir, process.pid);
 	await assert.rejects(fs.readFile(daemonHeartbeatPath(dir)), /ENOENT/, "own heartbeat removed on shutdown");
 });
+
+test("daemon heartbeat round-trips the code version and degraded reason", async () => {
+	const dir = await fs.mkdtemp(path.join(tmpdir(), "wake-presence-ver-"));
+	try {
+		await writeDaemonHeartbeat(dir, { version: 1, pid: process.pid, startedAt: 1, heartbeatAt: Date.now(), dryRun: false, pkgVersion: "0.2.5", degraded: "state unreadable", logTail: [] });
+		let liveness = await readDaemonLiveness(dir);
+		assert.equal(liveness.heartbeat?.pkgVersion, "0.2.5");
+		assert.equal(liveness.heartbeat?.degraded, "state unreadable");
+		// Older daemons wrote neither field: both must read as undefined.
+		await writeDaemonHeartbeat(dir, { version: 1, pid: process.pid, startedAt: 1, heartbeatAt: Date.now(), dryRun: false, logTail: [] });
+		liveness = await readDaemonLiveness(dir);
+		assert.equal(liveness.heartbeat?.pkgVersion, undefined);
+		assert.equal(liveness.heartbeat?.degraded, undefined);
+	} finally { await fs.rm(dir, { recursive: true, force: true }); }
+});

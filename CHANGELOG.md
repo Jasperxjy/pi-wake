@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.5 (2026-09-14)
+
+Daemon lifecycle release, motivated by a real incident: the vla-safety-mechanisms project was wedged by a daemon that had survived its own uninstall (16 daemon processes machine-wide, 8 running code from a deleted directory). Root chain: a long-lived 0.2.2-era daemon rejected the `ignoreBeforeSpec` field introduced in 0.2.4, its "state reload failed" path swallowed the error, and it kept scheduling from 13-day-old memory while the pre-0.2.4 error message invited deleting the state file (which happened, with a .bak).
+
+- **Version-aware daemon takeover**: the heartbeat now carries the running code's package version. A newer challenger takes the role from an older daemon (SIGTERM; safe because liveness is pidAlive-gated and wake delivery is claim-based at-least-once), and live sessions spawn a replacement within one 15s presence tick when they see a healthy-but-older daemon (rate-limited to one attempt per 5 minutes). Upgrades can no longer strand a project on stale daemon code.
+- **Per-tick read-before-write yield**: an established daemon re-reads the heartbeat before every 5s write and yields to a newer version, to any replacement once degraded, or to a larger pid at the same version. This also closes the double-survival hole in the original single-instance guard: a challenger slipping between an established daemon's write ticks could previously coexist forever because established daemons never re-read.
+- **Degraded instead of wedged**: a daemon whose state becomes unreadable (activation, reconcile, or post-wake reload) stops scheduling and marks its heartbeat `degraded` instead of silently continuing on stale memory that could overwrite newer state. It keeps heartbeating and retrying; sessions see the flag, show "daemon degraded/守护降级" in the footer, and spawn a replacement.
+- **Idle exit**: with zero active alarms and zero live sessions for 6 hours the daemon exits gracefully (a future session restarts it on the next create action). Orphan daemons no longer outlive their usefulness.
+- **Project-gone exit**: a daemon whose project directory was deleted or replaced (checked by dev/ino/birthtime identity, because the daemon's own heartbeat writer recreates `.pi/` and can resurrect a deleted directory) exits instead of becoming an immortal orphan watching a ghost path.
+- New tests: `daemon-lifecycle.test.ts` (takeover, degraded replacement, idle exit, project-gone via identity), heartbeat version/degraded round-trip, tri-state footer wording (en/zh), and version comparison.
+- Verified end-to-end: a 0.2.2-tagged daemon is detected and replaced by a real pi session running 0.2.5 within one presence tick.
+
+Tests: 114 (111 pass + 3 POSIX skips on Windows; 114/114 on WSL).
+
 ## 0.2.4 (2026-09-01)
 
 UI, i18n, and agent-prompt release. (0.2.3 was an unpublished git-only snapshot of the same content minus the prompt overhaul; this version ships everything to npm.)

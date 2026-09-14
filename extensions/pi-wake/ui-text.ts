@@ -115,7 +115,7 @@ const TEXT = {
 		wakePrefix: "wake",
 		active: (n: number) => `${n} active`,
 		paused: (n: number) => `${n} paused`,
-		daemon: (live: boolean) => live ? "daemon live" : "daemon offline",
+		daemon: (live: boolean, degraded?: boolean) => degraded ? "daemon degraded" : live ? "daemon live" : "daemon offline",
 		pending: (n: number) => `!${n} pending`,
 		more: (n: number) => `  … +${n} more`,
 		next: (name: string, inMs: number) => `next ${name} ${inMs >= 0 ? "in" : "overdue"} ${formatDelay(Math.abs(inMs))}`,
@@ -128,7 +128,7 @@ const TEXT = {
 		wakePrefix: "唤醒",
 		active: (n: number) => `${n} 活跃`,
 		paused: (n: number) => `${n} 暂停`,
-		daemon: (live: boolean) => live ? "守护在线" : "守护离线",
+		daemon: (live: boolean, degraded?: boolean) => degraded ? "守护降级" : live ? "守护在线" : "守护离线",
 		pending: (n: number) => `!${n} 待送达`,
 		more: (n: number) => `  … 另有 ${n} 个`,
 		next: (name: string, inMs: number) => `下一个 ${name} ${inMs >= 0 ? formatDelay(inMs) + "后" : "超时 " + formatDelay(-inMs)}`,
@@ -160,6 +160,8 @@ function entryDetail(entry: AlarmDigestEntry, lang: UiLanguage): string {
 export interface WidgetRenderOptions {
 	language: UiLanguage;
 	daemonLive: boolean;
+	/** True when the daemon heartbeat carries a degraded reason (stopped scheduling). */
+	degraded?: boolean;
 	maxEntries?: number;
 	nameWidthClamp?: number;
 }
@@ -173,7 +175,7 @@ export function formatWidgetLines(digest: AlarmDigest, options: WidgetRenderOpti
 	const nameWidth = Math.min(options.nameWidthClamp ?? 48, Math.max(6, ...visible.map((entry) => displayWidth(entry.name))));
 	const typeWidth = Math.max(...Object.values(TYPE_WORDS[lang]).map(displayWidth));
 	const lines = [
-		`${t.wakePrefix}: ${t.active(digest.active)}${digest.paused > 0 ? `, ${t.paused(digest.paused)}` : ""} · ${t.daemon(options.daemonLive)}${digest.pendingWakes > 0 ? ` · ${t.pending(digest.pendingWakes)}` : ""}`,
+		`${t.wakePrefix}: ${t.active(digest.active)}${digest.paused > 0 ? `, ${t.paused(digest.paused)}` : ""} · ${t.daemon(options.daemonLive, options.degraded)}${digest.pendingWakes > 0 ? ` · ${t.pending(digest.pendingWakes)}` : ""}`,
 	];
 	for (const entry of visible) {
 		const type = padDisplay(TYPE_WORDS[lang][entry.kind], typeWidth);
@@ -188,5 +190,5 @@ export function formatWidgetLines(digest: AlarmDigest, options: WidgetRenderOpti
 export function formatFooterStatus(digest: AlarmDigest, options: WidgetRenderOptions): string {
 	const t = TEXT[options.language];
 	const next = digest.nextDue ? t.next(digest.nextDue.name, digest.nextDue.inMs) : t.watching;
-	return `${t.wakePrefix}: ${digest.active} · ${next} · ${t.daemon(options.daemonLive)}`;
+	return `${t.wakePrefix}: ${digest.active} · ${next} · ${t.daemon(options.daemonLive, options.degraded)}`;
 }

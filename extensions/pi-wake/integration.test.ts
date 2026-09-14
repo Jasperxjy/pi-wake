@@ -483,6 +483,7 @@ test("daemon emit re-checks presence and refuses to spawn when the owner came ba
 		dryRun: false,
 		spawnDisabled: false,
 		isStopping: () => false,
+		degrade: () => undefined,
 		log: (message) => logs.push(message),
 		runPi: async () => { spawns++; return 0; },
 	});
@@ -508,6 +509,7 @@ test("daemon emit re-checks presence and refuses to spawn when the owner came ba
 		dryRun: false,
 		spawnDisabled: false,
 		isStopping: () => false,
+		degrade: () => undefined,
 		log: (message) => logs2.push(message),
 		runPi: async () => { spawns2++; return 0; },
 	});

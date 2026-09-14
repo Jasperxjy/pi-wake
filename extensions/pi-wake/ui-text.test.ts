@@ -99,3 +99,11 @@ test("updatePrefs merges: setting the display keeps the language and vice versa"
 test("system detection: zh locale prefix maps to zh, anything else to en", () => {
 	assert.equal(detectSystemLanguage().length > 0, true);
 });
+
+test("footer reports a degraded daemon in both languages", () => {
+	const one = digest([entry({ id: "d1", name: "Deploy", kind: "timer", dueInMs: 60_000, detail: "in 1m" })]);
+	assert.match(formatFooterStatus(one, { language: "en", daemonLive: false, degraded: true }), /daemon degraded$/);
+	assert.match(formatFooterStatus(one, { language: "zh", daemonLive: false, degraded: true }), /守护降级$/);
+	// No degraded flag: the tri-state falls back to offline, never both words.
+	assert.match(formatFooterStatus(one, { language: "en", daemonLive: false }), /daemon offline$/);
+});

@@ -16,14 +16,7 @@ import {
 	writePrefs,
 	type UiDisplay,
 } from "./ui-text.ts";
-import {
-	PRESENCE_DIR_NAME,
-	leaderInstanceId,
-	listLivePresences,
-	readDaemonLiveness,
-	registerPresence,
-	releasePresence,
-} from "./presence.ts";
+import { PRESENCE_DIR_NAME, compareVersions, leaderInstanceId, listLivePresences, readDaemonLiveness, readPkgVersion, registerPresence, releasePresence } from "./presence.ts";
 import { ACTION_DESCRIPTION, PROMPT_GUIDELINES, PROMPT_SNIPPET, TOOL_DESCRIPTION } from "./prompts.ts";
 import {
 	ACTION_ENUM,
@@ -85,6 +78,7 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 			presenceFailures = 0;
 			presenceWarned = false;
 			void refreshAlarmWidget();
+			void maybeReplaceDaemon();
 		} catch {
 			// Presence is the daemon's only signal that this session has a real Pi
 			// process. A silent failure here would let the daemon treat the session as
@@ -191,7 +185,9 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	async function ensureDaemon(): Promise<string> {
 		if (!daemonAutoSpawnAllowed()) return daemonWarned ? "" : "daemon auto-start disabled";
 		const liveness = await readDaemonLiveness(cwd);
-		if (liveness.live) return "";
+		// A degraded daemon (unreadable state, scheduling stopped) is NOT healthy:
+		// replacing it is allowed, and the fresh daemon's guard takes the role over.
+		if (liveness.live && !liveness.heartbeat?.degraded) return "";
 		if (Date.now() - daemonSpawnedAt < 60_000) return "";
 		const entry = await resolveDaemonEntry();
 		if (!entry) return "no pi-wake daemon entry found (package incomplete?)";
@@ -203,6 +199,37 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		} catch (error) {
 			return `cannot start the pi-wake daemon: ${(error as Error).message}`;
 		}
+	}
+
+	// A daemon must not linger in a state newer code can fix: the 15s presence
+	// tick watches for a DEGRADED heartbeat (scheduling stopped) or an OLDER
+	// code version (long-lived daemon predating an upgrade — the 2026-09
+	// incident) and spawns a replacement, whose guard takes the role over.
+	// Replacement spawns are rate-limited hard: a state unreadable by the
+	// CURRENT code would otherwise respawn a doomed daemon every tick forever.
+	let daemonDegradedSpawnedAt = 0;
+	const DAEMON_DEGRADED_RESPAWN_MS = 300_000;
+	const ownPkgVersion = readPkgVersion(path.dirname(fileURLToPath(import.meta.url)));
+	async function maybeReplaceDaemon(): Promise<void> {
+		if (!daemonAutoSpawnAllowed()) return;
+		let liveness;
+		try { liveness = await readDaemonLiveness(cwd); } catch { return; }
+		if (!liveness.live || !liveness.heartbeat) return;
+		const reason = liveness.heartbeat.degraded
+			? `degraded (${liveness.heartbeat.degraded})`
+			: liveness.heartbeat.pkgVersion && compareVersions(ownPkgVersion, liveness.heartbeat.pkgVersion) > 0
+				? `older code (${liveness.heartbeat.pkgVersion} < ${ownPkgVersion})`
+				: undefined;
+		if (!reason) return;
+		if (Date.now() - daemonDegradedSpawnedAt < DAEMON_DEGRADED_RESPAWN_MS) return;
+		const entry = await resolveDaemonEntry();
+		if (!entry) return;
+		try {
+			const child = spawn(process.execPath, [entry], { cwd, detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env, WAKE_ALARM_CWD: cwd } });
+			child.unref();
+			daemonDegradedSpawnedAt = Date.now();
+			uiNotify?.(`Wake alarm: daemon is ${reason}; started a replacement (pid ${child.pid ?? "?"})`);
+		} catch { /* the next tick retries after the cooldown */ }
 	}
 
 	async function daemonNote(action: string): Promise<string> {
@@ -231,7 +258,12 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		const ui = uiSet;
 		if (!ui) return;
 		let daemonLive = false;
-		try { daemonLive = (await readDaemonLiveness(cwd)).live; }
+		let daemonDegraded = false;
+		try {
+			const liveness = await readDaemonLiveness(cwd);
+			daemonDegraded = liveness.live && Boolean(liveness.heartbeat?.degraded);
+			daemonLive = liveness.live && !daemonDegraded;
+		}
 		catch { /* display only */ }
 		const runtimeNow = runtime;
 		const digest: AlarmDigest | undefined = runtimeNow?.alarmDigest();
@@ -243,7 +275,7 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		// Language: tool preference (set_language) > config uiLanguage > system locale.
 		const prefs = await readPrefs(cwd).catch(() => undefined);
 		const language = resolveLanguage(prefs?.language, runtimeNow?.runtimeConfig.uiLanguage, detectSystemLanguage());
-		const render = { language, daemonLive };
+		const render = { language, daemonLive, degraded: daemonDegraded };
 		const display: UiDisplay = prefs?.display ?? "full";
 		if (display === "off") {
 			ui.setStatus(STATUS_KEY, undefined);

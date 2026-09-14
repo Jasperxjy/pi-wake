@@ -1,4 +1,4 @@
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import path from "node:path";
 import { leaseIsAlive } from "./core.ts";
 
@@ -111,6 +111,14 @@ export interface DaemonHeartbeat {
 	startedAt: number;
 	heartbeatAt: number;
 	dryRun: boolean;
+	/** pi-wake package version of the daemon CODE that is running. A healthy
+	 * daemon holding an older version must yield to a newer challenger, so a
+	 * long-lived daemon never wedges a project on stale code (2026-09 incident). */
+	pkgVersion?: string;
+	/** Set while the daemon stopped scheduling because its state file is
+	 * unreadable (it must never write stale memory back over newer disk state).
+	 * Sessions treat a degraded daemon as unhealthy and spawn a replacement. */
+	degraded?: string;
 	logTail: string[];
 }
 
@@ -136,6 +144,34 @@ export async function clearDaemonHeartbeat(cwd: string, pid: number): Promise<vo
 	} catch { /* absent or unreadable: nothing to clear */ }
 }
 
+/** Numeric version compare; positive when a > b. Unknown/short cores pad with
+ * zero; a pre-release suffix ("1.0.0-beta") sorts below its release. */
+export function compareVersions(a: string, b: string): number {
+	const core = (value: string) => value.split("+", 1)[0].split("-", 1)[0].split(".");
+	const ac = core(a);
+	const bc = core(b);
+	for (let index = 0; index < Math.max(ac.length, bc.length); index++) {
+		const delta = (Number(ac[index] ?? "0") || 0) - (Number(bc[index] ?? "0") || 0);
+		if (delta) return delta;
+	}
+	const aPre = a.includes("-");
+	const bPre = b.includes("-");
+	if (aPre !== bPre) return aPre ? -1 : 1;
+	return a.localeCompare(b);
+}
+
+/** The pi-wake package version reachable from a module directory (dist/ and
+ * extensions/pi-wake/ are both one or two levels below the package root). */
+export function readPkgVersion(moduleDir: string): string {
+	for (const rel of ["../package.json", "../../package.json"]) {
+		try {
+			const version = (JSON.parse(readFileSync(path.join(moduleDir, rel), "utf8")) as { version?: unknown }).version;
+			if (typeof version === "string" && version) return version.slice(0, 32);
+		} catch { /* try next candidate */ }
+	}
+	return "0.0.0-unknown";
+}
+
 export interface DaemonLiveness {
 	live: boolean;
 	heartbeat?: DaemonHeartbeat;
@@ -153,7 +189,16 @@ export async function readDaemonLiveness(cwd: string): Promise<DaemonLiveness> {
 		// heartbeat behind; its pid being gone is the proof it cannot be writing.
 		return {
 			live: ageMs >= 0 && ageMs <= DAEMON_HEARTBEAT_FRESH_MS && pidAlive(raw.pid),
-			heartbeat: { version: 1, pid: raw.pid, startedAt: raw.startedAt ?? raw.heartbeatAt, heartbeatAt: raw.heartbeatAt, dryRun: Boolean(raw.dryRun), logTail: Array.isArray(raw.logTail) ? raw.logTail.slice(-DAEMON_LOG_TAIL_LINES).map((line) => String(line)) : [] },
+			heartbeat: {
+				version: 1,
+				pid: raw.pid,
+				startedAt: raw.startedAt ?? raw.heartbeatAt,
+				heartbeatAt: raw.heartbeatAt,
+				dryRun: Boolean(raw.dryRun),
+				pkgVersion: typeof raw.pkgVersion === "string" ? raw.pkgVersion.slice(0, 64) : undefined,
+				degraded: typeof raw.degraded === "string" && raw.degraded ? raw.degraded.slice(0, 256) : undefined,
+				logTail: Array.isArray(raw.logTail) ? raw.logTail.slice(-DAEMON_LOG_TAIL_LINES).map((line) => String(line)) : [],
+			},
 			ageMs,
 		};
 	} catch {
