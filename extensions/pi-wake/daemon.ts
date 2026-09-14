@@ -25,9 +25,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { promises as fs, realpathSync } from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { buildResumeArgs, type AlarmState, type OutboxEntry } from "./core.ts";
-import { PRESENCE_DIR_NAME, clearDaemonHeartbeat, isSessionFileLive, listLivePresences, readDaemonLiveness, writeDaemonHeartbeat, type PresenceRecord } from "./presence.ts";
+import { PRESENCE_DIR_NAME, clearDaemonHeartbeat, compareVersions, isSessionFileLive, listLivePresences, pidAlive, readDaemonLiveness, readPkgVersion, writeDaemonHeartbeat, type PresenceRecord } from "./presence.ts";
 import { WakeAlarmRuntime, type EmitFn, type ExecFn } from "./runtime.ts";
 
 const PRESENCE_POLL_MS = 5_000;
@@ -43,6 +43,34 @@ const presenceDir = path.join(cwd, ".pi", PRESENCE_DIR_NAME);
 const dryRun = process.env.WAKE_ALARM_SPAWN_DRY_RUN === "1";
 const spawnDisabled = process.env.WAKE_ALARM_SPAWN === "0";
 const configuredCommand = process.env.WAKE_ALARM_PI_COMMAND;
+
+/** The package version of the CODE this daemon runs (WAKE_ALARM_PKG_VERSION
+ * overrides it for tests). Long-lived daemons survive installs and uninstalls
+ * of their host directory, so the version travels with the heartbeat and a
+ * newer challenger can take the role over. */
+const pkgVersion = (() => {
+	const override = process.env.WAKE_ALARM_PKG_VERSION;
+	if (override && /^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$/.test(override)) return override;
+	try { return readPkgVersion(path.dirname(fileURLToPath(import.meta.url))); } catch { return "0.0.0-unknown"; }
+})();
+
+export { compareVersions } from "./presence.ts";
+
+/** Grace period with zero active alarms and zero live sessions before an idle
+ * daemon exits (WAKE_ALARM_IDLE_EXIT_MS overrides it for tests). A future
+ * session restarts the daemon when it creates the next alarm. */
+const IDLE_EXIT_MS = (() => {
+	const raw = Number(process.env.WAKE_ALARM_IDLE_EXIT_MS ?? "");
+	return Number.isFinite(raw) && raw > 0 ? raw : 6 * 60 * 60 * 1000;
+})();
+
+let degradedReason: string | undefined;
+let idleSince: number | undefined;
+
+/** Identity of the project directory at startup: dev/ino/birthtime. Used to
+ * detect a vanished OR recreated project (the heartbeat writer recreates
+ * <cwd>/.pi, so existence alone is not proof the project still exists). */
+const cwdStat = await fs.stat(cwd).catch(() => undefined);
 
 let stopping = false;
 let active: WakeAlarmRuntime | undefined;
@@ -60,9 +88,41 @@ function log(message: string): void {
 
 const startedAt = Date.now();
 
-/** Heartbeat + recent log tail, so a dead daemon leaves its last words on disk. */
+/** Heartbeat + recent log tail, so a dead daemon leaves its last words on disk.
+ * Read-before-write: an established daemon must notice a foreign claim BEFORE
+ * overwriting it, otherwise a takeover can never succeed against a daemon that
+ * only re-reads at startup. Yield rules (their claim is fresh and alive):
+ *   - their code version is newer than ours         -> yield (upgrade path);
+ *   - we are degraded                               -> yield (replacement path);
+ *   - same version and their pid is larger          -> yield (duplicate tie-break). */
 async function heartbeat(): Promise<void> {
-	await writeDaemonHeartbeat(cwd, { version: 1, pid: process.pid, startedAt, heartbeatAt: Date.now(), dryRun, logTail: [...LOG_RING] }).catch((error) => log(`heartbeat write failed: ${(error as Error).message}`));
+	try {
+		const foreign = await readDaemonLiveness(cwd);
+		const theirs = foreign.live ? foreign.heartbeat : undefined;
+		if (theirs && theirs.pid !== process.pid) {
+			const newer = typeof theirs.pkgVersion === "string" && compareVersions(theirs.pkgVersion, pkgVersion) > 0;
+			const sameVersionLargerPid = theirs.pkgVersion === pkgVersion && theirs.pid > process.pid;
+			if (newer || degradedReason !== undefined || sameVersionLargerPid) {
+				log(`yielding the daemon role to pid ${theirs.pid}${newer ? ` (newer code ${theirs.pkgVersion})` : degradedReason !== undefined ? " (this daemon is degraded)" : " (same version, larger pid)"}; exiting`);
+				await shutdown("role-yield");
+				return;
+			}
+		}
+	} catch { /* unreadable heartbeat: nothing to yield to */ }
+	await writeDaemonHeartbeat(cwd, { version: 1, pid: process.pid, startedAt, heartbeatAt: Date.now(), dryRun, pkgVersion, degraded: degradedReason, logTail: [...LOG_RING] }).catch((error) => log(`heartbeat write failed: ${(error as Error).message}`));
+}
+
+/** Stop scheduling but keep heartbeating (marked degraded). Stale in-memory
+ * state must never be written back over newer on-disk state, so the runtime is
+ * torn down and the main loop re-enters the activation path, which retries from
+ * disk and clears the flag on success; sessions seeing a degraded daemon spawn
+ * a replacement that takes the role over. */
+function degrade(reason: string, runtime?: WakeAlarmRuntime): void {
+	degradedReason ??= reason;
+	log(`DEGRADED — ${reason}; scheduling stopped until the state becomes readable`);
+	const target = runtime ?? active;
+	active = undefined;
+	if (target) void target.stop().catch(() => undefined);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -218,6 +278,7 @@ export interface DaemonEmitDeps {
 	spawnDisabled: boolean;
 	isStopping: () => boolean;
 	log: (message: string) => void;
+	degrade: (reason: string, runtime?: WakeAlarmRuntime) => void;
 	runPi: (launch: PiLaunch, sessionFile: string, message: string, timeoutMs: number, approve: boolean) => Promise<number>;
 }
 
@@ -277,7 +338,7 @@ export function createDaemonEmit(deps: DaemonEmitDeps): EmitFn {
 		deps.log(`wake run for ${entry.alarmId} exited with code ${code}`);
 		// The woken session may have created or changed alarms; reload before the next write.
 		try { await runtime.reloadFromDisk(); }
-		catch (error) { deps.log(`state reload after wake run failed: ${(error as Error).message}`); }
+		catch (error) { deps.degrade(`state reload after wake run failed: ${(error as Error).message}`, runtime); }
 		return code === 0;
 	};
 }
@@ -300,34 +361,56 @@ async function shutdown(signal: string): Promise<void> {
  * them correct — but they would double the probe traffic forever, and nothing
  * else reaps the duplicate. Protocol:
  *
- *   1. a fresh foreign heartbeat already on disk -> step down immediately;
+ *   1. a fresh foreign heartbeat already on disk -> step down, UNLESS we can
+ *      take the role over: their code is older (long-lived daemon on stale
+ *      code — the 2026-09 incident) or they are degraded (state unreadable);
+ *      takeover signals the old daemon and waits briefly for its exit;
  *   2. write OUR pid as a claim, then wait 1-2.5s (jitter staggers near-
- *      simultaneous spawns) and re-read: any OTHER pid on the file means we
- *      lost the race -> step down.
+ *      simultaneous spawns) and re-read: a healthy NEWER daemon on the file
+ *      means we lost the race -> step down; anything else proceeds — the
+ *      established daemon's read-before-write tick yields within 5s.
  *
- * The >=1s minimum stagger makes double survival impossible: for BOTH daemons
- * to see their own pid afterwards, each would have to write more than 1s after
- * the other's write — a contradiction. At most one daemon proceeds.
+ * The >=1s minimum stagger makes simultaneous double survival impossible, and
+ * the per-tick yield check closes the late-starter gap (a challenger slipping
+ * between an established daemon's 5s writes never re-read afterwards).
  */
 async function singleInstanceGuard(): Promise<void> {
 	const pre = await readDaemonLiveness(cwd);
-	if (pre.live) {
-		log(`another pi-wake daemon (pid ${pre.heartbeat?.pid}) is already live for this project; stepping down`);
-		process.exit(0);
+	if (pre.live && pre.heartbeat && pre.heartbeat.pid !== process.pid) {
+		const theirs = pre.heartbeat;
+		const degraded = typeof theirs.degraded === "string" && theirs.degraded.length > 0;
+		const older = typeof theirs.pkgVersion === "string" && compareVersions(pkgVersion, theirs.pkgVersion) > 0;
+		if (degraded || older) {
+			log(`taking over from daemon pid ${theirs.pid}${older ? ` (older code ${theirs.pkgVersion ?? "?"} < ${pkgVersion})` : " (degraded)"}; signaling it to stop`);
+			// SIGTERM runs their graceful shutdown on POSIX; on Windows this is a
+		// hard kill — acceptable because heartbeats are pidAlive-gated and wake
+		// delivery is claim-based at-least-once (a mid-run kill redelivers later).
+			try { process.kill(theirs.pid, "SIGTERM"); } catch { /* already gone */ }
+			for (let waited = 0; waited < 3_000 && pidAlive(theirs.pid); waited += 100) await sleep(100);
+			if (pidAlive(theirs.pid)) log(`pid ${theirs.pid} still alive after SIGTERM; claiming anyway (its per-tick yield check will settle it)`);
+		} else {
+			log(`another pi-wake daemon (pid ${theirs.pid}, version ${theirs.pkgVersion ?? "?"}) is already live for this project; stepping down`);
+			process.exit(0);
+		}
 	}
 	await heartbeat(); // claim the heartbeat path with OUR pid
 	await sleep(1_000 + Math.floor(Math.random() * 1_500));
 	const verify = await readDaemonLiveness(cwd);
-	if (verify.live && verify.heartbeat?.pid !== process.pid) {
-		log(`lost the single-instance race to daemon pid ${verify.heartbeat?.pid}; stepping down`);
-		await clearDaemonHeartbeat(cwd, process.pid).catch(() => undefined); // no-op when the winner's pid is on the file
-		process.exit(0);
+	if (verify.live && verify.heartbeat && verify.heartbeat.pid !== process.pid) {
+		const theirs = verify.heartbeat;
+		const newer = typeof theirs.pkgVersion === "string" && compareVersions(theirs.pkgVersion, pkgVersion) > 0;
+		if (newer && !theirs.degraded) {
+			log(`lost the single-instance race to newer daemon pid ${theirs.pid} (${theirs.pkgVersion}); stepping down`);
+			await clearDaemonHeartbeat(cwd, process.pid).catch(() => undefined); // no-op when the winner's pid is on the file
+			process.exit(0);
+		}
+		log(`retaining the claim against daemon pid ${theirs.pid} (same or older code${theirs.degraded ? ", degraded" : ""}); its per-tick check will yield`);
 	}
-	if (verify.heartbeat?.pid === process.pid) await heartbeat(); // refresh so the winner never looks stale after the stagger
+	await heartbeat(); // refresh so the winner never looks stale after the stagger
 }
 
 async function main(): Promise<void> {
-	log(`watching project ${cwd}${dryRun ? " (dry-run)" : ""}${spawnDisabled ? " (spawning disabled)" : ""}`);
+	log(`pi-wake daemon ${pkgVersion} watching project ${cwd}${dryRun ? " (dry-run)" : ""}${spawnDisabled ? " (spawning disabled)" : ""}`);
 	await singleInstanceGuard();
 	const emit = createDaemonEmit({
 		getRuntime: () => active,
@@ -336,9 +419,23 @@ async function main(): Promise<void> {
 		spawnDisabled,
 		isStopping: () => stopping,
 		log,
+		degrade,
 		runPi,
 	});
 	while (!stopping) {
+		// A daemon whose project directory vanished is an immortal orphan (the
+		// 2026-09 incident left several watching deleted install directories).
+		// IDENTITY, not mere existence: this daemon's own heartbeat writer
+		// mkdir-recreates <cwd>/.pi every 5s, so a deleted project can look
+		// alive again. The recreated directory has a different dev/ino/birthtime.
+		try {
+			const stat = await fs.stat(cwd);
+			if (cwdStat && (stat.dev !== cwdStat.dev || stat.ino !== cwdStat.ino || stat.birthtimeMs !== cwdStat.birthtimeMs)) throw new Error("replaced");
+		} catch {
+			log(`project directory is gone or was replaced (${cwd}); exiting so a fresh clone can respawn`);
+			await shutdown("project-gone");
+			return;
+		}
 		livePresences = await listLivePresences(presenceDir).catch(() => livePresences);
 		if (!active) {
 			const runtime = new WakeAlarmRuntime({
@@ -356,10 +453,11 @@ async function main(): Promise<void> {
 			try {
 				await runtime.start({ flushPending: false });
 				active = runtime;
+				if (degradedReason) { log("recovered: state is readable again, resuming scheduling"); degradedReason = undefined; }
 				log(`daemon active with ${runtime.alarmCount} alarm(s), ${livePresences.length} live session(s)`);
-				await heartbeat();
 			} catch (error) {
-				log(`activation failed: ${(error as Error).message}; retrying in ${ACTIVATION_RETRY_MS / 1000}s`);
+				degrade(`state activation failed: ${(error as Error).message}`, runtime);
+				await heartbeat(); // degraded heartbeat, so sessions can react and replace us
 				await sleep(ACTIVATION_RETRY_MS);
 				continue;
 			}
@@ -367,7 +465,24 @@ async function main(): Promise<void> {
 			// Disk state is the source of truth: adopt alarms created or changed by
 			// other sessions since the last poll, then re-arm the scheduler.
 			try { await active.resync(); }
-			catch (error) { log(`reconcile failed: ${(error as Error).message}`); }
+			catch (error) {
+				degrade(`reconcile failed: ${(error as Error).message}`, active);
+				await heartbeat();
+				continue;
+			}
+		}
+		// Idle exit: with zero active alarms and zero live sessions this daemon has
+		// no possible work; leaving it alive only preserves stale code. The next
+		// session that creates an alarm restarts the daemon automatically.
+		const activeAlarms = active.alarmDigest().active;
+		if (activeAlarms > 0 || livePresences.length > 0) idleSince = undefined;
+		else {
+			idleSince ??= Date.now();
+			if (Date.now() - idleSince >= IDLE_EXIT_MS) {
+				log(`no active alarms and no live sessions for ${Math.round((Date.now() - idleSince) / 1000)}s; exiting (idle)`);
+				await shutdown("idle-exit");
+				return;
+			}
 		}
 		await heartbeat();
 		await sleep(PRESENCE_POLL_MS);
