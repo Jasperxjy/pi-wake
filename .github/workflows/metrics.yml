@@ -1,12 +1,13 @@
 name: metrics
 
-# Daily npm-download chart for the README. The workflow refetches the full
-# history (tiny), regenerates .github/metrics/downloads.{json,svg}, and commits
-# with [skip ci] — ci.yml additionally ignores this path, so the daily data
-# commit never burns a 4-cell test matrix.
+# Weekly (Fridays) npm-download total chart for the README. The workflow
+# refetches the full history (tiny), regenerates
+# .github/metrics/downloads.{json,svg} — the cumulative subscription total from
+# first publish to today — and commits with [skip ci]; ci.yml additionally
+# ignores this path, so the data commit never burns a 4-cell test matrix.
 on:
   schedule:
-    - cron: "23 3 * * *" # daily, off-peak UTC
+    - cron: "23 3 * * 5" # Fridays, off-peak UTC
   workflow_dispatch:
 
 permissions:

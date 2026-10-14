@@ -3,12 +3,19 @@
  * Regenerate .github/metrics/downloads.{json,svg} from the npm registry
  * download API. Runs dependency-free under plain Node (>= 18, global fetch).
  *
- *   node scripts/metrics.mjs
+ *   node scripts/metrics.mjs               # fetch the full range, then render
+ *   node scripts/metrics.mjs --from-cache  # render the SVG from the saved JSON (no network)
+ *
+ * The chart plots the SUBSCRIPTION TOTAL: the running sum of registry
+ * downloads over the whole history, from the first publish day to today —
+ * one cumulative point per day. The daily rows stay in the JSON snapshot, so
+ * the total can always be recomputed from raw data.
  *
  * Data policy: refetch the ENTIRE range from first publish to today on every
  * run (the npm /range endpoint allows 18 months and the history is tiny), so
  * the stored JSON is always a full, self-correcting snapshot — no merging, no
- * drift if a day was missed.
+ * drift if a day was missed. The workflow runs weekly (Fridays); because every
+ * run rebuilds the entire curve, a missed Friday costs nothing.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -18,34 +25,47 @@ const METRICS_DIR = path.join(process.cwd(), ".github", "metrics");
 const JSON_PATH = path.join(METRICS_DIR, "downloads.json");
 const SVG_PATH = path.join(METRICS_DIR, "downloads.svg");
 const FIRST_PUBLISH = "2026-08-26";
-const WINDOW_DAYS = 60;
+const FROM_CACHE = process.argv.includes("--from-cache");
 
 const utcDay = (date) => date.toISOString().slice(0, 10);
 const today = () => utcDay(new Date());
 
-async function existingFirstDay() {
+async function savedSnapshot() {
 	try {
 		const saved = JSON.parse(await readFile(JSON_PATH, "utf8"));
-		if (Array.isArray(saved.days) && saved.days.length) return saved.days[0].day;
+		return Array.isArray(saved?.days) ? saved : null;
 	} catch { /* absent on first run */ }
-	return FIRST_PUBLISH;
+	return null;
 }
 
-const start = await existingFirstDay();
-const end = today();
-if (end < start) throw new Error(`clock skew: today ${end} < first day ${start}`);
-const response = await fetch(`https://api.npmjs.org/downloads/range/${start}:${end}/${PACKAGE}`);
-if (!response.ok) throw new Error(`npm downloads API responded ${response.status}`);
-const payload = (await response.json());
-const days = (payload.downloads ?? []).filter((entry) => typeof entry.downloads === "number");
-if (!days.length) throw new Error("npm downloads API returned no daily data");
+const saved = await savedSnapshot();
+const start = saved?.days.length ? saved.days[0].day : FIRST_PUBLISH;
 
-await mkdir(METRICS_DIR, { recursive: true });
-await writeFile(JSON_PATH, `${JSON.stringify({ package: PACKAGE, generatedAt: new Date().toISOString(), days }, null, 1)}\n`);
+let days;
+if (FROM_CACHE) {
+	days = (saved?.days ?? []).filter((entry) => typeof entry?.downloads === "number");
+	if (!days.length) throw new Error(`--from-cache found no saved days in ${path.relative(process.cwd(), JSON_PATH)}`);
+} else {
+	const end = today();
+	if (end < start) throw new Error(`clock skew: today ${end} < first day ${start}`);
+	const response = await fetch(`https://api.npmjs.org/downloads/range/${start}:${end}/${PACKAGE}`);
+	if (!response.ok) throw new Error(`npm downloads API responded ${response.status}`);
+	const payload = (await response.json());
+	days = (payload.downloads ?? []).filter((entry) => typeof entry.downloads === "number");
+	if (!days.length) throw new Error("npm downloads API returned no daily data");
+	await mkdir(METRICS_DIR, { recursive: true });
+	await writeFile(JSON_PATH, `${JSON.stringify({ package: PACKAGE, generatedAt: new Date().toISOString(), days }, null, 1)}\n`);
+}
 
-// ---- Hand-drawn (xkcd-style) line chart over the last WINDOW_DAYS ----
+// ---- Subscription total: cumulative downloads from the first day to today ----
+let running = 0;
+const series = days.map((entry) => ({ day: entry.day, daily: entry.downloads, total: (running += entry.downloads) }));
+const total = running;
+const max = Math.max(total, 1);
+
+// ---- Hand-drawn (xkcd-style) line chart over the cumulative total ----
 // Deterministic PRNG seeded from the data: the same numbers always redraw the
-// same wobble, so the daily commit diff stays byte-stable for unchanged days.
+// same wobble, so the weekly commit diff stays byte-stable for unchanged days.
 function mulberry32(seed) {
 	let a = seed >>> 0;
 	return () => {
@@ -94,10 +114,7 @@ function sketchEllipse(cx, cy, rx, ry, rng) {
 	return sketchPath(pass(0), rng, 1.5) + " " + sketchPath(pass(0.35), rng, 1.5);
 }
 
-const window = days.slice(-WINDOW_DAYS);
-const total = window.reduce((sum, entry) => sum + entry.downloads, 0);
-const max = Math.max(...window.map((entry) => entry.downloads), 1);
-const seed = hashData(window.map((entry) => `${entry.day}:${entry.downloads}`).join("|"));
+const seed = hashData(series.map((entry) => `${entry.day}:${entry.daily}:${entry.total}`).join("|"));
 const rng = mulberry32(seed);
 const rng2 = mulberry32(seed ^ 0x9e3779b9);
 
@@ -110,8 +127,8 @@ const bottom = 36;
 const chartW = width - padL - padR;
 const chartH = height - top - bottom;
 const yOf = (count) => top + chartH - (count / max) * chartH;
-const xOf = (index) => padL + (window.length === 1 ? chartW / 2 : (index / (window.length - 1)) * chartW);
-const points = window.map((entry, index) => [xOf(index), yOf(entry.downloads)]);
+const xOf = (index) => padL + (series.length === 1 ? chartW / 2 : (index / (series.length - 1)) * chartW);
+const points = series.map((entry, index) => [xOf(index), yOf(entry.total)]);
 
 const line = sketchPath(points, rng, 2.1);
 const lineGhost = sketchPath(points, rng2, 2.6);
@@ -122,35 +139,36 @@ const leftAxis = sketchPath([[padL, top - 8], [padL, top + chartH + 5]], rng, 1.
 const gridY = top + chartH / 2;
 const grid = sketchPath([[padL, gridY], [padL + chartW, gridY]], rng2, 1.1);
 
-const markers = window
-	.map((entry, index) => entry.downloads > 0 ? `<circle cx="${xOf(index).toFixed(1)}" cy="${yOf(entry.downloads).toFixed(1)}" r="2.6" fill="#316dca"><title>${entry.day}: ${entry.downloads}</title></circle>` : "")
+const markers = series
+	.map((entry, index) => entry.total > 0 ? `<circle cx="${xOf(index).toFixed(1)}" cy="${yOf(entry.total).toFixed(1)}" r="2.6" fill="#316dca"><title>${entry.day}: ${entry.total} total (+${entry.daily} that day)</title></circle>` : "")
 	.filter(Boolean).join("\n");
 const FONT = "'Comic Sans MS','Segoe Print','Chalkboard SE','Comic Neue',cursive";
-// Sketchy encirclement of the peak day, with a hand-labelled callout.
-const peakIndex = window.reduce((best, entry, index) => (entry.downloads > window[best].downloads ? index : best), 0);
-const peak = window[peakIndex];
+// Sketchy encirclement of the day the running total last reached its maximum,
+// with a hand-labelled callout; for a monotone curve that is the newest day
+// with a non-zero total.
+const peakIndex = series.reduce((best, entry, index) => (entry.total > series[best].total ? index : best), 0);
+const peak = series[peakIndex];
 const peakX = xOf(peakIndex);
-const peakY = yOf(peak.downloads);
-const peakLabel = `${peak.downloads.toLocaleString("en-US")} on ${peak.day.slice(5)}`;
-// Callout side follows the peak's position so the label never leaves the canvas
-// (publish-spike data peaks on the FIRST day, i.e. the far left).
+const peakY = yOf(peak.total);
+const peakLabel = `${peak.total.toLocaleString("en-US")} total · ${peak.day.slice(5)}`;
+// Callout side follows the peak's position so the label never leaves the canvas.
 const calloutLeft = peakX > 300;
 const [cArrow, cTextX, cAnchor] = calloutLeft
 	? [`M ${peakX.toFixed(1)} ${(peakY - 18).toFixed(1)} C ${(peakX - 30).toFixed(1)} ${(peakY - 42).toFixed(1)}, ${(peakX - 46).toFixed(1)} ${(peakY - 40).toFixed(1)}, ${(peakX - 52).toFixed(1)} ${(peakY - 30).toFixed(1)}`, peakX - 56, "end"]
 	: [`M ${peakX.toFixed(1)} ${(peakY - 18).toFixed(1)} C ${(peakX + 30).toFixed(1)} ${(peakY - 42).toFixed(1)}, ${(peakX + 46).toFixed(1)} ${(peakY - 40).toFixed(1)}, ${(peakX + 52).toFixed(1)} ${(peakY - 30).toFixed(1)}`, peakX + 56, "start"];
-const callout = peak.downloads > 0
+const callout = peak.total > 0
 	? `<path d="${sketchEllipse(peakX, peakY, 26, 16, rng)}" fill="none" stroke="#e78100" stroke-width="1.6" stroke-linecap="round"/>
  <path d="${cArrow}" fill="none" stroke="#e78100" stroke-width="1.4" stroke-linecap="round"/>
  <text x="${cTextX.toFixed(1)}" y="${(peakY - 26).toFixed(1)}" text-anchor="${cAnchor}" font-family="${FONT}" font-size="12.5" fill="#e78100">${peakLabel}</text>`
 	: "";
 
-const first = window[0].day;
-const last = window[window.length - 1];
-const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="npm downloads per day, hand-drawn line chart">
- <title>${PACKAGE}: npm downloads per day</title>
+const first = series[0].day;
+const last = series[series.length - 1].day;
+const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="npm total downloads (cumulative subscription total), hand-drawn line chart">
+ <title>${PACKAGE}: npm downloads — cumulative subscription total</title>
  <rect width="${width}" height="${height}" fill="transparent"/>
- <text x="${padL}" y="24" font-family="${FONT}" font-size="14.5" fill="#3b4249">npm downloads / day</text>
- <text x="${padL + chartW}" y="24" text-anchor="end" font-family="${FONT}" font-size="12" fill="#8b949e">total ${total.toLocaleString("en-US")} · ${window.length}d</text>
+ <text x="${padL}" y="24" font-family="${FONT}" font-size="14.5" fill="#3b4249">npm downloads · cumulative total</text>
+ <text x="${padL + chartW}" y="24" text-anchor="end" font-family="${FONT}" font-size="12" fill="#8b949e">${total.toLocaleString("en-US")} total · ${series.length}d</text>
  <path d="${grid}" fill="none" stroke="#d0d7de" stroke-width="1.1" stroke-dasharray="5 6"/>
  <text x="${padL - 6}" y="${gridY + 4}" text-anchor="end" font-family="${FONT}" font-size="10.5" fill="#8b949e">${Math.round(max / 2).toLocaleString("en-US")}</text>
  <text x="${padL - 6}" y="${top + 4}" text-anchor="end" font-family="${FONT}" font-size="10.5" fill="#8b949e">${max.toLocaleString("en-US")}</text>
@@ -162,8 +180,8 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${
 ${markers}
 ${callout}
  <text x="${padL}" y="${height - 10}" font-family="${FONT}" font-size="11" fill="#8b949e">${first}</text>
- <text x="${padL + chartW}" y="${height - 10}" text-anchor="end" font-family="${FONT}" font-size="11" fill="#8b949e">${last} · daily refresh</text>
+ <text x="${padL + chartW}" y="${height - 10}" text-anchor="end" font-family="${FONT}" font-size="11" fill="#8b949e">${last} · weekly refresh</text>
 </svg>
 `;
 await writeFile(SVG_PATH, svg);
-console.log(`metrics: ${window.length} days, total ${total}, hand-drawn line chart -> ${path.relative(process.cwd(), SVG_PATH)}`);
+console.log(`metrics: ${series.length} days, subscription total ${total.toLocaleString("en-US")}, hand-drawn cumulative chart -> ${path.relative(process.cwd(), SVG_PATH)}`);

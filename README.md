@@ -2,9 +2,9 @@
 
 [![npm version](https://img.shields.io/npm/v/pi-wake.svg)](https://www.npmjs.com/package/pi-wake) [![npm downloads/month](https://img.shields.io/npm/dm/pi-wake.svg)](https://www.npmjs.com/package/pi-wake) [![npm total](https://img.shields.io/npm/dt/pi-wake.svg)](https://www.npmjs.com/package/pi-wake)
 
-![npm downloads per day](.github/metrics/downloads.svg)
+![npm subscription total](.github/metrics/downloads.svg)
 
-<sub>Registry download counts (daily refresh, mirror pulls included — the plugin itself is fully local and reports nothing).</sub>
+<sub>Registry download counts — cumulative subscription total from first publish to today, refreshed weekly on Fridays (mirror pulls included; the plugin itself is fully local and reports nothing).</sub>
 
 Programmable event subscriptions for the [Pi coding agent](https://github.com/earendil-works/pi). The agent names a condition — a point in time, a container exit, a line in a remote log — and pi-wake wakes **the same session** when it happens:
 
