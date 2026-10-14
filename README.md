@@ -4,7 +4,7 @@
 
 ![npm subscription total](.github/metrics/downloads.svg)
 
-<sub>Registry download counts — cumulative subscription total from first publish to today, refreshed weekly on Fridays (mirror pulls included; the plugin itself is fully local and reports nothing).</sub>
+<sub>Registry download counts — cumulative subscription total by week (Mon–Sun), from first publish to today, refreshed weekly on Fridays (mirror pulls included; the plugin itself is fully local and reports nothing).</sub>
 
 Programmable event subscriptions for the [Pi coding agent](https://github.com/earendil-works/pi). The agent names a condition — a point in time, a container exit, a line in a remote log — and pi-wake wakes **the same session** when it happens:
 

@@ -6,10 +6,12 @@
  *   node scripts/metrics.mjs               # fetch the full range, then render
  *   node scripts/metrics.mjs --from-cache  # render the SVG from the saved JSON (no network)
  *
- * The chart plots the SUBSCRIPTION TOTAL: the running sum of registry
- * downloads over the whole history, from the first publish day to today —
- * one cumulative point per day. The daily rows stay in the JSON snapshot, so
- * the total can always be recomputed from raw data.
+ * The chart plots the SUBSCRIPTION TOTAL per WEEK: the daily registry rows are
+ * bucketed into weeks (Monday–Sunday, UTC), each week's downloads are summed,
+ * and the buckets are accumulated into a running total from the first week to
+ * today. The x axis is therefore one point per week, not per day. The daily
+ * rows stay in the JSON snapshot, so the weekly table can always be recomputed
+ * from raw data.
  *
  * Data policy: refetch the ENTIRE range from first publish to today on every
  * run (the npm /range endpoint allows 18 months and the history is tiny), so
@@ -57,15 +59,29 @@ if (FROM_CACHE) {
 	await writeFile(JSON_PATH, `${JSON.stringify({ package: PACKAGE, generatedAt: new Date().toISOString(), days }, null, 1)}\n`);
 }
 
-// ---- Subscription total: cumulative downloads from the first day to today ----
+// ---- Weekly buckets (Mon–Sun, UTC): the historical daily rows re-tallied by
+// ---- date, then accumulated into the subscription total at each week ----
+const weekStartOf = (day) => {
+	const date = new Date(`${day}T00:00:00Z`);
+	date.setUTCDate(date.getUTCDate() - ((date.getUTCDay() + 6) % 7)); // Monday
+	return date.toISOString().slice(0, 10);
+};
+const buckets = new Map();
+for (const entry of days) {
+	const week = weekStartOf(entry.day);
+	const bucket = buckets.get(week) ?? { week, downloads: 0, through: entry.day };
+	bucket.downloads += entry.downloads;
+	bucket.through = entry.day;
+	buckets.set(week, bucket);
+}
 let running = 0;
-const series = days.map((entry) => ({ day: entry.day, daily: entry.downloads, total: (running += entry.downloads) }));
+const series = [...buckets.values()].map((bucket) => ({ ...bucket, total: (running += bucket.downloads) }));
 const total = running;
 const max = Math.max(total, 1);
 
-// ---- Hand-drawn (xkcd-style) line chart over the cumulative total ----
+// ---- Hand-drawn (xkcd-style) line chart, one point per week ----
 // Deterministic PRNG seeded from the data: the same numbers always redraw the
-// same wobble, so the weekly commit diff stays byte-stable for unchanged days.
+// same wobble, so the weekly commit diff stays byte-stable for unchanged weeks.
 function mulberry32(seed) {
 	let a = seed >>> 0;
 	return () => {
@@ -114,21 +130,21 @@ function sketchEllipse(cx, cy, rx, ry, rng) {
 	return sketchPath(pass(0), rng, 1.5) + " " + sketchPath(pass(0.35), rng, 1.5);
 }
 
-const seed = hashData(series.map((entry) => `${entry.day}:${entry.daily}:${entry.total}`).join("|"));
+const seed = hashData(series.map((week) => `${week.week}:${week.downloads}:${week.total}`).join("|"));
 const rng = mulberry32(seed);
 const rng2 = mulberry32(seed ^ 0x9e3779b9);
 
 const width = 900;
-const height = 240;
+const height = 252;
 const padL = 46;
-const padR = 16;
+const padR = 34; // room for the peak-day encirclement at the right edge
 const top = 46;
 const bottom = 36;
 const chartW = width - padL - padR;
 const chartH = height - top - bottom;
 const yOf = (count) => top + chartH - (count / max) * chartH;
 const xOf = (index) => padL + (series.length === 1 ? chartW / 2 : (index / (series.length - 1)) * chartW);
-const points = series.map((entry, index) => [xOf(index), yOf(entry.total)]);
+const points = series.map((week, index) => [xOf(index), yOf(week.total)]);
 
 const line = sketchPath(points, rng, 2.1);
 const lineGhost = sketchPath(points, rng2, 2.6);
@@ -140,17 +156,17 @@ const gridY = top + chartH / 2;
 const grid = sketchPath([[padL, gridY], [padL + chartW, gridY]], rng2, 1.1);
 
 const markers = series
-	.map((entry, index) => entry.total > 0 ? `<circle cx="${xOf(index).toFixed(1)}" cy="${yOf(entry.total).toFixed(1)}" r="2.6" fill="#316dca"><title>${entry.day}: ${entry.total} total (+${entry.daily} that day)</title></circle>` : "")
+	.map((week, index) => week.total > 0 ? `<circle cx="${xOf(index).toFixed(1)}" cy="${yOf(week.total).toFixed(1)}" r="2.6" fill="#316dca"><title>week of ${week.week}: +${week.downloads} (${week.total} total, through ${week.through})</title></circle>` : "")
 	.filter(Boolean).join("\n");
 const FONT = "'Comic Sans MS','Segoe Print','Chalkboard SE','Comic Neue',cursive";
-// Sketchy encirclement of the day the running total last reached its maximum,
-// with a hand-labelled callout; for a monotone curve that is the newest day
-// with a non-zero total.
-const peakIndex = series.reduce((best, entry, index) => (entry.total > series[best].total ? index : best), 0);
+// Sketchy encirclement of the newest week that holds the maximum running
+// total, with a hand-labelled callout (ties resolve to the newest week, so a
+// flat tail still points at the current total).
+const peakIndex = series.reduce((best, week, index) => (week.total >= series[best].total ? index : best), 0);
 const peak = series[peakIndex];
 const peakX = xOf(peakIndex);
 const peakY = yOf(peak.total);
-const peakLabel = `${peak.total.toLocaleString("en-US")} total · ${peak.day.slice(5)}`;
+const peakLabel = `${peak.total.toLocaleString("en-US")} total · week of ${peak.week.slice(5)}`;
 // Callout side follows the peak's position so the label never leaves the canvas.
 const calloutLeft = peakX > 300;
 const [cArrow, cTextX, cAnchor] = calloutLeft
@@ -162,13 +178,22 @@ const callout = peak.total > 0
  <text x="${cTextX.toFixed(1)}" y="${(peakY - 26).toFixed(1)}" text-anchor="${cAnchor}" font-family="${FONT}" font-size="12.5" fill="#e78100">${peakLabel}</text>`
 	: "";
 
-const first = series[0].day;
-const last = series[series.length - 1].day;
-const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="npm total downloads (cumulative subscription total), hand-drawn line chart">
- <title>${PACKAGE}: npm downloads — cumulative subscription total</title>
+// ---- Weekly x axis: one tick per week (Monday date), thinned when dense ----
+const tickEvery = Math.max(1, Math.ceil(series.length / 12));
+const ticks = series
+	.map((week, index) => {
+		if (index % tickEvery !== 0 && index !== series.length - 1) return "";
+		const anchor = index === 0 ? "start" : index === series.length - 1 ? "end" : "middle";
+		return `<text x="${xOf(index).toFixed(1)}" y="${height - 22}" text-anchor="${anchor}" font-family="${FONT}" font-size="10.5" fill="#8b949e">${week.week.slice(5)}</text>`;
+	})
+	.filter(Boolean).join("\n");
+const last = series[series.length - 1];
+const caption = `week of (Mon) · data through ${last.through} · refreshed weekly (Fri)`;
+
+const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="npm downloads by week, cumulative subscription total, hand-drawn line chart">
+ <title>${PACKAGE}: npm downloads — cumulative subscription total by week</title>
  <rect width="${width}" height="${height}" fill="transparent"/>
- <text x="${padL}" y="24" font-family="${FONT}" font-size="14.5" fill="#3b4249">npm downloads · cumulative total</text>
- <text x="${padL + chartW}" y="24" text-anchor="end" font-family="${FONT}" font-size="12" fill="#8b949e">${total.toLocaleString("en-US")} total · ${series.length}d</text>
+ <text x="${padL}" y="24" font-family="${FONT}" font-size="14.5" fill="#3b4249">npm downloads · cumulative total (weekly)</text>
  <path d="${grid}" fill="none" stroke="#d0d7de" stroke-width="1.1" stroke-dasharray="5 6"/>
  <text x="${padL - 6}" y="${gridY + 4}" text-anchor="end" font-family="${FONT}" font-size="10.5" fill="#8b949e">${Math.round(max / 2).toLocaleString("en-US")}</text>
  <text x="${padL - 6}" y="${top + 4}" text-anchor="end" font-family="${FONT}" font-size="10.5" fill="#8b949e">${max.toLocaleString("en-US")}</text>
@@ -179,9 +204,9 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${
  <path d="${baseline}" fill="none" stroke="#8b949e" stroke-width="1.6" stroke-linecap="round"/>
 ${markers}
 ${callout}
- <text x="${padL}" y="${height - 10}" font-family="${FONT}" font-size="11" fill="#8b949e">${first}</text>
- <text x="${padL + chartW}" y="${height - 10}" text-anchor="end" font-family="${FONT}" font-size="11" fill="#8b949e">${last} · weekly refresh</text>
+${ticks}
+ <text x="${padL}" y="${height - 6}" font-family="${FONT}" font-size="10" fill="#8b949e">${caption}</text>
 </svg>
 `;
 await writeFile(SVG_PATH, svg);
-console.log(`metrics: ${series.length} days, subscription total ${total.toLocaleString("en-US")}, hand-drawn cumulative chart -> ${path.relative(process.cwd(), SVG_PATH)}`);
+console.log(`metrics: ${series.length} weeks (${days.length} days), subscription total ${total.toLocaleString("en-US")}, hand-drawn cumulative chart -> ${path.relative(process.cwd(), SVG_PATH)}`);
