@@ -1,11 +1,14 @@
+import { randomUUID } from "node:crypto";
 import { promises as fs, readFileSync } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { leaseIsAlive } from "./core.ts";
 
 /**
  * Per-session presence registry. Each live session owns exactly one file named
- * after its instance id, so registration never contends: there is no acquire,
- * no takeover, and no fencing race. Leadership for ownerless alarms is computed
+ * after its instance id. Each registration owns a unique temporary file;
+ * session heartbeats are coalesced by createPresenceRefresher. There is no
+ * acquire or takeover. Leadership for ownerless alarms is computed
  * deterministically (smallest live instance id), not claimed.
  */
 export const PRESENCE_DIR_NAME = "wake-alarm.sessions";
@@ -38,20 +41,120 @@ async function renameWithRetry(from: string, to: string): Promise<void> {
 	throw lastError;
 }
 
-/** Idempotent (re)registration: writes only this instance's own file. Safe to heartbeat with. */
-export async function registerPresence(dir: string, record: PresenceRecord): Promise<void> {
-	await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-	const file = path.join(dir, `${record.instanceId}.json`);
-	const temp = `${file}.tmp-${process.pid}`;
-	await fs.writeFile(temp, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
-	try { await renameWithRetry(temp, file); }
-	catch (error) { await fs.rm(temp, { force: true }).catch(() => undefined); throw error; }
+type PresenceOperation = "mkdir" | "open" | "write" | "close" | "rename" | "list";
+
+/** Keep the original I/O error for callers without exposing paths in warnings. */
+export class PresenceIoError extends Error {
+	readonly operation: PresenceOperation;
+	readonly code: string | undefined;
+
+	constructor(operation: PresenceOperation, cause: unknown) {
+		super(`Presence ${operation} failed`, { cause });
+		this.name = "PresenceIoError";
+		this.operation = operation;
+		const code = (cause as NodeJS.ErrnoException | null)?.code;
+		this.code = typeof code === "string" ? code : undefined;
+	}
 }
 
-/** Remove only this instance's own presence file. */
+/** Atomic registration; overlapping callers never share a temporary file.
+ * Direct callers choose commit order. Session heartbeats use the refresher below. */
+export async function registerPresence(dir: string, record: PresenceRecord): Promise<void> {
+	const file = path.join(dir, `${record.instanceId}.json`);
+	const temp = `${file}.tmp-${process.pid}-${randomUUID()}`;
+	let operation: PresenceOperation = "mkdir";
+	let handle: FileHandle | undefined;
+	let ownsTemp = false;
+	try {
+		await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+		operation = "open";
+		handle = await fs.open(temp, "wx", 0o600);
+		ownsTemp = true;
+		operation = "write";
+		await handle.writeFile(`${JSON.stringify(record)}\n`, { encoding: "utf8" });
+		operation = "close";
+		await handle.close();
+		handle = undefined;
+		operation = "rename";
+		await renameWithRetry(temp, file);
+		ownsTemp = false;
+	} catch (error) {
+		throw new PresenceIoError(operation, error);
+	} finally {
+		// A partial write still owns its file. An unsuccessful exclusive open
+		// does not, and must never remove somebody else's existing file.
+		if (handle) await handle.close().catch(() => undefined);
+		if (ownsTemp) await fs.rm(temp, { force: true }).catch(() => undefined);
+	}
+}
+
+/** Call only after the owning refresher has closed and drained. */
 export async function releasePresence(dir: string, instanceId: string): Promise<void> {
 	await fs.rm(path.join(dir, `${instanceId}.json`), { force: true }).catch(() => undefined);
-	await fs.rm(path.join(dir, `${instanceId}.json.tmp-${process.pid}`), { force: true }).catch(() => undefined);
+}
+
+export interface PresenceRefresher {
+	request(record: PresenceRecord): Promise<void>;
+	close(): Promise<void>;
+}
+
+/** One running write/list cycle and at most one latest pending heartbeat.
+ * Callbacks are synchronous; reentrant requests join the same drain. */
+export function createPresenceRefresher(dir: string, callbacks: {
+	onLive?: (live: PresenceRecord[]) => void;
+	onError?: (error: unknown) => void;
+} = {}): PresenceRefresher {
+	let closed = false;
+	let pending: PresenceRecord | undefined;
+	let inFlight: Promise<void> | undefined;
+	return {
+		request(record) {
+			if (closed) return Promise.resolve();
+			pending = { ...record };
+			if (!inFlight) {
+				// Publish the Promise before any work or callback can reenter.
+				inFlight = Promise.resolve().then(async () => {
+					try {
+						while (!closed && pending) {
+							const next = pending;
+							pending = undefined;
+							try {
+								await registerPresence(dir, next);
+								if (closed) continue;
+								const live = await listLivePresences(dir).catch((error) => { throw new PresenceIoError("list", error); });
+								if (!closed) callbacks.onLive?.(live);
+							} catch (error) {
+								if (!closed) callbacks.onError?.(error);
+							}
+						}
+					} finally {
+						// No await between observing an empty queue and clearing this
+						// state: a new request cannot be stranded in a finally gap.
+						inFlight = undefined;
+					}
+				});
+			}
+			return inFlight;
+		},
+		close() {
+			closed = true;
+			pending = undefined;
+			return inFlight ?? Promise.resolve();
+		},
+	};
+}
+
+export function formatPresenceFailure(error: unknown, failures: number): string {
+	const operations: readonly string[] = ["mkdir", "open", "write", "close", "rename", "list"];
+	const operation = error instanceof PresenceIoError && operations.includes(error.operation) ? error.operation : "refresh";
+	const rawCode = (error as NodeJS.ErrnoException | null)?.code;
+	const code = typeof rawCode === "string" && /^E[A-Z0-9_]{1,39}$/.test(rawCode) ? rawCode : "UNKNOWN";
+	const hint = code === "EACCES" || code === "EPERM"
+		? "check directory/file permissions or file locks"
+		: code === "ENOENT" && operation === "rename"
+			? "the temporary source or parent directory is missing"
+			: "check the presence registry filesystem and I/O operation";
+	return `Wake alarm: cannot refresh session presence (${operation}: ${code}; ${failures} consecutive failure(s)); the daemon may not detect this session — ${hint}`;
 }
 
 /** All currently live presences; stale records are ignored and best-effort removed. */

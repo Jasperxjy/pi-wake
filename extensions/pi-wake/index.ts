@@ -16,7 +16,7 @@ import {
 	writePrefs,
 	type UiDisplay,
 } from "./ui-text.ts";
-import { PRESENCE_DIR_NAME, compareVersions, leaderInstanceId, listLivePresences, readDaemonLiveness, readPkgVersion, registerPresence, releasePresence } from "./presence.ts";
+import { PRESENCE_DIR_NAME, compareVersions, createPresenceRefresher, formatPresenceFailure, leaderInstanceId, readDaemonLiveness, readPkgVersion, releasePresence, type PresenceRefresher } from "./presence.ts";
 import { ACTION_DESCRIPTION, PROMPT_GUIDELINES, PROMPT_SNIPPET, TOOL_DESCRIPTION } from "./prompts.ts";
 import {
 	ACTION_ENUM,
@@ -66,30 +66,17 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	let presenceWarned = false;
 	let uiNotify: ((message: string) => void) | undefined;
 	let cwd = "";
+	let presenceRefresher: PresenceRefresher | undefined;
+	let generation = 0;
+	let closing = true;
+	let runtimeReady = false;
+	// Unknown until this session's runtime has finished loading its config.
+	let spawnDaemon: boolean | undefined;
+	let shutdownPromise: Promise<void> | undefined;
 
-	async function refreshPresence(): Promise<void> {
-		if (!presenceDir) return;
-		try {
-			await registerPresence(presenceDir, { version: 1, pid: process.pid, instanceId, sessionFile: ownerSessionFile, heartbeatAt: Date.now() });
-			const live = await listLivePresences(presenceDir);
-			// Ownerless (legacy) alarms are scheduled by exactly one live session: the
-			// deterministic leader (smallest instance id). No acquisition, no fencing.
-			isLeader = leaderInstanceId(live) === instanceId;
-			presenceFailures = 0;
-			presenceWarned = false;
-			void refreshAlarmWidget();
-			void maybeReplaceDaemon();
-		} catch {
-			// Presence is the daemon's only signal that this session has a real Pi
-			// process. A silent failure here would let the daemon treat the session as
-			// offline and spawn a second Pi on the same session file, so consecutive
-			// failures must be visible instead of swallowed.
-			presenceFailures++;
-			if (!presenceWarned || presenceFailures % 5 === 0) {
-				presenceWarned = true;
-				uiNotify?.(`Wake alarm: cannot write session presence (${presenceFailures} consecutive failure(s)); the daemon may not detect this session — check write access to ${presenceDir}`);
-			}
-		}
+	function refreshPresence(): Promise<void> {
+		if (closing || !presenceRefresher) return Promise.resolve();
+		return presenceRefresher.request({ version: 1, pid: process.pid, instanceId, sessionFile: ownerSessionFile, heartbeatAt: Date.now() });
 	}
 
 	function stopHeartbeat(): void {
@@ -99,7 +86,10 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 
 	function startHeartbeat(): void {
 		stopHeartbeat();
-		presenceHeartbeat = setInterval(() => void refreshPresence(), PRESENCE_HEARTBEAT_MS);
+		const epoch = generation;
+		presenceHeartbeat = setInterval(() => {
+			if (!closing && epoch === generation) void refreshPresence();
+		}, PRESENCE_HEARTBEAT_MS);
 		if (typeof presenceHeartbeat.unref === "function") presenceHeartbeat.unref();
 	}
 
@@ -158,10 +148,12 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	let daemonSpawnedAt = 0;
 	let daemonWarned = false;
 
-	function daemonAutoSpawnAllowed(): boolean {
-		if (passive || process.env.WAKE_ALARM_NO_AUTOSPAWN === "1") return false;
-		const config = runtime?.runtimeConfig;
-		return config ? config.spawnDaemon : true;
+	type DaemonTarget = { cwd: string; passive: boolean; spawnDaemon: boolean | undefined };
+
+	function daemonTarget(): DaemonTarget { return { cwd, passive, spawnDaemon }; }
+
+	function daemonAutoSpawnAllowed(target: DaemonTarget): boolean {
+		return !target.passive && target.spawnDaemon === true && process.env.WAKE_ALARM_NO_AUTOSPAWN !== "1";
 	}
 
 	/** Prefer the built daemon when the package ships dist/ (published install);
@@ -182,17 +174,21 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	async function ensureDaemon(): Promise<string> {
-		if (!daemonAutoSpawnAllowed()) return daemonWarned ? "" : "daemon auto-start disabled";
-		const liveness = await readDaemonLiveness(cwd);
+	async function ensureDaemon(target = daemonTarget(), handoff = false): Promise<string> {
+		const epoch = generation;
+		const allowed = () => daemonAutoSpawnAllowed(target) && (handoff || (!closing && epoch === generation));
+		if (!allowed()) return daemonWarned ? "" : "daemon auto-start disabled";
+		const liveness = await readDaemonLiveness(target.cwd);
+		if (!allowed()) return "";
 		// A degraded daemon (unreadable state, scheduling stopped) is NOT healthy:
 		// replacing it is allowed, and the fresh daemon's guard takes the role over.
 		if (liveness.live && !liveness.heartbeat?.degraded) return "";
 		if (Date.now() - daemonSpawnedAt < 60_000) return "";
 		const entry = await resolveDaemonEntry();
+		if (!allowed()) return "";
 		if (!entry) return "no pi-wake daemon entry found (package incomplete?)";
 		try {
-			const child = spawn(process.execPath, [entry], { cwd, detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env, WAKE_ALARM_CWD: cwd } });
+			const child = spawn(process.execPath, [entry], { cwd: target.cwd, detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env, WAKE_ALARM_CWD: target.cwd } });
 			child.unref();
 			daemonSpawnedAt = Date.now();
 			return `started pi-wake daemon (pid ${child.pid ?? "?"})`;
@@ -211,10 +207,13 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	const DAEMON_DEGRADED_RESPAWN_MS = 300_000;
 	const ownPkgVersion = readPkgVersion(path.dirname(fileURLToPath(import.meta.url)));
 	async function maybeReplaceDaemon(): Promise<void> {
-		if (!daemonAutoSpawnAllowed()) return;
+		const epoch = generation;
+		const target = daemonTarget();
+		const allowed = () => !closing && epoch === generation && daemonAutoSpawnAllowed(target);
+		if (!allowed()) return;
 		let liveness;
-		try { liveness = await readDaemonLiveness(cwd); } catch { return; }
-		if (!liveness.live || !liveness.heartbeat) return;
+		try { liveness = await readDaemonLiveness(target.cwd); } catch { return; }
+		if (!allowed() || !liveness.live || !liveness.heartbeat) return;
 		const reason = liveness.heartbeat.degraded
 			? `degraded (${liveness.heartbeat.degraded})`
 			: liveness.heartbeat.pkgVersion && compareVersions(ownPkgVersion, liveness.heartbeat.pkgVersion) > 0
@@ -223,9 +222,9 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		if (!reason) return;
 		if (Date.now() - daemonDegradedSpawnedAt < DAEMON_DEGRADED_RESPAWN_MS) return;
 		const entry = await resolveDaemonEntry();
-		if (!entry) return;
+		if (!allowed() || !entry) return;
 		try {
-			const child = spawn(process.execPath, [entry], { cwd, detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env, WAKE_ALARM_CWD: cwd } });
+			const child = spawn(process.execPath, [entry], { cwd: target.cwd, detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env, WAKE_ALARM_CWD: target.cwd } });
 			child.unref();
 			daemonDegradedSpawnedAt = Date.now();
 			uiNotify?.(`Wake alarm: daemon is ${reason}; started a replacement (pid ${child.pid ?? "?"})`);
@@ -234,8 +233,9 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 
 	async function daemonNote(action: string): Promise<string> {
 		if (action !== "set_timer" && action !== "watch_container" && action !== "watch_container_group" && action !== "watch_condition") return "";
+		const epoch = generation;
 		const outcome = await ensureDaemon();
-		if (!outcome) return "";
+		if (closing || epoch !== generation || !outcome) return "";
 		if (outcome.startsWith("started")) return ` (${outcome}; it delivers wakes while all sessions are closed)`;
 		if (!daemonWarned) {
 			daemonWarned = true;
@@ -253,28 +253,34 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	let uiSet: { setStatus: (key: string, text: string | undefined) => void; setWidget: (key: string, lines: string[] | undefined) => void } | undefined;
 
 	async function refreshAlarmWidget(): Promise<void> {
-		// Capture the UI handle up front: an in-flight refresh must survive a
-		// session_shutdown that nulls uiSet while our awaits are suspended.
+		const epoch = generation;
 		const ui = uiSet;
-		if (!ui) return;
+		const runtimeNow = runtime;
+		const projectCwd = cwd;
+		// The first presence is written before runtime creation. Do not let an
+		// early empty snapshot clear a later, fully initialized widget.
+		if (closing || !ui || !runtimeNow || !runtimeReady) return;
+		const current = () => !closing && epoch === generation && uiSet === ui && runtime === runtimeNow && runtimeReady;
 		let daemonLive = false;
 		let daemonDegraded = false;
 		try {
-			const liveness = await readDaemonLiveness(cwd);
+			const liveness = await readDaemonLiveness(projectCwd);
+			if (!current()) return;
 			daemonDegraded = liveness.live && Boolean(liveness.heartbeat?.degraded);
 			daemonLive = liveness.live && !daemonDegraded;
 		}
 		catch { /* display only */ }
-		const runtimeNow = runtime;
-		const digest: AlarmDigest | undefined = runtimeNow?.alarmDigest();
+		if (!current()) return;
+		const digest: AlarmDigest = runtimeNow.alarmDigest();
 		if (!digest || digest.active === 0) {
 			ui.setStatus(STATUS_KEY, undefined);
 			ui.setWidget(WIDGET_KEY, undefined);
 			return;
 		}
 		// Language: tool preference (set_language) > config uiLanguage > system locale.
-		const prefs = await readPrefs(cwd).catch(() => undefined);
-		const language = resolveLanguage(prefs?.language, runtimeNow?.runtimeConfig.uiLanguage, detectSystemLanguage());
+		const prefs = await readPrefs(projectCwd).catch(() => undefined);
+		if (!current()) return;
+		const language = resolveLanguage(prefs?.language, runtimeNow.runtimeConfig.uiLanguage, detectSystemLanguage());
 		const render = { language, daemonLive, degraded: daemonDegraded };
 		const display: UiDisplay = prefs?.display ?? "full";
 		if (display === "off") {
@@ -341,6 +347,12 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+		const epoch = ++generation;
+		const current = () => !closing && epoch === generation;
+		closing = false;
+		runtimeReady = false;
+		spawnDaemon = undefined;
+		shutdownPromise = undefined;
 		cwd = ctx.cwd;
 		passive = process.env.WAKE_ALARM_PASSIVE === "1";
 		ownerSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
@@ -355,9 +367,28 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 		// session owns one registry file, so this never contends with other sessions.
 		if (!passive) {
 			presenceDir = path.join(ctx.cwd, ".pi", PRESENCE_DIR_NAME);
+			presenceRefresher = createPresenceRefresher(presenceDir, {
+				onLive: (live) => {
+					if (!current()) return;
+					isLeader = leaderInstanceId(live) === instanceId;
+					presenceFailures = 0;
+					presenceWarned = false;
+					void refreshAlarmWidget();
+					void maybeReplaceDaemon();
+				},
+				onError: (error) => {
+					if (!current()) return;
+					presenceFailures++;
+					if (!presenceWarned || presenceFailures % 5 === 0) {
+						presenceWarned = true;
+						uiNotify?.(formatPresenceFailure(error, presenceFailures));
+					}
+				},
+			});
 			await refreshPresence();
+			if (!current()) return;
 		}
-		runtime = new WakeAlarmRuntime({
+		const starting = new WakeAlarmRuntime({
 			cwd: ctx.cwd,
 			emit: sessionEmit,
 			deferDeliveryCompletion: true,
@@ -366,8 +397,12 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 			owns: (alarm) => alarm.ownerSessionFile === undefined ? isLeader : alarm.ownerSessionFile === ownerSessionFile,
 			claimantId: `session:${instanceId}`,
 		});
+		runtime = starting;
 		try {
-			await runtime.start({ flushPending: !passive });
+			await starting.start({ flushPending: !passive });
+			if (!current()) { await starting.stop(); return; }
+			spawnDaemon = starting.runtimeConfig.spawnDaemon;
+			runtimeReady = true;
 			if (passive) return;
 			startHeartbeat();
 			void refreshAlarmWidget();
@@ -375,28 +410,65 @@ export default function wakeAlarmExtension(pi: ExtensionAPI) {
 			if (ctx.hasUI && runtime.retiredLegacy) ctx.ui.notify("Wake alarm retired the incompatible v1 periodic watcher state; no alarm was migrated.", "info");
 			if (ctx.hasUI && runtime.alarmCount) ctx.ui.notify(`Wake alarm restored ${runtime.alarmCount} alarm(s).`, "info");
 		} catch (error) {
-			const failed = runtime;
+			if (!current()) { await starting.stop().catch(() => undefined); return; }
+			closing = true;
+			const failedEpoch = ++generation;
+			stopHeartbeat();
+			const failedPresence = presenceRefresher;
+			const failedDir = presenceDir;
+			presenceRefresher = undefined;
+			presenceDir = undefined;
+			const drained = failedPresence?.close();
 			runtime = undefined;
-			if (failed) await failed.stop().catch(() => undefined);
-			if (presenceDir) await releasePresence(presenceDir, instanceId);
-			ctx.ui.notify(`Wake alarm disabled: ${(error as Error).message}`, "error");
+			runtimeReady = false;
+			spawnDaemon = undefined;
+			uiSet = undefined;
+			uiNotify = undefined;
+			try { await starting.stop(); }
+			finally {
+				try { await drained; }
+				finally { if (failedDir) await releasePresence(failedDir, instanceId); }
+			}
+			if (ctx.hasUI && generation === failedEpoch) ctx.ui.notify(`Wake alarm disabled: ${(error as Error).message}`, "error");
 		}
 	});
 
-	pi.on("session_shutdown", async () => {
-		// Stop accepting and finish in-flight scheduler work first; only then
-		// withdraw live presence, so the daemon cannot interleave mid-shutdown.
+	pi.on("session_shutdown", () => {
+		if (shutdownPromise) return shutdownPromise;
+		// Snapshot configuration before detaching runtime. Unknown config never
+		// authorizes a daemon, and reading this snapshot cannot invoke a getter.
+		const target = daemonTarget();
+		closing = true;
+		generation++;
+		const presence = presenceRefresher;
+		const dir = presenceDir;
+		presenceRefresher = undefined;
+		presenceDir = undefined;
+		const drained = presence?.close();
 		stopHeartbeat();
-		uiSet?.setStatus(STATUS_KEY, undefined);
-		uiSet?.setWidget(WIDGET_KEY, undefined);
+		try {
+			uiSet?.setStatus(STATUS_KEY, undefined);
+			uiSet?.setWidget(WIDGET_KEY, undefined);
+		} catch { /* UI cleanup must not prevent presence cleanup. */ }
 		uiSet = undefined;
 		uiNotify = undefined;
 		const current = runtime;
 		runtime = undefined;
-		if (current) await current.stop();
-		// Closing the (possibly last) session: leave a live daemon behind so
-		// pending wakes still fire. Best effort — spawnDaemon:false users manage it.
-		await ensureDaemon().catch(() => "");
-		if (presenceDir) { await releasePresence(presenceDir, instanceId); presenceDir = undefined; }
+		runtimeReady = false;
+		spawnDaemon = undefined;
+		isLeader = false;
+		shutdownPromise = (async () => {
+			try {
+				if (current) await current.stop();
+				await drained;
+				// Explicit handoff is allowed after closing, but still respects the
+				// original session's passive/config/environment restrictions.
+				await ensureDaemon(target, true).catch(() => "");
+			} finally {
+				try { await drained; }
+				finally { if (dir) await releasePresence(dir, instanceId); }
+			}
+		})();
+		return shutdownPromise;
 	});
 }
