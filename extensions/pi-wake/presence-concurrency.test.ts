@@ -95,6 +95,8 @@ test("exclusive-open EEXIST does not remove the file belonging to another writer
 
 test("one failed registration cannot clean up a concurrent writer's temporary file", { timeout: 5_000 }, async (t) => {
 	const dir = await fs.mkdtemp(path.join(tmpdir(), "wake-presence-owner-"));
+	const firstEntered = deferred();
+	const secondEntered = deferred();
 	const both = deferred();
 	const resumeSecond = deferred();
 	const rename = fs.rename;
@@ -102,17 +104,23 @@ test("one failed registration cannot clean up a concurrent writer's temporary fi
 	let secondSource: Parameters<typeof fs.rename>[0] | undefined;
 	t.mock.method(fs, "rename", async (from: Parameters<typeof fs.rename>[0], to: Parameters<typeof fs.rename>[1]) => {
 		const index = ++count;
-		if (index === 2) { secondSource = from; both.resolve(); }
+		if (index === 1) firstEntered.resolve();
+		else { secondSource = from; secondEntered.resolve(); }
 		await both.promise;
 		if (index === 1) throw Object.assign(new Error("first writer failed"), { code: "EIO" });
 		await resumeSecond.promise;
 		await rename(from, to);
 	});
+	// Who reaches the rename barrier first decides the roles below, so await
+	// each entry before starting the next registration: filesystem timing must
+	// not pick the winner (it flips on Windows).
 	const first = registerPresence(dir, record("one", 1));
+	await firstEntered.promise;
 	const firstOutcome = first.then(() => undefined, (error: unknown) => error);
 	const second = registerPresence(dir, record("one", 2));
+	await secondEntered.promise;
 	try {
-		await both.promise;
+		both.resolve();
 		assert.ok(await firstOutcome instanceof PresenceIoError);
 		assert.ok(secondSource);
 		await fs.access(secondSource);
