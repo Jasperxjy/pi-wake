@@ -1,6 +1,6 @@
 {
  "package": "pi-wake",
- "generatedAt": "2026-10-16T08:19:01.579Z",
+ "generatedAt": "2026-10-23T08:40:19.263Z",
  "days": [
   {
    "downloads": 234,
@@ -207,8 +207,36 @@
    "day": "2026-10-15"
   },
   {
-   "downloads": 0,
+   "downloads": 3,
    "day": "2026-10-16"
+  },
+  {
+   "downloads": 4,
+   "day": "2026-10-17"
+  },
+  {
+   "downloads": 3,
+   "day": "2026-10-18"
+  },
+  {
+   "downloads": 0,
+   "day": "2026-10-19"
+  },
+  {
+   "downloads": 0,
+   "day": "2026-10-20"
+  },
+  {
+   "downloads": 0,
+   "day": "2026-10-21"
+  },
+  {
+   "downloads": 0,
+   "day": "2026-10-22"
+  },
+  {
+   "downloads": 0,
+   "day": "2026-10-23"
   }
  ]
 }
